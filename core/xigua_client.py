@@ -10,6 +10,7 @@ from core.otp_utils import extract_otp
 logger = logging.getLogger(__name__)
 _CODE_RE = re.compile(r"\b(\d{6})\b")
 _CACHE: dict[str, "XiguaAccount"] = {}
+_LAST_CODES: dict[str, str] = {}
 _LOCK = threading.RLock()
 
 class XiguaError(RuntimeError): pass
@@ -70,7 +71,8 @@ def get_email(): return pick_account().email
 def get_account_context(email):
     with _LOCK: return _CACHE.get(str(email or "").strip().lower())
 def release_account(email, status="available", note=None):
-    with _LOCK: account = _CACHE.pop(str(email or "").strip().lower(), None)
+    key = str(email or "").strip().lower()
+    with _LOCK: account = _CACHE.pop(key, None)
     # 注册流程在邮箱尚未消耗时失败，应主动取消西瓜订单并释放平台库存/冻结资源。
     if account and str(status or "").lower() in {"available", "failed", "cancelled", "error"}:
         try:
@@ -78,6 +80,7 @@ def release_account(email, status="available", note=None):
             logger.info("[Xigua] 已取消未消耗订单: %s order=%s", account.email, account.order_id)
         except Exception as exc:
             logger.warning("[Xigua] 取消订单失败: order=%s error=%s", account.order_id, exc)
+    _LAST_CODES.pop(key, None)
 
 def fetch_latest_otp(email, after_ts=0, max_wait=None, poll_interval=None, settle_seconds=None):
     account = get_account_context(email)
@@ -96,10 +99,13 @@ def fetch_latest_otp(email, after_ts=0, max_wait=None, poll_interval=None, settl
             account = None
     if account is None: raise XiguaError(f"西瓜邮箱上下文不存在: {email}")
     deadline = time.monotonic() + int(max_wait if max_wait is not None else getattr(_cfg, "OTP_MAX_WAIT", 90) or 90)
-    interval = max(1, int(poll_interval if poll_interval is not None else getattr(_cfg, "OTP_POLL_INTERVAL", 3) or 3))
+    interval = max(1, int(poll_interval if poll_interval is not None else getattr(_cfg, "XIGUA_POLL_INTERVAL", 5) or 5))
+    attempts = max(1, int(getattr(_cfg, "XIGUA_POLL_ATTEMPTS", 10) or 10))
     candidate = None
     confirmations = 0
-    while time.monotonic() <= deadline:
+    for _attempt in range(attempts):
+        if time.monotonic() > deadline:
+            break
         data = _unwrap(_request("GET", "/api/v1/orders/" + account.order_id))
         code = (data.get("code") or data.get("verification_code") or data.get("verificationCode")) if isinstance(data, dict) else None
         direct_code = False
@@ -112,8 +118,9 @@ def fetch_latest_otp(email, after_ts=0, max_wait=None, poll_interval=None, settl
                     confirmations += 1
                 else:
                     candidate, confirmations = found, 1
-                if confirmations >= 2:
+                if confirmations >= 2 and found != _LAST_CODES.get(account.email.lower()):
                     logger.info("[Xigua] 验证码已连续确认 2 次: %s", found)
+                    _LAST_CODES[account.email.lower()] = found
                     return found
         text = " ".join(str(data.get(k, "")) for k in ("subject", "body", "body_preview", "message")) if isinstance(data, dict) else ""
         code = extract_otp({"subject": text, "body": text, "text": text})
@@ -122,8 +129,9 @@ def fetch_latest_otp(email, after_ts=0, max_wait=None, poll_interval=None, settl
                 confirmations += 1
             else:
                 candidate, confirmations = code, 1
-            if confirmations >= 2:
+            if confirmations >= 2 and code != _LAST_CODES.get(account.email.lower()):
                 logger.info("[Xigua] 验证码已连续确认 2 次: %s", code)
+                _LAST_CODES[account.email.lower()] = code
                 return code
         time.sleep(min(interval, max(0, deadline - time.monotonic())))
     raise XiguaError(f"西瓜验证码等待超时: {email}")

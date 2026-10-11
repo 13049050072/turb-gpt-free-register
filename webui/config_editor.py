@@ -520,6 +520,14 @@ EDITABLE_FIELDS = [
         "key": "XIGUA_REQUEST_TIMEOUT", "file": "email.py", "type": "int", "group": "邮箱 / OTP",
         "label": "西瓜请求超时(秒)", "help": "西瓜 API 单次 HTTP 请求超时，默认 20 秒",
     },
+    {
+        "key": "XIGUA_POLL_ATTEMPTS", "file": "email.py", "type": "int", "group": "邮箱 / OTP",
+        "label": "西瓜轮询次数", "help": "每次等待验证码最多请求次数，默认 10 次",
+    },
+    {
+        "key": "XIGUA_POLL_INTERVAL", "file": "email.py", "type": "int", "group": "邮箱 / OTP",
+        "label": "西瓜轮询间隔(秒)", "help": "西瓜每次查询验证码的间隔，默认 5 秒",
+    },
     # ---- 浏览器地区画像 ----
     {
         "key": "BROWSER_LOCALE_PROFILE", "file": "browser.py", "type": "str", "group": "浏览器画像",

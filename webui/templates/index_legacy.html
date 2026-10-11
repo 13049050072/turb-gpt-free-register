@@ -380,6 +380,7 @@
     }
     .config-subhead .hint { display:block; margin-top:3px; color:var(--muted); font-size:12px; font-weight:400; line-height:1.45; }
     .config-subhead.remail-subhead .hint { display: inline; }
+    .config-subhead.remail-subhead { white-space: nowrap; overflow-x: auto; }
     .config-subhead .remail-promo-notice {
       display: inline-flex; align-items: center; width: fit-content;
       margin: 0 0 0 10px; padding: 7px 11px;
@@ -2238,7 +2239,7 @@ async function setupAccountTotp(id, btn) {
 async function changeAccountEmails(ids) {
   ids = (ids || []).map(Number).filter(Boolean);
   if (!ids.length) { showToast('请先选择账号'); return; }
-  const source = prompt('请输入新邮箱来源：\noutlook / generic_api / imap / cloudflare_domain / cloudflare / gptmail / mailnest / cloudmail / remail', 'outlook');
+  const source = prompt('请输入新邮箱来源：\noutlook / generic_api / imap / cloudflare_domain / cloudflare / gptmail / mailnest / cloudmail / remail / xigua', 'outlook');
   if (!source) return;
   try {
     const url = ids.length === 1 ? `/api/accounts/${ids[0]}/change-email` : '/api/accounts/change-email-bulk';
@@ -3413,10 +3414,12 @@ function renderConfigRecommendedLinks(f) {
 }
 
 function configSubhead(title, help = '') {
-  const subheadClass = title === 'Remail' ? 'config-subhead remail-subhead' : 'config-subhead';
-  const titleHtml = title === 'Remail' ? `<div class="remail-subhead-title">${esc(title)}</div>` : esc(title);
+  const subheadClass = ['Remail', '西瓜'].includes(title) ? 'config-subhead remail-subhead' : 'config-subhead';
+  const titleHtml = esc(title);
   const promo = title === 'Remail'
-    ? `<span class="remail-promo-notice" role="note">通过作者卡网购买积分9折优惠</span>`
+    ? `<span class="remail-promo-notice" role="note">通过作者卡网购买积分9折优惠 · <a href="https://catfk.com/shop/9D4N5XEY" target="_blank" rel="noopener noreferrer">打开卡网</a></span>`
+    : title === '西瓜'
+    ? `<span class="remail-promo-notice" role="note">作者卡网购买CDK9折优惠 · <a href="https://catfk.com/shop/9D4N5XEY" target="_blank" rel="noopener noreferrer">打开卡网</a></span>`
     : '';
   return `<div class="${subheadClass}">${titleHtml}${help ? `<span class="hint">${esc(help)}</span>` : ''}${promo}</div>`;
 }
@@ -3429,6 +3432,7 @@ function emailConfigSectionForKey(key) {
   if (key.startsWith('MAIL_NEST_')) return ['MailNest', 'MailNest / 迈巢临时邮箱 API 配置'];
   if (key.startsWith('CLOUDMAIL_')) return ['CloudMail', 'CloudMail 域名随机邮箱、Token 和收信 API 配置'];
   if (key.startsWith('REMAIL_')) return ['Remail', 'Remail 开放 API、项目下单和取件配置'];
+  if (key.startsWith('XIGUA_')) return ['西瓜', '西瓜邮箱接码 API、项目方案和取件配置'];
   if (key.startsWith('OUTLOOK_')) return ['Outlook 邮箱池', 'Outlook 邮箱池和取件模式配置'];
   if (key.startsWith('IMAP_')) return ['通用 IMAP', '通用 IMAP 邮箱池的收件目录配置'];
   if (['EMAIL_DOMAIN','QQ_EMAIL','QQ_IMAP_PASSWORD'].includes(key)) return ['Cloudflare 域名邮箱', 'Cloudflare 转发到 QQ 邮箱后的 IMAP 收信配置'];
@@ -3501,7 +3505,7 @@ function renderConfigFields(fields) {
       CONFIG_EMAIL_ACTIVE_SECTION,
       v => { CONFIG_EMAIL_ACTIVE_SECTION = v; },
       emailConfigSectionForKey,
-      ['通用邮箱 / OTP', 'GPTMail', 'MailNest', 'CloudMail', 'Remail', 'Outlook 邮箱池', 'Cloudflare 域名邮箱', '其他邮箱配置'],
+      ['通用邮箱 / OTP', 'GPTMail', 'MailNest', 'CloudMail', 'Remail', '西瓜', 'Outlook 邮箱池', 'Cloudflare 域名邮箱', '其他邮箱配置'],
       'email-config-section'
     );
   }

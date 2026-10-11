@@ -351,7 +351,7 @@ EDITABLE_FIELDS = [
     },
     {
         "key": "EMAIL_SOURCE", "file": "email.py", "type": "str", "group": "邮箱 / OTP",
-        "label": "邮箱来源", "help": "可填单个或多个，逗号分隔并按顺序兜底：outlook,generic_api,imap,cloudflare_domain,cloudflare,gptmail,mailnest,cloudmail,remail",
+        "label": "邮箱来源", "help": "可填单个或多个，逗号分隔并按顺序兜底：outlook,generic_api,imap,cloudflare_domain,cloudflare,gptmail,mailnest,cloudmail,remail,xigua",
     },
     {
         "key": "IMAP_MAILBOX", "file": "email.py", "type": "str", "group": "邮箱 / OTP",
@@ -504,6 +504,21 @@ EDITABLE_FIELDS = [
     {
         "key": "REMAIL_REQUEST_TIMEOUT", "file": "email.py", "type": "int", "group": "邮箱 / OTP",
         "label": "Remail 请求超时(秒)", "help": "Remail API 单次 HTTP 请求超时，默认 20 秒",
+    },
+    {
+        "key": "XIGUA_API_KEY", "file": "email.py", "type": "str", "group": "邮箱 / OTP",
+        "label": "西瓜 API Key", "help": "西瓜 API 密钥，选择 xigua 来源时必填，保存在 .env",
+        "storage": "env", "secret": True,
+        "external_url": "https://xigua.dasiqo.com/#register?invite=XGMKWMW4Z7",
+        "external_label": "打开西瓜官网",
+    },
+    {
+        "key": "XIGUA_OFFER_ID", "file": "email.py", "type": "str", "group": "邮箱 / OTP",
+        "label": "西瓜 Offer ID", "help": "手动填写西瓜项目方案的 offer_id",
+    },
+    {
+        "key": "XIGUA_REQUEST_TIMEOUT", "file": "email.py", "type": "int", "group": "邮箱 / OTP",
+        "label": "西瓜请求超时(秒)", "help": "西瓜 API 单次 HTTP 请求超时，默认 20 秒",
     },
     # ---- 浏览器地区画像 ----
     {

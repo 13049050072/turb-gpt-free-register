@@ -22,6 +22,8 @@ from flask import Flask, Response, jsonify, make_response, render_template, requ
 import pyotp
 
 from core import codex_retry_service, db, plan_check_service, extract_link_service, codex_agent_service, live_check_service
+from core.chatgpt2api_401_service import ChatGPT2API401Service
+from core.chatgpt2api_admin import ChatGPT2APIAdminError
 from core.sub2api_401_service import Sub2Api401Service, Sub2ApiSnapshotConflict
 from core.sub2api_admin import Sub2ApiAdminError
 from webui.auth import init_auth, register_auth_routes
@@ -259,6 +261,7 @@ def create_app(auth_code: str | None = None) -> Flask:
     app = Flask(__name__, template_folder="templates")
     _prepared_downloads: dict[str, dict] = {}
     sub2api_401_service = Sub2Api401Service()
+    chatgpt2api_401_service = ChatGPT2API401Service()
 
     @app.after_request
     def _compress_json_response(response: Response):
@@ -376,6 +379,10 @@ def create_app(auth_code: str | None = None) -> Flask:
     @app.get("/sub2api-401")
     def sub2api_401_page():
         return render_template("sub2api_401.html")
+
+    @app.get("/chatgpt2api-401")
+    def chatgpt2api_401_page():
+        return render_template("chatgpt2api_401.html")
 
     # ----------------------------------------------------------
     # 统计概览
@@ -2937,6 +2944,86 @@ def create_app(auth_code: str | None = None) -> Flask:
             error, status = _sub2api_401_remote_error(exc)
             logger.warning("Sub2API 401 清理前复核失败: %s", error)
             return _sub2api_401_response({"ok": False, "error": error}, status)
+
+    def _chatgpt2api_401_response(payload: dict, status: int = 200) -> Response:
+        response = make_response(jsonify(payload), status)
+        response.headers["Cache-Control"] = "no-store, max-age=0"
+        response.headers["Pragma"] = "no-cache"
+        response.headers["X-Content-Type-Options"] = "nosniff"
+        return response
+
+    def _chatgpt2api_401_error(exc: Exception) -> tuple[str, int]:
+        if isinstance(exc, ChatGPT2APIAdminError):
+            messages = {
+                "auth": "ChatGPT2API 管理接口认证失败，请检查管理密钥",
+                "configuration": "ChatGPT2API 管理连接未配置完整",
+                "timeout": "ChatGPT2API 管理接口请求超时，远端账号未修改",
+                "network": "ChatGPT2API 管理接口不可达，远端账号未修改",
+                "not_found": "ChatGPT2API 锁定账号或接口不存在",
+                "conflict": "ChatGPT2API 账号快照已变化，请重新检测",
+                "unsupported": "当前 ChatGPT2API 不支持安全账号更新接口",
+            }
+            return messages.get(exc.category, "ChatGPT2API 管理请求失败，远端账号未修改"), exc.status_code
+        text = str(exc or "").lower()
+        if "timeout" in text or "timed out" in text:
+            return "ChatGPT2API 管理接口请求超时，远端账号未修改", 504
+        return "ChatGPT2API 管理请求失败，远端账号未修改", 502
+
+    def _chatgpt2api_401_ids(data: object) -> tuple[list, Response | None]:
+        if not isinstance(data, dict):
+            return [], _chatgpt2api_401_response({"ok": False, "error": "请求体必须是 JSON 对象"}, 400)
+        remote_ids = data.get("remote_ids")
+        if not isinstance(remote_ids, list) or not remote_ids:
+            return [], _chatgpt2api_401_response({"ok": False, "error": "remote_ids 必须是非空数组"}, 400)
+        if len(remote_ids) > 50:
+            return [], _chatgpt2api_401_response({"ok": False, "error": "单次最多选择 50 个账号"}, 400)
+        return remote_ids, None
+
+    @app.get("/api/chatgpt2api-401/state")
+    def api_chatgpt2api_401_state():
+        """读取仅含摘要与稳定 ID 的 ChatGPT2API 401 审计状态。"""
+        return _chatgpt2api_401_response(chatgpt2api_401_service.state())
+
+    @app.post("/api/chatgpt2api-401/detect")
+    def api_chatgpt2api_401_detect():
+        """检测 AT 明确失效/401 且远端 ID 与邮箱可唯一映射的账号。"""
+        try:
+            return _chatgpt2api_401_response(chatgpt2api_401_service.detect())
+        except Exception as exc:
+            error, status = _chatgpt2api_401_error(exc)
+            logger.warning("ChatGPT2API 401 检测失败: %s", error)
+            return _chatgpt2api_401_response({"ok": False, "error": error}, status)
+
+    @app.post("/api/chatgpt2api-401/refresh")
+    def api_chatgpt2api_401_refresh():
+        """对用户选中的安全映射账号执行本地查活并持久化新 AT。"""
+        remote_ids, error_response = _chatgpt2api_401_ids(request.get_json(silent=True))
+        if error_response is not None:
+            return error_response
+        try:
+            return _chatgpt2api_401_response(chatgpt2api_401_service.refresh(remote_ids, limit=50))
+        except Exception as exc:
+            error, status = _chatgpt2api_401_error(exc)
+            logger.warning("ChatGPT2API 401 查活失败: %s", error)
+            return _chatgpt2api_401_response({"ok": False, "error": error}, status)
+
+    @app.post("/api/chatgpt2api-401/replace")
+    def api_chatgpt2api_401_replace():
+        """显式确认后，仅 PATCH 锁定旧远端 ID 的 AT 字段。"""
+        data = request.get_json(silent=True)
+        remote_ids, error_response = _chatgpt2api_401_ids(data)
+        if error_response is not None:
+            return error_response
+        try:
+            return _chatgpt2api_401_response(chatgpt2api_401_service.replace(
+                remote_ids,
+                opt_in=data.get("confirm_replace") is True,
+                limit=50,
+            ))
+        except Exception as exc:
+            error, status = _chatgpt2api_401_error(exc)
+            logger.warning("ChatGPT2API 401 PATCH 失败: %s", error)
+            return _chatgpt2api_401_response({"ok": False, "error": error}, status)
 
     @app.get("/api/codex/retry-log")
     def api_codex_retry_log():

@@ -19,6 +19,7 @@ This directory contains guidelines for backend development. Fill in each file wi
 | [Error Handling](./error-handling.md) | Error types, handling strategies | To fill |
 | [Quality Guidelines](./quality-guidelines.md) | Code standards, forbidden patterns | To fill |
 | [Sub2API Credential Rotation](./sub2api-credential-rotation.md) | Verification-first Sub2API OpenAI OAuth retry, account-ID replacement proof, and cleanup gating | Ready |
+| [ChatGPT2API Credential Rotation](./chatgpt2api-credential-rotation.md) | Verification-first expired AT detection, local liveness refresh, and exact remote-ID replacement | Ready |
 
 ---
 

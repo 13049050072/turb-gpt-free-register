@@ -42,7 +42,14 @@ def _append_log(email: str, line: str, *, clear: bool = False) -> None:
         f.write(f"{stamp} [INFO] {line}\n")
 
 
-def _run_live_check(*, account_id: int, email: str, proxy: str | None, trigger: str) -> dict:
+def _run_live_check(
+    *,
+    account_id: int,
+    email: str,
+    proxy: str | None,
+    trigger: str,
+    release_queue_slot: bool = True,
+) -> dict:
     relay = None
     try:
         with _LOCK:
@@ -146,7 +153,44 @@ def _run_live_check(*, account_id: int, email: str, proxy: str | None, trigger: 
             relay.close()
         with _LOCK:
             _RUNNING.discard(int(account_id))
-        _QUEUE_SLOTS.release()
+        if release_queue_slot:
+            _QUEUE_SLOTS.release()
+
+
+def run_account_live_check(
+    account_id: int,
+    *,
+    trigger: str = "chatgpt2api-401",
+    proxy: str | None = None,
+) -> dict:
+    """Synchronously run the normal liveness worker with its DB concurrency claim."""
+    account_id = int(account_id)
+    account = db.get_account(account_id)
+    if not account:
+        return {"ok": False, "status": "failed", "error": "本地账号不存在"}
+    email = str(account.get("email") or "").strip()
+    if not email:
+        return {"ok": False, "status": "failed", "error": "本地账号邮箱为空"}
+    if not db.claim_account_live_check(acc_id=account_id, trigger=trigger):
+        return {"ok": False, "status": "busy", "error": "该账号正在查活"}
+    try:
+        _append_log(email, f"[查活] 已由 {trigger} 同步启动 account_id={account_id}", clear=True)
+    except Exception as exc:
+        result = {
+            "ok": False,
+            "status": "failed",
+            "checked_at": datetime.now().isoformat(timespec="seconds"),
+            "error": f"查活日志初始化失败: {type(exc).__name__}",
+        }
+        db.update_account_liveness(account_id, result)
+        return result
+    return _run_live_check(
+        account_id=account_id,
+        email=email,
+        proxy=proxy,
+        trigger=trigger,
+        release_queue_slot=False,
+    )
 
 
 def enqueue_account_live_check(*, account_id: int, email: str, trigger: str = "manual", proxy: str | None = None) -> dict:

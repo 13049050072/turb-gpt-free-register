@@ -40,6 +40,7 @@ __pycache__/
 *.sqlite3-shm
 cpa_401_audit.json
 sub2api_401_audit.json
+chatgpt2api_401_audit.json
 .venv/
 *.py[cod]
 *$py.class

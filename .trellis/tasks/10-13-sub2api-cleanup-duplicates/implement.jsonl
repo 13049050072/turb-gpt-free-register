@@ -1,0 +1,3 @@
+{"file": ".trellis/spec/backend/sub2api-credential-rotation.md", "reason": "Existing exact-ID snapshot, replacement verification, cleanup and UI/API contract being extended for automatic cleanup and historical duplicate convergence."}
+{"file": ".trellis/spec/guides/cross-layer-thinking-guide.md", "reason": "Change spans Sub2API adapter, persisted service state, background retry runner, API defaults and browser UI."}
+{"file": ".trellis/spec/guides/code-reuse-thinking-guide.md", "reason": "Reuse existing cleanup gate rather than duplicating exact-ID deletion logic."}

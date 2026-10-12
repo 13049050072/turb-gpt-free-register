@@ -62,6 +62,20 @@ def _email(value: object) -> str:
     return text if _EMAIL_RE.match(text) else ""
 
 
+def _created_at(value: object) -> str:
+    text = _text(value, 64)
+    if not text or "@" in text or "http://" in text.lower() or "https://" in text.lower():
+        return ""
+    candidate = text[:-1] + "+00:00" if text.endswith("Z") else text
+    try:
+        parsed = datetime.fromisoformat(candidate)
+    except ValueError:
+        return ""
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc).isoformat()
+
+
 def _bounded_int(value: object, *, minimum: int = 0, maximum: int = 10_000) -> int:
     try:
         parsed = int(value or 0)
@@ -199,6 +213,7 @@ class Sub2Api401Service:
             "account_id": account_id,
             "account_name": _account_name(raw.get("account_name")),
             "email": _email(raw.get("email")),
+            "created_at": _created_at(raw.get("created_at")),
             "state": state,
             "health": health,
             "reason": _reason(raw.get("reason"), state),
@@ -216,7 +231,10 @@ class Sub2Api401Service:
             "local_codex_status": _text(raw.get("local_codex_status"), 64).lower(),
             "retryable": retryable,
             "cleanup_supported": self.cleanup_supported,
-            "manual_action": "确认替代账号健康后，仅按锁定的旧 account_id 删除" if state == "cleanup_ready" else "",
+            "manual_action": (
+                "历史重复项或自动清理失败时，确认后仅按锁定的旧 account_id 重试清理"
+                if state == "cleanup_ready" else ""
+            ),
         }
 
     def _public_items_locked(self) -> list[dict]:
@@ -262,6 +280,7 @@ class Sub2Api401Service:
                 "account_name": _account_name(raw.get("account_name") or raw.get("name")),
                 "email": email,
                 "email_ambiguous": raw.get("email_ambiguous") is True,
+                "created_at": _created_at(raw.get("created_at")),
             }
             if account_id not in by_id:
                 by_id[account_id] = account
@@ -332,8 +351,43 @@ class Sub2Api401Service:
 
         if old.get("state") == "cleaned" and replacement:
             if old_id not in by_id and replacement in by_id and kinds.get(replacement) == "healthy":
-                return self._sanitize_entry({**base, "state": "cleaned", "reason": "旧 Sub2API account_id 已删除，替代账号保持健康", "replacement_account_id": replacement})
+                return self._sanitize_entry({
+                    **base,
+                    "state": "cleaned",
+                    "reason": "旧 Sub2API account_id 已删除，替代账号保持健康",
+                    "replacement_account_id": replacement,
+                    "cleanup_account_id": old_id,
+                })
             return self._sanitize_entry({**base, "state": "ambiguous", "reason": "清理后 Sub2API 账号状态发生变化，需要人工复核"})
+
+        if old.get("state") == "cleanup_ready" and replacement:
+            expected_ids = _dedupe_ids(old.get("post_retry_account_ids") or old.get("observed_account_ids"))
+            expected_current = set(expected_ids)
+            if not old_exists:
+                expected_current.discard(old_id)
+            if not expected_ids or set(current_ids) != expected_current:
+                return self._sanitize_entry({
+                    **base,
+                    "state": "ambiguous",
+                    "reason": "已验证的新旧 account_id 快照发生变化，禁止清理",
+                    "replacement_account_id": replacement,
+                })
+            replacement_row = by_id.get(replacement)
+            if not replacement_row or replacement_row.get("email") != email or kinds.get(replacement) != "healthy":
+                return self._sanitize_entry({
+                    **base,
+                    "state": "ambiguous",
+                    "reason": "已记录的替代 account_id 不再满足健康与邮箱一致性条件",
+                    "replacement_account_id": replacement,
+                })
+            if not old_exists:
+                return self._sanitize_entry({
+                    **base,
+                    "state": "cleaned",
+                    "reason": "锁定的旧 Sub2API account_id 已消失，并确认替代账号保持健康",
+                    "replacement_account_id": replacement,
+                    "cleanup_account_id": old_id,
+                })
 
         if not email:
             return self._sanitize_entry({**base, "state": "ambiguous", "reason": "无法唯一提取邮箱，禁止自动补跑或清理"})
@@ -381,6 +435,27 @@ class Sub2Api401Service:
             "reason": "补跑后没有出现可唯一验证的同邮箱新 account_id，禁止清理",
             "retryable": kinds.get(old_id) == "unauthorized" and local_status in _FAILED_LOCAL_STATES,
         })
+
+    @staticmethod
+    def _historical_keeper(group: list[dict], kinds: dict[str, str]) -> tuple[str, str]:
+        """Return deterministic keeper or an ambiguity reason for duplicate emails."""
+        if any(row.get("email_ambiguous") for row in group):
+            return "", "同邮箱候选存在邮箱歧义，禁止自动确认 keeper"
+        healthy = [row for row in group if kinds.get(row["account_id"]) == "healthy"]
+        if len(healthy) == 1 and all(
+            kinds.get(row["account_id"]) == "unauthorized" for row in group if row not in healthy
+        ):
+            return healthy[0]["account_id"], "唯一健康账号为 keeper"
+        if len(healthy) < 2 or len(healthy) != len(group):
+            return "", "同邮箱账号健康状态无法唯一确认 keeper"
+        dated = [row for row in healthy if row.get("created_at")]
+        if len(dated) != len(healthy):
+            return "", "同邮箱账号缺少合法 created_at，无法唯一确认 keeper"
+        latest = max(row["created_at"] for row in dated)
+        newest = [row for row in dated if row["created_at"] == latest]
+        if len(newest) != 1:
+            return "", "同邮箱账号 created_at 并列最新，无法唯一确认 keeper"
+        return newest[0]["account_id"], "唯一最新账号为 keeper"
 
     def _persist_post_snapshot_error(self, accounts: list[dict], reason: str) -> None:
         by_id, by_email = self._account_maps(accounts)
@@ -457,10 +532,24 @@ class Sub2Api401Service:
                 email = _email(account.get("email"))
                 group = by_email.get(email, []) if email else []
                 health = kinds.get(account_id, "unknown")
+                keeper = ""
+                replacement_id = ""
+                cleanup_id = ""
+                preserve_decision_reason = False
                 if account.get("email_ambiguous") or not email:
                     state, reason, retryable = "ambiguous", "无法唯一提取邮箱，禁止自动补跑或清理", False
+                    preserve_decision_reason = True
                 elif len(group) != 1:
-                    state, reason, retryable = "ambiguous", "同一邮箱匹配到多个 Sub2API account_id，无法唯一关联本地账号", False
+                    preserve_decision_reason = True
+                    keeper, keeper_reason = self._historical_keeper(group, kinds)
+                    if keeper and account_id == keeper:
+                        continue
+                    if keeper:
+                        state, reason, retryable = "cleanup_ready", f"{keeper_reason}，可精确清理旧 account_id", False
+                        replacement_id, cleanup_id = keeper, account_id
+                    else:
+                        state, reason, retryable = "ambiguous", keeper_reason, False
+                        replacement_id, cleanup_id = "", ""
                 elif health == "unauthorized":
                     state, reason, retryable = "pending", "Sub2API 刷新返回 unauthorized/401", True
                 elif health in {"timeout", "unknown"}:
@@ -473,20 +562,20 @@ class Sub2Api401Service:
                     "account_id": account_id,
                     "account_name": account.get("account_name"),
                     "email": email,
+                    "created_at": account.get("created_at"),
                     "state": state,
                     "health": health,
-                    "reason": reasons.get(account_id) or reason,
+                    "reason": reason if preserve_decision_reason else reasons.get(account_id) or reason,
                     "observed_account_ids": [row.get("account_id") for row in group] or [account_id],
                     "pre_retry_account_ids": [],
                     "post_retry_account_ids": [],
-                    "replacement_account_id": "",
-                    "cleanup_account_id": "",
+                    "replacement_account_id": replacement_id if len(group) != 1 and keeper else "",
+                    "cleanup_account_id": cleanup_id if len(group) != 1 and keeper else "",
                     "candidate_count": len(group) if email else 1,
                     "checked_at": checked_at,
                     "retryable": retryable,
                     "local_codex_status": local_status.get(email, ""),
                 })
-                processed_ids.update(row.get("account_id") for row in group)
 
             self._tracked = next_tracked
             self._health_counts = health_counts
@@ -628,107 +717,258 @@ class Sub2Api401Service:
                 "manual_action": "确认替代账号和旧 account_id 后，勾选显式确认再执行删除",
             }
 
-        after_error = ""
-        stale_review_ids: set[str] = set()
-        with self._operation_lock:
-            live_review_ids: set[str] = set()
-            with self._lock:
-                for item in review:
-                    account_id = _account_id(item.get("account_id"))
-                    current = self._tracked.get(account_id)
-                    if (
-                        current
-                        and current.get("state") == "cleanup_ready"
-                        and _account_id(current.get("cleanup_account_id")) == _account_id(item.get("cleanup_account_id"))
-                        and _account_id(current.get("replacement_account_id")) == _account_id(item.get("replacement_account_id"))
-                        and _email(current.get("email")) == _email(item.get("email"))
-                    ):
-                        live_review_ids.add(account_id)
-                    else:
-                        stale_review_ids.add(account_id)
+        def matches_review(current: dict | None, review_item: dict) -> bool:
+            return bool(
+                current
+                and current.get("state") == "cleanup_ready"
+                and _account_id(current.get("cleanup_account_id")) == _account_id(review_item.get("cleanup_account_id"))
+                and _account_id(current.get("replacement_account_id")) == _account_id(review_item.get("replacement_account_id"))
+                and _email(current.get("email")) == _email(review_item.get("email"))
+            )
 
+        def persist_operational_failure(message: str) -> None:
+            with self._lock:
+                for review_item in review:
+                    account_id = _account_id(review_item.get("account_id"))
+                    current = self._tracked.get(account_id)
+                    if not matches_review(current, review_item):
+                        continue
+                    self._tracked[account_id] = self._sanitize_entry({
+                        **current,
+                        "state": "cleanup_ready",
+                        "reason": message,
+                        "cleanup_account_id": account_id,
+                    })
+                self._persist_locked()
+
+        stale_review_ids: set[str] = set()
+        tracked_snapshots: dict[str, dict] = {}
+        cleaned_ids_by_keeper: dict[tuple[str, str], set[str]] = {}
+        with self._lock:
+            for tracked_id, tracked_item in self._tracked.items():
+                if tracked_item.get("state") != "cleaned":
+                    continue
+                key = (
+                    _email(tracked_item.get("email")),
+                    _account_id(tracked_item.get("replacement_account_id")),
+                )
+                cleaned_ids_by_keeper.setdefault(key, set()).add(_account_id(tracked_id))
+            for review_item in review:
+                account_id = _account_id(review_item.get("account_id"))
+                current = self._tracked.get(account_id)
+                if matches_review(current, review_item):
+                    tracked_snapshots[account_id] = self._sanitize_entry(current)
+                else:
+                    stale_review_ids.add(account_id)
+
+        try:
             before = self._list_fn()
-            before_by_id, _ = self._account_maps(before)
-            replacement_ids = _dedupe_ids([
-                item.get("replacement_account_id")
-                for item in review
-                if _account_id(item.get("account_id")) in live_review_ids
+        except Exception:
+            persist_operational_failure("清理前无法重新读取 Sub2API 账号，未执行删除；请重试清理")
+            raise
+
+        before_by_id, before_by_email = self._account_maps(before)
+        replacement_ids = _dedupe_ids([
+            item.get("replacement_account_id")
+            for item in review
+            if _account_id(item.get("account_id")) in tracked_snapshots
+        ])
+        try:
+            refresh_payload = self._refresh_fn(replacement_ids) if replacement_ids else {
+                "total": 0,
+                "success": 0,
+                "failed": 0,
+                "errors": [],
+            }
+        except Exception:
+            persist_operational_failure("清理前无法刷新替代 account_id，未执行删除；请重试清理")
+            raise
+        replacement_kinds, _ = self._refresh_maps(replacement_ids, refresh_payload)
+
+        precheck_errors: dict[str, str] = {}
+        ambiguous_ids: set[str] = set()
+        reconciled_ids: set[str] = set()
+        before_group_ids: dict[str, list[str]] = {}
+        eligible_ids: list[str] = []
+        for review_item in review:
+            account_id = _account_id(review_item.get("account_id"))
+            old_id = _account_id(review_item.get("cleanup_account_id"))
+            replacement_id = _account_id(review_item.get("replacement_account_id"))
+            email = _email(review_item.get("email"))
+            if account_id in stale_review_ids:
+                precheck_errors[account_id] = "清理状态已变化，未执行删除"
+                continue
+            tracked = tracked_snapshots.get(account_id) or {}
+            if not old_id or old_id != account_id:
+                precheck_errors[account_id] = "清理目标不是检测时锁定的旧 account_id"
+                ambiguous_ids.add(account_id)
+                continue
+
+            current_ids = _dedupe_ids([
+                row.get("account_id") for row in before_by_email.get(email, [])
             ])
-            refresh_payload = self._refresh_fn(replacement_ids)
-            replacement_kinds, _ = self._refresh_maps(replacement_ids, refresh_payload)
-            attempts: dict[str, bool] = {}
-            precheck_errors: dict[str, str] = {}
-            for item in review:
-                old_id = _account_id(item.get("cleanup_account_id"))
-                replacement_id = _account_id(item.get("replacement_account_id"))
-                email = _email(item.get("email"))
-                old_row = before_by_id.get(old_id)
-                replacement_row = before_by_id.get(replacement_id)
-                if _account_id(item.get("account_id")) in stale_review_ids:
-                    precheck_errors[old_id or item.get("account_id") or ""] = "清理状态已变化，未执行删除"
-                    continue
-                if not old_id or old_id != item.get("account_id"):
-                    precheck_errors[old_id or item.get("account_id") or ""] = "清理目标不是检测时锁定的旧 account_id"
-                    continue
-                if not old_row:
-                    precheck_errors[old_id] = "检测时锁定的旧 account_id 已不存在，未执行删除"
-                    continue
-                if not replacement_row or replacement_row.get("email") != email:
-                    precheck_errors[old_id] = "替代 account_id 不存在或邮箱不一致，未执行删除"
-                    continue
-                if replacement_kinds.get(replacement_id) != "healthy":
-                    precheck_errors[old_id] = "替代 account_id 未通过刷新验证，未执行删除"
-                    continue
-                try:
-                    result = self._delete_fn(old_id)
-                    attempts[old_id] = bool(result.get("ok", result.get("success"))) if isinstance(result, dict) else result is True
-                except Exception:
-                    attempts[old_id] = False
+            before_group_ids[account_id] = current_ids
+            expected_ids = _dedupe_ids(
+                tracked.get("post_retry_account_ids")
+                or tracked.get("observed_account_ids")
+            )
+            known_cleaned = cleaned_ids_by_keeper.get((email, replacement_id), set())
+            expected_live = [value for value in expected_ids if value not in known_cleaned]
+            old_already_absent = (
+                old_id not in current_ids
+                and set(current_ids) == (set(expected_live) - {old_id})
+            )
+            if not expected_live or (
+                set(current_ids) != set(expected_live) and not old_already_absent
+            ):
+                precheck_errors[account_id] = "清理前同邮箱 account_id 快照已变化，未执行删除；请重新检测"
+                ambiguous_ids.add(account_id)
+                continue
+
+            replacement_row = before_by_id.get(replacement_id)
+            if not replacement_row or replacement_row.get("email") != email:
+                precheck_errors[account_id] = "替代 account_id 不存在或邮箱不一致，未执行删除；请重新检测"
+                ambiguous_ids.add(account_id)
+                continue
+            if replacement_kinds.get(replacement_id) != "healthy":
+                precheck_errors[account_id] = "替代 account_id 未通过刷新验证，未执行删除；请重试清理"
+                if old_already_absent:
+                    ambiguous_ids.add(account_id)
+                continue
+            if old_already_absent:
+                reconciled_ids.add(account_id)
+                continue
+            if old_id not in before_by_id:
+                precheck_errors[account_id] = "检测时锁定的旧 account_id 已不存在，但快照无法确认"
+                ambiguous_ids.add(account_id)
+                continue
+            eligible_ids.append(account_id)
+
+        attempts: dict[str, bool] = {}
+        for account_id in eligible_ids:
+            try:
+                result = self._delete_fn(account_id)
+                attempts[account_id] = (
+                    bool(result.get("ok", result.get("success")))
+                    if isinstance(result, dict)
+                    else result is True
+                )
+            except Exception:
+                attempts[account_id] = False
+
+        after_error = ""
+        after_refresh_error = ""
+        if eligible_ids:
             try:
                 after = self._list_fn()
             except Exception:
                 after = []
                 after_error = "删除请求后无法重新读取 Sub2API 账号，保留清理状态等待复核"
+        else:
+            after = before
+        after_by_id, after_by_email = self._account_maps(after)
 
-        after_by_id, _ = self._account_maps(after)
+        post_replacement_kinds = replacement_kinds
+        if not after_error and (eligible_ids or reconciled_ids):
+            try:
+                post_refresh = self._refresh_fn(replacement_ids) if replacement_ids else {
+                    "total": 0,
+                    "success": 0,
+                    "failed": 0,
+                    "errors": [],
+                }
+                post_replacement_kinds, _ = self._refresh_maps(replacement_ids, post_refresh)
+            except Exception:
+                post_replacement_kinds = {}
+                after_refresh_error = "清理后无法刷新替代 account_id，清理结果等待复核"
+
+        absent_ids_by_email: dict[str, set[str]] = {}
+        for review_item in review:
+            old_id = _account_id(review_item.get("cleanup_account_id"))
+            email = _email(review_item.get("email"))
+            if old_id and old_id not in after_by_id:
+                absent_ids_by_email.setdefault(email, set()).add(old_id)
+
         results = []
         with self._lock:
-            for item in review:
-                account_id = _account_id(item.get("account_id"))
-                old_id = _account_id(item.get("cleanup_account_id"))
+            for review_item in review:
+                account_id = _account_id(review_item.get("account_id"))
+                old_id = _account_id(review_item.get("cleanup_account_id"))
+                replacement_id = _account_id(review_item.get("replacement_account_id"))
+                email = _email(review_item.get("email"))
                 tracked = self._tracked.get(account_id) or {}
-                error = precheck_errors.get(old_id)
                 stale_review = account_id in stale_review_ids
-                if after_error and attempts.get(old_id, False):
+                error = precheck_errors.get(account_id, "")
+                state = "cleanup_ready"
+
+                if not error and after_error:
                     error = after_error
+                current_after_ids = _dedupe_ids([
+                    row.get("account_id") for row in after_by_email.get(email, [])
+                ])
+                if not error:
+                    expected_after = set(before_group_ids.get(account_id, []))
+                    expected_after -= absent_ids_by_email.get(email, set())
+                    if set(current_after_ids) != expected_after:
+                        error = "清理后同邮箱 account_id 快照发生变化，结果无法确认"
+                        state = "ambiguous"
+                replacement_row = after_by_id.get(replacement_id)
+                if not error and (
+                    not replacement_row or replacement_row.get("email") != email
+                ):
+                    error = "清理后替代 account_id 不存在或邮箱不一致，结果无法确认"
+                    state = "ambiguous"
+                if not error and after_refresh_error:
+                    error = after_refresh_error
+                    state = "ambiguous" if old_id not in after_by_id else "cleanup_ready"
+                if not error and post_replacement_kinds.get(replacement_id) != "healthy":
+                    error = "清理后替代 account_id 未通过刷新验证，结果无法确认"
+                    state = "ambiguous" if old_id not in after_by_id else "cleanup_ready"
+
                 absent = not after_error and old_id not in after_by_id
-                ok = not error and attempts.get(old_id, False) and absent
+                ok = not error and absent and (
+                    account_id in eligible_ids or account_id in reconciled_ids
+                )
                 if ok:
+                    attempted = account_id in eligible_ids
                     self._tracked[account_id] = self._sanitize_entry({
                         **tracked,
                         "state": "cleaned",
-                        "reason": "已显式删除锁定的旧 Sub2API account_id，并确认该 ID 已消失",
-                        "observed_account_ids": [tracked.get("replacement_account_id")],
-                        "post_retry_account_ids": [tracked.get("replacement_account_id")],
-                        "cleanup_account_id": "",
+                        "reason": (
+                            "已删除锁定的旧 Sub2API account_id，并确认该 ID 已消失且替代账号健康"
+                            if attempted
+                            else "锁定的旧 Sub2API account_id 已不存在，并确认替代账号保持健康"
+                        ),
+                        "observed_account_ids": current_after_ids,
+                        "post_retry_account_ids": current_after_ids,
+                        "cleanup_account_id": old_id,
                         "retryable": False,
                     })
-                    result_text = "deleted_and_verified"
+                    result_text = "deleted_and_verified" if attempted else "absent_and_verified"
                     result_reason = ""
                 else:
-                    result_reason = error or ("Sub2API 删除请求失败" if not attempts.get(old_id, False) else "删除后旧 account_id 仍存在")
+                    if not error:
+                        error = (
+                            "Sub2API 删除请求失败"
+                            if not attempts.get(old_id, False)
+                            else "删除后旧 account_id 仍存在"
+                        )
+                    if account_id in ambiguous_ids:
+                        state = "ambiguous"
                     if not stale_review:
                         self._tracked[account_id] = self._sanitize_entry({
                             **tracked,
-                            "state": "cleanup_ready",
-                            "reason": result_reason,
+                            "state": state,
+                            "reason": error,
                             "cleanup_account_id": old_id,
+                            "retryable": False,
                         })
                     result_text = "not_deleted"
+                    result_reason = error
                 results.append({
                     "account_id": account_id,
                     "cleanup_account_id": old_id,
-                    "replacement_account_id": item.get("replacement_account_id"),
+                    "replacement_account_id": replacement_id,
                     "ok": ok,
                     "result": result_text,
                     "reason": result_reason,

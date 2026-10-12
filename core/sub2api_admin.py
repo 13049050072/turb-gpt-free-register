@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import re
+from datetime import datetime, timezone
+from math import isfinite
 from typing import Callable
 from urllib.parse import quote, urlencode
 
@@ -119,6 +121,27 @@ def _bool(value: object) -> bool | None:
     return None
 
 
+def _created_at(value: object) -> str:
+    """保留可排序的非敏感创建时间，拒绝任意长文本和无效值。"""
+    if isinstance(value, bool) or value is None:
+        return ""
+    if isinstance(value, (int, float)):
+        if not isfinite(float(value)) or not 0 < float(value) < 4_102_444_800:
+            return ""
+        return datetime.fromtimestamp(float(value), timezone.utc).isoformat()
+    text = _clean_text(value, 64)
+    if not text or "@" in text or "http://" in text.lower() or "https://" in text.lower():
+        return ""
+    candidate = text[:-1] + "+00:00" if text.endswith("Z") else text
+    try:
+        parsed = datetime.fromisoformat(candidate)
+    except ValueError:
+        return ""
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc).isoformat()
+
+
 def _extract_email(row: dict) -> tuple[str, bool]:
     candidates: list[str] = []
     for key in ("email", "account_email", "username", "name"):
@@ -143,6 +166,7 @@ def _sanitize_account(row: dict) -> dict:
         "status": _clean_text(row.get("status"), 64).lower(),
         "disabled": row.get("disabled") is True,
         "unavailable": row.get("unavailable") is True,
+        "created_at": _created_at(row.get("created_at") or row.get("createdAt")),
     }
 
 

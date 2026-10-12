@@ -91,6 +91,221 @@ class Sub2Api401ServiceTests(unittest.TestCase):
         self.assertEqual(["old"], item["pre_retry_account_ids"])
         self.assertEqual(["new", "old"], item["post_retry_account_ids"])
 
+    def test_detect_reconciles_cleanup_ready_when_locked_old_id_disappears(self):
+        rows = [{"account_id": "old", "email": "one@example.com"}]
+
+        def refresh(ids):
+            failures = [
+                {"account_id": value, "error": "401 unauthorized"}
+                for value in ids
+                if value == "old"
+            ]
+            return {
+                "total": len(ids),
+                "success": len(ids) - len(failures),
+                "failed": len(failures),
+                "errors": failures,
+            }
+
+        service = self.service(rows=rows, refresh=refresh)
+        service.detect()
+        service.mark_retrying(["old"])
+        rows.append({"account_id": "new", "email": "one@example.com"})
+        service.detect({"one@example.com": "success"})
+        rows[:] = [{"account_id": "new", "email": "one@example.com"}]
+
+        reloaded = self.service(rows=rows, refresh=refresh)
+        item = reloaded.detect()["items"][0]
+
+        self.assertEqual("cleaned", item["state"])
+        self.assertEqual("new", item["replacement_account_id"])
+        self.assertEqual("old", item["cleanup_account_id"])
+
+    def test_detect_blocks_cleanup_ready_when_verified_snapshot_changes(self):
+        rows = [{"account_id": "old", "email": "one@example.com"}]
+
+        def refresh(ids):
+            failures = [
+                {"account_id": value, "error": "401 unauthorized"}
+                for value in ids
+                if value == "old"
+            ]
+            return {
+                "total": len(ids),
+                "success": len(ids) - len(failures),
+                "failed": len(failures),
+                "errors": failures,
+            }
+
+        service = self.service(rows=rows, refresh=refresh)
+        service.detect()
+        service.mark_retrying(["old"])
+        rows.append({"account_id": "new", "email": "one@example.com"})
+        service.detect({"one@example.com": "success"})
+        rows.append({"account_id": "unexpected", "email": "one@example.com"})
+
+        item = service.detect()["items"][0]
+
+        self.assertEqual("ambiguous", item["state"])
+        self.assertEqual("", item["cleanup_account_id"])
+        self.assertIn("快照发生变化", item["reason"])
+
+    def test_historical_all_healthy_duplicates_keep_unique_latest_out_of_items(self):
+        rows = [
+            {"account_id": "old-a", "email": "one@example.com", "created_at": "2026-10-11T00:00:00Z"},
+            {"account_id": "old-b", "email": "one@example.com", "created_at": "2026-10-12T00:00:00Z"},
+            {"account_id": "keeper", "email": "one@example.com", "created_at": "2026-10-13T00:00:00Z"},
+        ]
+
+        result = self.service(rows=rows).detect()
+        by_id = {item["account_id"]: item for item in result["items"]}
+
+        self.assertEqual({"old-a", "old-b"}, set(by_id))
+        for account_id in ("old-a", "old-b"):
+            with self.subTest(account_id=account_id):
+                self.assertEqual("cleanup_ready", by_id[account_id]["state"])
+                self.assertEqual("keeper", by_id[account_id]["replacement_account_id"])
+                self.assertEqual(account_id, by_id[account_id]["cleanup_account_id"])
+                self.assertIn("唯一最新账号为 keeper", by_id[account_id]["reason"])
+
+    def test_historical_healthy_duplicates_without_created_at_remain_ambiguous(self):
+        rows = [
+            {"account_id": "a", "email": "one@example.com"},
+            {"account_id": "b", "email": "one@example.com", "created_at": "2026-10-13T00:00:00Z"},
+        ]
+
+        result = self.service(rows=rows).detect()
+
+        self.assertEqual({"a", "b"}, {item["account_id"] for item in result["items"]})
+        self.assertTrue(all(item["state"] == "ambiguous" for item in result["items"]))
+        self.assertTrue(all("缺少合法 created_at" in item["reason"] for item in result["items"]))
+
+    def test_historical_healthy_duplicates_with_tied_latest_remain_ambiguous(self):
+        rows = [
+            {"account_id": "a", "email": "one@example.com", "created_at": "2026-10-13T00:00:00Z"},
+            {"account_id": "b", "email": "one@example.com", "created_at": "2026-10-13T00:00:00Z"},
+            {"account_id": "older", "email": "one@example.com", "created_at": "2026-10-12T00:00:00Z"},
+        ]
+
+        result = self.service(rows=rows).detect()
+
+        self.assertEqual(3, len(result["items"]))
+        self.assertTrue(all(item["state"] == "ambiguous" for item in result["items"]))
+        self.assertTrue(all("created_at 并列最新" in item["reason"] for item in result["items"]))
+
+    def test_historical_unique_healthy_keeper_marks_all_unauthorized_older_ids(self):
+        rows = [
+            {"account_id": "old-a", "email": "one@example.com"},
+            {"account_id": "old-b", "email": "one@example.com"},
+            {"account_id": "keeper", "email": "one@example.com"},
+        ]
+
+        def refresh(ids):
+            errors = [
+                {"account_id": account_id, "error": "401 unauthorized"}
+                for account_id in ids
+                if account_id != "keeper"
+            ]
+            return {
+                "total": len(ids),
+                "success": len(ids) - len(errors),
+                "failed": len(errors),
+                "errors": errors,
+            }
+
+        result = self.service(rows=rows, refresh=refresh).detect()
+        by_id = {item["account_id"]: item for item in result["items"]}
+
+        self.assertEqual({"old-a", "old-b"}, set(by_id))
+        self.assertTrue(all(item["state"] == "cleanup_ready" for item in by_id.values()))
+        self.assertTrue(all(item["replacement_account_id"] == "keeper" for item in by_id.values()))
+        self.assertTrue(all("唯一健康账号为 keeper" in item["reason"] for item in by_id.values()))
+
+    def test_historical_cleanup_deletes_only_exact_old_ids(self):
+        rows = [
+            {"account_id": "old-a", "email": "one@example.com", "created_at": "2026-10-11T00:00:00Z"},
+            {"account_id": "old-b", "email": "one@example.com", "created_at": "2026-10-12T00:00:00Z"},
+            {"account_id": "keeper", "email": "one@example.com", "created_at": "2026-10-13T00:00:00Z"},
+        ]
+        deleted = []
+
+        def delete(account_id):
+            deleted.append(account_id)
+            rows[:] = [row for row in rows if row["account_id"] != account_id]
+            return {"ok": True}
+
+        service = self.service(rows=rows, delete=delete)
+        service.detect()
+        result = service.cleanup(["keeper", "old-b", "old-a", "old-b", "missing"], opt_in=True)
+
+        self.assertCountEqual(["old-a", "old-b"], deleted)
+        self.assertEqual(["keeper"], [row["account_id"] for row in rows])
+        self.assertEqual({"old-a", "old-b"}, {item["account_id"] for item in result["items"]})
+        self.assertTrue(all(item["ok"] for item in result["items"]))
+        self.assertTrue(all(item["state"] == "cleaned" for item in service.state()["items"]))
+
+    def test_historical_cleanup_allows_sequential_exact_id_cleanup_after_restart(self):
+        rows = [
+            {"account_id": "old-a", "email": "one@example.com", "created_at": "2026-10-11T00:00:00Z"},
+            {"account_id": "old-b", "email": "one@example.com", "created_at": "2026-10-12T00:00:00Z"},
+            {"account_id": "keeper", "email": "one@example.com", "created_at": "2026-10-13T00:00:00Z"},
+        ]
+        deleted = []
+
+        def delete(account_id):
+            deleted.append(account_id)
+            rows[:] = [row for row in rows if row["account_id"] != account_id]
+            return {"ok": True}
+
+        service = self.service(rows=rows, delete=delete)
+        service.detect()
+        first = service.cleanup(["old-a"], opt_in=True)
+        self.assertTrue(first["items"][0]["ok"])
+
+        reloaded = self.service(rows=rows, delete=delete)
+        second = reloaded.cleanup(["old-b"], opt_in=True)
+
+        self.assertTrue(second["items"][0]["ok"])
+        self.assertEqual(["old-a", "old-b"], deleted)
+        self.assertEqual(["keeper"], [row["account_id"] for row in rows])
+
+    def test_cleanup_blocks_when_same_email_snapshot_changes(self):
+        rows = [{"account_id": "old", "email": "one@example.com"}]
+        errors = {"old": "401 unauthorized"}
+        deleted = []
+
+        def refresh(ids):
+            failures = [
+                {"account_id": value, "error": errors[value]}
+                for value in ids
+                if value in errors
+            ]
+            return {
+                "total": len(ids),
+                "success": len(ids) - len(failures),
+                "failed": len(failures),
+                "errors": failures,
+            }
+
+        service = self.service(
+            rows=rows,
+            refresh=refresh,
+            delete=lambda account_id: deleted.append(account_id) or {"ok": True},
+        )
+        service.detect()
+        service.mark_retrying(["old"])
+        rows.append({"account_id": "new", "email": "one@example.com"})
+        service.detect({"one@example.com": "success"})
+        rows.append({"account_id": "unexpected", "email": "one@example.com"})
+
+        result = service.cleanup(["old"], opt_in=True)
+
+        self.assertEqual([], deleted)
+        self.assertFalse(result["items"][0]["ok"])
+        item = service.state()["items"][0]
+        self.assertEqual("ambiguous", item["state"])
+        self.assertIn("快照已变化", item["reason"])
+
     def test_no_new_account_is_ambiguous_and_not_cleanup_ready(self):
         rows = [{"account_id": "old", "email": "one@example.com"}]
         service = self.service(
@@ -204,6 +419,7 @@ class Sub2Api401ServiceTests(unittest.TestCase):
         self.assertTrue(result["items"][0]["ok"])
         self.assertEqual("deleted_and_verified", result["items"][0]["result"])
         self.assertEqual("cleaned", service.state()["items"][0]["state"])
+        self.assertEqual("old", service.state()["items"][0]["cleanup_account_id"])
 
     def test_cleanup_waits_for_detection_state_commit_and_does_not_delete_stale_target(self):
         rows = [{"account_id": "old", "email": "one@example.com"}]
@@ -269,6 +485,114 @@ class Sub2Api401ServiceTests(unittest.TestCase):
         self.assertEqual("cleanup_ready", item["state"])
         self.assertEqual("old", item["cleanup_account_id"])
         self.assertEqual("new", item["replacement_account_id"])
+
+    def test_cleanup_requires_healthy_replacement_after_delete(self):
+        rows = [{"account_id": "old", "email": "one@example.com"}]
+        new_only_refreshes = 0
+        deleted = []
+
+        def refresh(ids):
+            nonlocal new_only_refreshes
+            if ids == ["new"]:
+                new_only_refreshes += 1
+                if new_only_refreshes >= 2:
+                    return {
+                        "total": 1,
+                        "success": 0,
+                        "failed": 1,
+                        "errors": [{"account_id": "new", "error": "401 unauthorized"}],
+                    }
+            failures = [
+                {"account_id": value, "error": "401 unauthorized"}
+                for value in ids
+                if value == "old"
+            ]
+            return {
+                "total": len(ids),
+                "success": len(ids) - len(failures),
+                "failed": len(failures),
+                "errors": failures,
+            }
+
+        def delete(account_id):
+            deleted.append(account_id)
+            rows[:] = [row for row in rows if row["account_id"] != account_id]
+            return {"ok": True}
+
+        service = self.service(rows=rows, refresh=refresh, delete=delete)
+        service.detect()
+        service.mark_retrying(["old"])
+        rows.append({"account_id": "new", "email": "one@example.com"})
+        service.detect({"one@example.com": "success"})
+
+        result = service.cleanup(["old"], opt_in=True)
+
+        self.assertEqual(["old"], deleted)
+        self.assertFalse(result["items"][0]["ok"])
+        item = service.state()["items"][0]
+        self.assertEqual("ambiguous", item["state"])
+        self.assertIn("清理后替代 account_id 未通过刷新验证", item["reason"])
+
+    def test_cleanup_reconciles_missing_old_id_after_relist_failure_and_restart(self):
+        rows = [{"account_id": "old", "email": "one@example.com"}]
+        deleted = []
+        fail_next_list = False
+
+        def list_accounts():
+            nonlocal fail_next_list
+            if fail_next_list:
+                fail_next_list = False
+                raise RuntimeError("transient list failure with secret detail")
+            return list(rows)
+
+        def refresh(ids):
+            failures = [
+                {"account_id": value, "error": "401 unauthorized"}
+                for value in ids
+                if value == "old"
+            ]
+            return {
+                "total": len(ids),
+                "success": len(ids) - len(failures),
+                "failed": len(failures),
+                "errors": failures,
+            }
+
+        def delete(account_id):
+            nonlocal fail_next_list
+            deleted.append(account_id)
+            rows[:] = [row for row in rows if row["account_id"] != account_id]
+            fail_next_list = True
+            return {"ok": True}
+
+        service = Sub2Api401Service(
+            list_fn=list_accounts,
+            refresh_fn=refresh,
+            delete_fn=delete,
+            audit_path=self.audit_path,
+        )
+        service.detect()
+        service.mark_retrying(["old"])
+        rows.append({"account_id": "new", "email": "one@example.com"})
+        service.detect({"one@example.com": "success"})
+
+        first = service.cleanup(["old"], opt_in=True)
+        self.assertFalse(first["items"][0]["ok"])
+        self.assertEqual("cleanup_ready", service.state()["items"][0]["state"])
+        self.assertNotIn("secret detail", self.audit_path.read_text(encoding="utf-8"))
+
+        reloaded = Sub2Api401Service(
+            list_fn=lambda: list(rows),
+            refresh_fn=refresh,
+            delete_fn=delete,
+            audit_path=self.audit_path,
+        )
+        second = reloaded.cleanup(["old"], opt_in=True)
+
+        self.assertTrue(second["items"][0]["ok"])
+        self.assertEqual("absent_and_verified", second["items"][0]["result"])
+        self.assertEqual(["old"], deleted)
+        self.assertEqual("cleaned", reloaded.state()["items"][0]["state"])
 
     def test_audit_write_is_atomic_private_and_symlink_target_safe(self):
         target_dir = Path(self.temp_dir.name) / "data"

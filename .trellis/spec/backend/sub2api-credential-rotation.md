@@ -50,7 +50,7 @@ DELETE /api/v1/admin/accounts/<exact account_id>
 
 ### 3. Contracts
 
-Environment is reused from `config/sub2api.py`: `SUB2API_API_BASE`, `SUB2API_API_KEY` or `SUB2API_API_TOKEN`, `SUB2API_API_AUTH_HEADER`, `SUB2API_API_AUTH_SCHEME`, and `SUB2API_API_TIMEOUT`. Do not introduce a second management-secret configuration.
+Environment is reused from `config/sub2api.py`: `SUB2API_API_BASE`, `SUB2API_API_KEY` or `SUB2API_API_TOKEN`, `SUB2API_API_AUTH_HEADER`, `SUB2API_API_AUTH_SCHEME`, and `SUB2API_API_TIMEOUT`. Do not introduce a second management-secret configuration. The list adapter may retain only a bounded, validated non-sensitive `created_at` value; malformed, missing, or tied latest timestamps are not usable for keeper selection.
 
 The list adapter accepts direct payloads and standard `{code, data}` envelopes, traverses bounded pagination, deduplicates by normalized `account_id`, and retains only `platform=openai` plus `type=oauth`. Numeric IDs remain strings in audit/UI state but are sent as integers on batch-refresh requests. Email candidates are normalized; missing or conflicting candidates set `email_ambiguous` and are ineligible for retry and cleanup.
 
@@ -65,7 +65,7 @@ Errors matching HTTP 401, `unauthorized`, `invalid_grant`, or `invalid_token` ar
 Audit entries contain non-sensitive evidence only:
 
 ```text
-account_id, account_name, email, state, health, reason,
+account_id, account_name, email, created_at, state, health, reason,
 observed_account_ids, pre_retry_account_ids, post_retry_account_ids,
 replacement_account_id, cleanup_account_id, candidate_count,
 checked_at, pre_retry_snapshot_at, post_retry_snapshot_at,
@@ -94,16 +94,18 @@ All Sub2API-401 responses set `Cache-Control: no-store, max-age=0`, `Pragma: no-
 | Email is missing or maps to multiple account IDs | `ambiguous`; retry and cleanup disabled |
 | OAuth/local retry fails | `failed`; preserve the old ID and snapshot |
 | No new ID or multiple new IDs appear | `ambiguous`; cleanup disabled |
-| Exactly one new same-email ID refreshes healthy and old ID remains | `cleanup_ready` with exact old/new IDs locked |
+| Exactly one new same-email ID refreshes healthy and old ID remains | `cleanup_ready` with exact old/new IDs locked; the retry runner immediately performs exact-ID cleanup |
 | `confirm_cleanup` is not literal `true` | Review only; no DELETE request |
 | Locked state changes before cleanup | Skip stale target; no DELETE request |
 | Delete succeeds but old ID remains on re-list | Keep evidence and report verification failure |
-| Delete and re-list confirm old ID absent | `cleaned` |
+| Delete/reconciliation confirms old ID absent but the replacement is missing or not healthy | `ambiguous`; keep bounded evidence for review |
+| Re-list confirms old ID absent and a second refresh confirms the replacement healthy | `cleaned` |
 
 ### 5. Good/Base/Bad Cases
 
-- Good: old ID `42` is unauthorized, its same-email ID set is snapshotted, OAuth creates healthy ID `84`, and ID `42` still exists. State becomes `cleanup_ready`; explicit confirmation deletes only `42`, then re-list confirms it is absent.
-- Base: healthy accounts are counted but omitted from the actionable list. Unauthorized accounts remain `pending` until the operator selects their exact IDs.
+- Good: old ID `42` is unauthorized, its same-email ID set is snapshotted, OAuth creates healthy ID `84`, and ID `42` still exists. State becomes `cleanup_ready`; the retry runner deletes only locked ID `42`, then re-list confirms it is absent and state becomes `cleaned`.
+- Historical duplicate: one healthy account with unauthorized peers, or multiple healthy accounts with one unique latest valid `created_at`, marks each older exact ID `cleanup_ready`; detection itself never deletes.
+- Base: healthy accounts are counted but omitted from the actionable list. Unauthorized accounts remain `pending` until the operator selects their exact IDs. The page defaults retry workers to 3; cleanup is a manual action only for historical duplicates or an automatic cleanup failure.
 - Bad: email extraction is ambiguous, the pre-retry ID set changes, OAuth creates zero or multiple candidates, the new ID is not healthy, or cleanup state becomes stale. State becomes `failed` or `ambiguous`; no deletion occurs.
 
 ### 6. Tests Required
@@ -132,7 +134,8 @@ Local completion is not remote proof, and email-wide deletion can remove the rep
 service.mark_retrying([old_account_id], batch_id=batch_id)
 run_existing_codex_retry(email)
 result = service.detect({email: local_codex_status})
-service.cleanup([old_account_id], opt_in=operator_confirmed)
+# The retry runner auto-cleans only the selected, locked IDs in cleanup_ready.
+service.cleanup([old_account_id], opt_in=True)
 ```
 
 Cleanup becomes available only after Sub2API shows one healthy new same-email `account_id` while the snapshotted old ID still exists. The delete target remains the exact locked old ID.

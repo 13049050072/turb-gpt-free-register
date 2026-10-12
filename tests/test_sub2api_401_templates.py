@@ -22,7 +22,8 @@ class Sub2Api401TemplateTests(unittest.TestCase):
         for text in (
             "检测 Sub2API 401",
             "补跑 Codex",
-            "确认清理旧 ID",
+            "重试清理旧 ID",
+            "按钮仅用于历史重复项或自动清理失败重试",
             "补跑前 account_id",
             "补跑后 account_id",
             "唯一替代 account_id",

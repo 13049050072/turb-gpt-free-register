@@ -1,0 +1,2 @@
+{"file": ".trellis/spec/backend/sub2api-credential-rotation.md", "reason": "Review implementation against exact-ID deletion, verification, persistence, redaction and test requirements."}
+{"file": ".trellis/tasks/10-13-sub2api-cleanup-duplicates/prd.md", "reason": "Verify future auto-cleanup, historical duplicate convergence and default concurrency 3 acceptance criteria."}

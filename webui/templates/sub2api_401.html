@@ -20,13 +20,13 @@
 </head>
 <body>
 <div class="wrap">
-  <div class="top"><div><h1>Sub2API 401 凭证轮换</h1><div class="muted">批量刷新 OpenAI OAuth 账号 → 补跑 unauthorized → 验证同邮箱新 account_id → 显式删除锁定旧 ID。</div></div><a href="/">← 返回控制台</a></div>
+  <div class="top"><div><h1>Sub2API 401 凭证轮换</h1><div class="muted">批量刷新 OpenAI OAuth 账号 → 补跑 unauthorized → 验证同邮箱新 account_id → 自动清理锁定旧 ID（历史重复项或失败时可手动重试）。</div></div><a href="/">← 返回控制台</a></div>
   <section class="card">
     <div class="toolbar">
       <button class="primary" id="detectBtn">检测 Sub2API 401</button>
       <button id="retryBtn" disabled>补跑 Codex（已选 0）</button>
-      <button class="danger" id="cleanupBtn" disabled>确认清理旧 ID（已选 0）</button>
-      <label>并发 <select id="workers"><option>1</option><option>2</option><option>3</option><option>4</option><option>6</option><option>8</option></select></label>
+      <button class="danger" id="cleanupBtn" disabled>重试清理旧 ID（已选 0）</button>
+      <label>并发 <select id="workers"><option>1</option><option>2</option><option selected>3</option><option>4</option><option>6</option><option>8</option></select></label>
       <span class="spacer"></span><span class="muted" id="checkedAt">正在读取审计状态…</span>
     </div>
     <div class="counts">
@@ -37,7 +37,7 @@
       <div class="metric"><span class="muted">状态正常</span><b id="healthyCount">0</b></div>
       <div class="metric"><span class="muted">状态未知</span><b id="unknownCount">0</b></div>
     </div>
-    <div class="notice">系统仅处理 platform=openai 且 type=oauth 的 Sub2API 账号。清理必须显式确认，并且只会删除检测时锁定、验证时仍存在的旧 account_id；不会按邮箱批量删除。</div>
+    <div class="notice">系统仅处理 platform=openai 且 type=oauth 的 Sub2API 账号。补跑验证出唯一健康替代 ID 后会自动清理锁定旧 ID；按钮仅用于历史重复项或自动清理失败重试，并且不会按邮箱批量删除。</div>
     <div id="message"></div>
     <pre id="cleanupQueue" class="queue hidden"></pre>
   </section>
@@ -55,7 +55,7 @@
   let items = [];
   let cleanupSupported = true;
   const esc = value => String(value ?? '').replace(/[&<>"']/g, ch => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch]));
-  const stateText = {pending:'待补跑',retrying:'补跑中',verified:'已验证',cleanup_ready:'待显式清理',cleaned:'已清理',failed:'补跑失败',ambiguous:'状态不明确'};
+  const stateText = {pending:'待补跑',retrying:'补跑中',verified:'已验证',cleanup_ready:'待清理/可重试',cleaned:'已清理',failed:'补跑失败',ambiguous:'状态不明确'};
   async function api(path, options={}) {
     const response = await fetch(path, {...options, headers:{'Content-Type':'application/json', ...(options.headers || {})}});
     const data = await response.json().catch(() => ({ok:false,error:`HTTP ${response.status}`}));
@@ -90,7 +90,7 @@
     $('#retryBtn').disabled = retryIds.length === 0;
     $('#retryBtn').textContent = `补跑 Codex（已选 ${retryIds.length}）`;
     $('#cleanupBtn').disabled = !cleanupSupported || cleanupIds.length === 0;
-    $('#cleanupBtn').textContent = `确认清理旧 ID（已选 ${cleanupIds.length}）`;
+    $('#cleanupBtn').textContent = `重试清理旧 ID（已选 ${cleanupIds.length}）`;
     $('#selectAll').checked = actionable.length > 0 && actionable.every(item => selected.has(item.account_id));
     $('#selectAll').indeterminate = selected.size > 0 && !$('#selectAll').checked;
   }
@@ -111,10 +111,10 @@
   $('#detectBtn').addEventListener('click', detect);
   $('#retryBtn').addEventListener('click', async () => {
     const accountIds = [...selected].filter(accountId => items.some(item => item.account_id === accountId && item.retryable));
-    if (!accountIds.length || !confirm(`补跑选中的 ${accountIds.length} 个 Codex OAuth？\n\n系统会保存旧 account_id 快照；只有同邮箱出现唯一新 account_id 且旧 ID 仍存在时才允许清理。`)) return;
+    if (!accountIds.length || !confirm(`补跑选中的 ${accountIds.length} 个 Codex OAuth？\n\n系统会保存旧 account_id 快照；只有同邮箱出现唯一健康新 account_id 且旧 ID 仍存在时才会自动删除锁定旧 ID。`)) return;
     $('#retryBtn').disabled = true;
     try {
-      const data = await api('/api/sub2api-401/retry', {method:'POST', body:JSON.stringify({account_ids:accountIds, workers:Number($('#workers').value || 1)})});
+      const data = await api('/api/sub2api-401/retry', {method:'POST', body:JSON.stringify({account_ids:accountIds, workers:Number($('#workers').value || 3)})});
       for (const accountId of accountIds) {
         const item = items.find(row => row.account_id === accountId);
         if (item) { item.pre_retry_account_ids = [...(item.observed_account_ids || [accountId])]; item.state='retrying'; item.reason='已启动 Codex OAuth 补跑，等待 Sub2API 新 account_id 后置验证'; item.retryable=false; }
@@ -134,7 +134,7 @@
       const lines = (preview.items || []).map(item => `${item.email || '—'}\n  旧 account_id: ${item.cleanup_account_id || '—'}\n  已验证替代: ${item.replacement_account_id || '—'}`);
       $('#cleanupQueue').textContent = `${preview.manual_action || ''}\n\n${lines.join('\n\n')}`.trim();
       $('#cleanupQueue').classList.remove('hidden');
-      if (!confirm(`确认删除 ${accountIds.length} 个已锁定的旧 Sub2API account_id？\n\n系统不会按邮箱删除，并会在删除后重新读取账号列表确认旧 ID 消失。`)) return;
+      if (!confirm(`确认删除 ${accountIds.length} 个已锁定的旧 Sub2API account_id？\n\n系统不会按邮箱删除，并会在删除后重新读取账号列表确认旧 ID 消失；此按钮仅重试历史重复项或自动清理失败。`)) return;
       const result = await api('/api/sub2api-401/cleanup', {method:'POST', body:JSON.stringify({account_ids:accountIds, confirm_cleanup:true})});
       await loadState();
       const failed = (result.items || []).filter(item => !item.ok).length;

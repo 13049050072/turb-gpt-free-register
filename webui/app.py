@@ -2813,11 +2813,10 @@ def create_app(auth_code: str | None = None) -> Flask:
             return _sub2api_401_response({"ok": False, "error": "account_ids 必须是非空数组"}, 400)
         if len(account_ids) > 50:
             return _sub2api_401_response({"ok": False, "error": "单次最多选择 50 个账号"}, 400)
-        try:
-            workers = int(data.get("workers") or 1)
-        except (TypeError, ValueError):
+        raw_workers = data.get("workers", 3)
+        if isinstance(raw_workers, bool) or not isinstance(raw_workers, int):
             return _sub2api_401_response({"ok": False, "error": "workers 必须是整数"}, 400)
-        workers = max(1, min(8, workers))
+        workers = max(1, min(8, raw_workers))
 
         candidates, skipped = sub2api_401_service.select_retryable(account_ids, limit=50)
         selected: list[dict] = []
@@ -2891,7 +2890,7 @@ def create_app(auth_code: str | None = None) -> Flask:
                     except Exception as exc:
                         logger.warning("Sub2API 401 Codex 补跑子任务异常 batch=%s error=%s", batch, type(exc).__name__)
             try:
-                sub2api_401_service.detect(_sub2api_401_local_statuses())
+                result = sub2api_401_service.detect(_sub2api_401_local_statuses())
             except Exception as exc:
                 error, _status = _sub2api_401_remote_error(exc)
                 sub2api_401_service.mark_verification_error(
@@ -2899,6 +2898,27 @@ def create_app(auth_code: str | None = None) -> Flask:
                     f"{error}；旧账号保持不变",
                 )
                 logger.warning("Sub2API 401 后置验证失败 batch=%s: %s", batch, error)
+            else:
+                cleanup_ids = [
+                    item["account_id"] for item in result.get("items", [])
+                    if (
+                        item.get("account_id") in selected_ids
+                        and item.get("retry_batch_id") == batch
+                        and item.get("state") == "cleanup_ready"
+                    )
+                ]
+                if cleanup_ids:
+                    try:
+                        cleanup_result = sub2api_401_service.cleanup(cleanup_ids, opt_in=True, limit=50)
+                        failed_cleanup = sum(1 for item in cleanup_result.get("items", []) if not item.get("ok"))
+                        if failed_cleanup:
+                            logger.warning("Sub2API 401 自动清理失败 batch=%s count=%s", batch, failed_cleanup)
+                    except Exception as exc:
+                        logger.warning(
+                            "Sub2API 401 自动清理异常 batch=%s error=%s；保留 cleanup_ready",
+                            batch,
+                            type(exc).__name__,
+                        )
 
         try:
             threading.Thread(
@@ -2915,7 +2935,7 @@ def create_app(auth_code: str | None = None) -> Flask:
             return _sub2api_401_response({"ok": False, "error": "Sub2API 401 补跑调度失败"}, 500)
         return _sub2api_401_response({
             "ok": True,
-            "message": f"已启动 {len(selected)} 个 Codex 补跑任务；完成后将自动验证 Sub2API 替代 account_id",
+            "message": f"已启动 {len(selected)} 个 Codex 补跑任务；唯一健康替代 account_id 验证成功后将自动删除锁定旧 ID",
             "started": selected,
             "started_count": len(selected),
             "skipped": skipped[:50],

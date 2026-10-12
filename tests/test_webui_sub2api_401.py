@@ -119,8 +119,130 @@ class WebuiSub2Api401Tests(unittest.TestCase):
         self.assert_sensitive_headers(response)
         body = response.get_json()
         self.assertEqual(1, body["started_count"])
+        self.assertIn("自动删除锁定旧 ID", body["message"])
         self.assertEqual("old-id", body["started"][0]["account_id"])
         mark_retrying.assert_called_once_with(["old-id"], batch_id=ANY)
+
+    def test_retry_defaults_workers_to_three(self):
+        candidate = {"account_id": "old-id", "email": "bad@example.com", "retryable": True, "state": "pending"}
+        with patch(
+            "core.sub2api_401_service.Sub2Api401Service.select_retryable",
+            return_value=([candidate], []),
+        ), patch(
+            "core.sub2api_401_service.Sub2Api401Service.mark_retrying"
+        ), patch(
+            "webui.app.db.get_account_by_email", return_value={"id": 1, "email": "bad@example.com"}
+        ), patch(
+            "webui.app.codex_retry_service.reserve", return_value=True
+        ), patch(
+            "webui.app.db.update_account_codex_status"
+        ), patch(
+            "webui.app.codex_retry_service.log_path",
+            return_value=Path(tempfile.gettempdir()) / "retry.log",
+        ), patch(
+            "webui.app.threading.Thread"
+        ) as thread:
+            response = self.client.post(
+                "/api/sub2api-401/retry",
+                headers=self.headers,
+                json={"account_ids": ["old-id"]},
+            )
+        self.assertEqual(200, response.status_code)
+        thread.assert_called_once()
+        self.assertEqual(3, thread.call_args.kwargs["args"][1])
+
+    def test_retry_runner_detects_after_workers_and_cleans_only_selected_ready_ids(self):
+        candidates = [
+            {"account_id": "old-a", "email": "a@example.com", "retryable": True, "state": "pending"},
+            {"account_id": "old-b", "email": "b@example.com", "retryable": True, "state": "pending"},
+        ]
+        events = []
+        batch_ids = []
+
+        def mark_retrying(_account_ids, *, batch_id):
+            batch_ids.append(batch_id)
+
+        def run_worker(email, **_kwargs):
+            events.append(f"worker:{email}")
+
+        def detect(_local_status):
+            events.append("detect")
+            return {
+                "items": [
+                    {"account_id": "old-a", "state": "cleanup_ready", "retry_batch_id": batch_ids[0]},
+                    {"account_id": "old-b", "state": "cleanup_ready", "retry_batch_id": "older-batch"},
+                    {"account_id": "unrelated", "state": "cleanup_ready", "retry_batch_id": batch_ids[0]},
+                ]
+            }
+
+        def cleanup(_account_ids, **_kwargs):
+            events.append("cleanup")
+            return {
+                "items": [{
+                    "account_id": "old-a",
+                    "cleanup_account_id": "old-a",
+                    "replacement_account_id": "new-a",
+                    "ok": False,
+                    "result": "not_deleted",
+                    "reason": "Sub2API 删除请求失败",
+                }]
+            }
+
+        with tempfile.TemporaryDirectory() as tmp, patch(
+            "core.sub2api_401_service.Sub2Api401Service.select_retryable",
+            return_value=(candidates, []),
+        ), patch(
+            "core.sub2api_401_service.Sub2Api401Service.mark_retrying",
+            side_effect=mark_retrying,
+        ), patch(
+            "core.sub2api_401_service.Sub2Api401Service.detect", side_effect=detect
+        ) as detect_mock, patch(
+            "core.sub2api_401_service.Sub2Api401Service.cleanup", side_effect=cleanup
+        ) as cleanup_mock, patch(
+            "webui.app.db.get_account_by_email",
+            side_effect=lambda email: {"id": email, "email": email},
+        ), patch(
+            "webui.app.codex_retry_service.reserve", return_value=True
+        ), patch(
+            "webui.app.db.update_account_codex_status"
+        ), patch(
+            "webui.app.codex_retry_service.log_path",
+            side_effect=lambda email: Path(tmp) / f"{email}.log",
+        ), patch(
+            "webui.app.db.list_accounts", return_value=[]
+        ), patch(
+            "webui.app.codex_retry_service.run_worker", side_effect=run_worker
+        ):
+            with patch("webui.app.threading.Thread") as thread:
+                response = self.client.post(
+                    "/api/sub2api-401/retry",
+                    headers=self.headers,
+                    json={"account_ids": ["old-a", "old-b"], "workers": 2},
+                )
+                runner = thread.call_args.kwargs["target"]
+                runner_args = thread.call_args.kwargs["args"]
+            runner(*runner_args)
+
+        self.assertEqual(200, response.status_code)
+        self.assert_sensitive_headers(response)
+        worker_indexes = [index for index, event in enumerate(events) if event.startswith("worker:")]
+        self.assertEqual(2, len(worker_indexes))
+        self.assertGreater(events.index("detect"), max(worker_indexes))
+        self.assertGreater(events.index("cleanup"), events.index("detect"))
+        detect_mock.assert_called_once_with({})
+        cleanup_mock.assert_called_once_with(["old-a"], opt_in=True, limit=50)
+
+    def test_retry_rejects_non_integer_workers(self):
+        for workers in (True, False, "3", 3.5, None):
+            with self.subTest(workers=workers):
+                response = self.client.post(
+                    "/api/sub2api-401/retry",
+                    headers=self.headers,
+                    json={"account_ids": ["old-id"], "workers": workers},
+                )
+                self.assertEqual(400, response.status_code)
+                self.assert_sensitive_headers(response)
+                self.assertEqual("workers 必须是整数", response.get_json()["error"])
 
     def test_retry_snapshot_conflict_releases_reservation_and_returns_409(self):
         candidate = {"account_id": "old-id", "email": "bad@example.com", "retryable": True, "state": "pending"}
@@ -185,6 +307,25 @@ class WebuiSub2Api401Tests(unittest.TestCase):
         self.assertEqual(422, response.status_code)
         self.assert_sensitive_headers(response)
         self.assertEqual(0, response.get_json()["started_count"])
+
+    def test_cleanup_errors_are_bounded_and_do_not_echo_secrets(self):
+        with patch(
+            "core.sub2api_401_service.Sub2Api401Service.cleanup",
+            side_effect=RuntimeError(
+                "access_token=super-secret callback=https://secret.example/cb?code=secret-code"
+            ),
+        ):
+            response = self.client.post(
+                "/api/sub2api-401/cleanup",
+                headers=self.headers,
+                json={"account_ids": ["old-id"], "confirm_cleanup": True},
+            )
+        self.assertEqual(502, response.status_code)
+        self.assert_sensitive_headers(response)
+        text = response.get_data(as_text=True).lower()
+        self.assertNotIn("super-secret", text)
+        self.assertNotIn("secret.example", text)
+        self.assertNotIn("secret-code", text)
 
     def test_cleanup_passes_explicit_confirmation_and_account_ids(self):
         payload = {

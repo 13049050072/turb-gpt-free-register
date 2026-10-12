@@ -63,6 +63,25 @@ class Sub2ApiAdminClientTests(unittest.TestCase):
         self.assertEqual(["0", "1"], [row["account_id"] for row in rows])
         self.assertEqual(2, len(calls))
 
+    def test_list_preserves_only_valid_created_at(self):
+        def request(method, path, body):
+            return {"data": {"items": [
+                {"id": "valid", "email": "valid@example.com", "platform": "openai", "type": "oauth", "created_at": "2026-10-13T01:02:03Z", "access_token": "secret"},
+                {"id": "numeric", "email": "numeric@example.com", "platform": "openai", "type": "oauth", "createdAt": 1_760_317_323},
+                {"id": "invalid", "email": "invalid@example.com", "platform": "openai", "type": "oauth", "created_at": "not-a-date"},
+                {"id": "future", "email": "future@example.com", "platform": "openai", "type": "oauth", "created_at": 4_102_444_800},
+                {"id": "url", "email": "url@example.com", "platform": "openai", "type": "oauth", "created_at": "https://secret.example/callback"},
+                {"id": "overlong", "email": "long@example.com", "platform": "openai", "type": "oauth", "created_at": "2026-10-13T01:02:03Z" + "x" * 1000},
+            ]}}
+        rows = Sub2ApiAdminClient(request).list_openai_oauth_accounts()
+        by_id = {row["account_id"]: row for row in rows}
+        self.assertEqual("2026-10-13T01:02:03+00:00", by_id["valid"]["created_at"])
+        self.assertEqual("2025-10-13T01:02:03+00:00", by_id["numeric"]["created_at"])
+        for account_id in ("invalid", "future", "url", "overlong"):
+            self.assertEqual("", by_id[account_id]["created_at"])
+        self.assertNotIn("access_token", str(rows))
+        self.assertNotIn("secret.example", str(rows))
+
     def test_list_marks_multiple_emails_in_account_name_ambiguous(self):
         def request(method, path, body):
             return {

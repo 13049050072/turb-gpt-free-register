@@ -1,0 +1,2 @@
+{"file":".trellis/spec/backend/logging-guidelines.md","reason":"Sanitize all production evidence and avoid secrets in diagnostic reports."}
+{"file":".trellis/spec/backend/error-handling.md","reason":"Trace error propagation and distinguish failure categories."}

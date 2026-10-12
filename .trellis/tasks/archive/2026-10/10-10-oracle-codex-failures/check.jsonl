@@ -1,0 +1,2 @@
+{"file":".trellis/spec/backend/logging-guidelines.md","reason":"Verify the report and evidence contain no credential material."}
+{"file":".trellis/spec/backend/quality-guidelines.md","reason":"Check diagnostic claims against observed results; no business code change."}

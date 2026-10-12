@@ -325,6 +325,9 @@ def create_app(auth_code: str | None = None) -> Flask:
 
     init_auth(app, auth_code=auth_code)
     register_auth_routes(app)
+    recovered_registration_jobs = db.recover_interrupted_registration_jobs()
+    if recovered_registration_jobs:
+        logger.warning("已释放 %s 个因 WebUI 重启中断的注册任务", recovered_registration_jobs)
     recovered_plan_checks = db.recover_interrupted_plan_checks()
     if recovered_plan_checks:
         logger.warning("已恢复 %s 个因 WebUI 重启中断的套餐查询状态", recovered_plan_checks)

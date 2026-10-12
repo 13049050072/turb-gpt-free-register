@@ -3099,6 +3099,23 @@ def create_job(email_source: str) -> dict:
         return dict(row)
 
 
+def recover_interrupted_registration_jobs() -> int:
+    """服务重启后将未完成的注册任务标记为 stopped，避免继续占用活动任务名额。"""
+    with _LOCK:
+        rows = _load_jobs()
+        changed = 0
+        now = _now()
+        for row in rows:
+            if row.get("status") in {"running", "stopping"}:
+                row["status"] = "stopped"
+                row["error"] = "服务重启，注册任务被中断并释放"
+                row["completed_at"] = now
+                changed += 1
+        if changed:
+            _save_jobs(rows)
+        return changed
+
+
 def create_retry_job(
     source_job_id: int,
     *,

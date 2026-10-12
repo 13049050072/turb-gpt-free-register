@@ -67,13 +67,13 @@ Audit entries contain non-sensitive evidence only:
 ```text
 account_id, account_name, email, created_at, state, health, reason,
 observed_account_ids, pre_retry_account_ids, post_retry_account_ids,
-replacement_account_id, cleanup_account_id, candidate_count,
+replacement_account_id, replacement_health, cleanup_account_id, candidate_count,
 checked_at, pre_retry_snapshot_at, post_retry_snapshot_at,
 retry_started_at, retry_batch_id, local_codex_status,
 retryable, cleanup_supported, manual_action
 ```
 
-Allowed states are `pending`, `retrying`, `verified`, `cleanup_ready`, `cleaned`, `failed`, and `ambiguous`. Management keys, access/refresh tokens, OAuth codes, callback URLs, cookies, and credential JSON must never be logged, persisted, or returned. Reasons are bounded and secret-like text is redacted.
+Allowed states are `pending`, `retrying`, `verified`, `cleanup_ready`, `cleaned`, `failed`, and `ambiguous`. `replacement_health` is empty without a keeper and otherwise records only the cleanup invariant `healthy` or `unauthorized`; audits created before this field existed default to `healthy` so deployed replacement cleanup remains restart-safe. Management keys, access/refresh tokens, OAuth codes, callback URLs, cookies, and credential JSON must never be logged, persisted, or returned. Reasons are bounded and secret-like text is redacted.
 
 `sub2api_401_audit.json` is persisted atomically. If the configured audit path is a symlink, create the temporary file beside the resolved target so `os.replace()` remains on the writable data volume and preserves the symlink. Use mode `0600` where supported.
 
@@ -94,24 +94,29 @@ All Sub2API-401 responses set `Cache-Control: no-store, max-age=0`, `Pragma: no-
 | Email is missing or maps to multiple account IDs | `ambiguous`; retry and cleanup disabled |
 | OAuth/local retry fails | `failed`; preserve the old ID and snapshot |
 | No new ID or multiple new IDs appear | `ambiguous`; cleanup disabled |
-| Exactly one new same-email ID refreshes healthy and old ID remains | `cleanup_ready` with exact old/new IDs locked; the retry runner immediately performs exact-ID cleanup |
+| Exactly one new same-email ID refreshes healthy and old ID remains | `cleanup_ready` with exact old/new IDs locked and `replacement_health=healthy`; the retry runner immediately performs exact-ID cleanup |
+| Every member of a historical same-email duplicate group is unauthorized and one account has the unique latest valid `created_at` | Omit the latest keeper; mark each older exact ID `cleanup_ready` with `replacement_health=unauthorized`; detection performs no deletion |
+| Historical all-unauthorized group has missing/invalid/tied `created_at`, or any timeout/unknown classification | `ambiguous`; no cleanup target is locked |
 | `confirm_cleanup` is not literal `true` | Review only; no DELETE request |
 | Locked state changes before cleanup | Skip stale target; no DELETE request |
+| Historical unauthorized keeper cleanup precheck changes the group snapshot, any classification, email, persisted non-keeper `created_at`, or unique-latest result | `ambiguous`; no DELETE request |
 | Delete succeeds but old ID remains on re-list | Keep evidence and report verification failure |
-| Delete/reconciliation confirms old ID absent but the replacement is missing or not healthy | `ambiguous`; keep bounded evidence for review |
+| Delete/reconciliation confirms old ID absent but the replacement is missing or no longer matches its locked `healthy`/`unauthorized` invariant | `ambiguous`; keep bounded evidence for review |
 | Re-list confirms old ID absent and a second refresh confirms the replacement healthy | `cleaned` |
+| Re-list confirms an exact historical old ID absent, the keeper remains same-email and unique latest, and a second refresh confirms it unauthorized | `cleaned`; on the next detect the unauthorized singleton keeper becomes normal retryable `pending` |
+| Historical unauthorized old ID is absent but the keeper no longer refreshes unauthorized or is no longer unique latest | `ambiguous`; retain the exact cleanup and keeper evidence |
 
 ### 5. Good/Base/Bad Cases
 
 - Good: old ID `42` is unauthorized, its same-email ID set is snapshotted, OAuth creates healthy ID `84`, and ID `42` still exists. State becomes `cleanup_ready`; the retry runner deletes only locked ID `42`, then re-list confirms it is absent and state becomes `cleaned`.
-- Historical duplicate: one healthy account with unauthorized peers, or multiple healthy accounts with one unique latest valid `created_at`, marks each older exact ID `cleanup_ready`; detection itself never deletes.
+- Historical duplicate: one healthy account with unauthorized peers, multiple healthy accounts with one unique latest valid `created_at`, or all unauthorized accounts with one unique latest valid `created_at`, marks each older exact ID `cleanup_ready`; detection itself never deletes. The all-unauthorized branch refreshes the complete live same-email group before deletion, requires every classification to remain unauthorized, and refreshes the unique-latest keeper again after deletion.
 - Base: healthy accounts are counted but omitted from the actionable list. Unauthorized accounts remain `pending` until the operator selects their exact IDs. The page defaults retry workers to 3; cleanup is a manual action only for historical duplicates or an automatic cleanup failure.
-- Bad: email extraction is ambiguous, the pre-retry ID set changes, OAuth creates zero or multiple candidates, the new ID is not healthy, or cleanup state becomes stale. State becomes `failed` or `ambiguous`; no deletion occurs.
+- Bad: email extraction is ambiguous, the pre-retry ID set changes, OAuth creates zero or multiple candidates, the new ID is not healthy, historical timestamps are missing/invalid/tied, historical health includes timeout/unknown, or cleanup state/classification changes. State becomes `failed` or `ambiguous`; no deletion occurs.
 
 ### 6. Tests Required
 
 - Adapter tests assert direct and enveloped responses, bounded pagination, repeated-page protection, OpenAI OAuth filtering, numeric wire IDs, exact DELETE paths, safe error categories, and redaction.
-- Service tests assert health classification, persisted snapshots, unique replacement, zero/multiple candidates, missing old IDs, local retry failure, email ambiguity, stale-snapshot conflict, concurrent detect/cleanup serialization, explicit cleanup opt-in, delete verification, and failed cleanup evidence retention.
+- Service tests assert health classification, persisted snapshots, unique replacement, zero/multiple candidates, missing old IDs, local retry failure, email ambiguity, stale-snapshot conflict, concurrent detect/cleanup serialization, explicit cleanup opt-in, delete verification, failed cleanup evidence retention, and historical all-unauthorized unique-latest selection/refusal, classification drift, post-delete keeper drift, exact-ID deletion, and next-detect singleton retryability.
 - Persistence tests assert atomic writes, resolved symlink target directories, preserved symlinks, mode `0600`, and no secret text.
 - API tests assert authentication, request validation, HTTP 409/422 behavior, no-store headers, worker release on failures, exact-ID selection, and remote error mapping.
 - Template tests assert modern/legacy navigation parity, all four Sub2API-401 endpoints, account ID evidence, explicit cleanup wording, and no CPA-401 links.

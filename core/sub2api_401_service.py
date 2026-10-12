@@ -207,6 +207,12 @@ class Sub2Api401Service:
             health = "unknown"
         account_id = _account_id(raw.get("account_id"))
         replacement_id = _account_id(raw.get("replacement_account_id"))
+        replacement_health = _text(raw.get("replacement_health"), 32).lower()
+        if replacement_id and replacement_health not in {"healthy", "unauthorized"}:
+            # Audits written before replacement_health existed always required a healthy keeper.
+            replacement_health = "healthy"
+        if not replacement_id:
+            replacement_health = ""
         cleanup_id = _account_id(raw.get("cleanup_account_id"))
         retryable = bool(raw.get("retryable")) and state in {"pending", "failed"}
         return {
@@ -221,6 +227,7 @@ class Sub2Api401Service:
             "pre_retry_account_ids": _dedupe_ids(raw.get("pre_retry_account_ids")),
             "post_retry_account_ids": _dedupe_ids(raw.get("post_retry_account_ids")),
             "replacement_account_id": replacement_id,
+            "replacement_health": replacement_health,
             "cleanup_account_id": cleanup_id,
             "candidate_count": _bounded_int(raw.get("candidate_count")),
             "checked_at": _text(raw.get("checked_at"), 64),
@@ -437,25 +444,36 @@ class Sub2Api401Service:
         })
 
     @staticmethod
-    def _historical_keeper(group: list[dict], kinds: dict[str, str]) -> tuple[str, str]:
-        """Return deterministic keeper or an ambiguity reason for duplicate emails."""
-        if any(row.get("email_ambiguous") for row in group):
-            return "", "同邮箱候选存在邮箱歧义，禁止自动确认 keeper"
-        healthy = [row for row in group if kinds.get(row["account_id"]) == "healthy"]
-        if len(healthy) == 1 and all(
-            kinds.get(row["account_id"]) == "unauthorized" for row in group if row not in healthy
-        ):
-            return healthy[0]["account_id"], "唯一健康账号为 keeper"
-        if len(healthy) < 2 or len(healthy) != len(group):
-            return "", "同邮箱账号健康状态无法唯一确认 keeper"
-        dated = [row for row in healthy if row.get("created_at")]
-        if len(dated) != len(healthy):
+    def _unique_latest_keeper(group: list[dict]) -> tuple[str, str]:
+        if not group:
+            return "", "同邮箱账号缺少合法 created_at，无法唯一确认 keeper"
+        dated = [row for row in group if row.get("created_at")]
+        if len(dated) != len(group):
             return "", "同邮箱账号缺少合法 created_at，无法唯一确认 keeper"
         latest = max(row["created_at"] for row in dated)
         newest = [row for row in dated if row["created_at"] == latest]
         if len(newest) != 1:
             return "", "同邮箱账号 created_at 并列最新，无法唯一确认 keeper"
         return newest[0]["account_id"], "唯一最新账号为 keeper"
+
+    @classmethod
+    def _historical_keeper(cls, group: list[dict], kinds: dict[str, str]) -> tuple[str, str, str]:
+        """Return a deterministic keeper, reason, and required keeper health."""
+        if any(row.get("email_ambiguous") for row in group):
+            return "", "同邮箱候选存在邮箱歧义，禁止自动确认 keeper", ""
+        healthy = [row for row in group if kinds.get(row["account_id"]) == "healthy"]
+        unauthorized = [row for row in group if kinds.get(row["account_id"]) == "unauthorized"]
+        if len(healthy) == 1 and len(healthy) + len(unauthorized) == len(group):
+            return healthy[0]["account_id"], "唯一健康账号为 keeper", "healthy"
+        if len(healthy) == len(group) or len(unauthorized) == len(group):
+            keeper, reason = cls._unique_latest_keeper(group)
+            if not keeper:
+                return "", reason, ""
+            keeper_health = "healthy" if healthy else "unauthorized"
+            if keeper_health == "unauthorized":
+                reason = "唯一最新失效账号为 keeper"
+            return keeper, reason, keeper_health
+        return "", "同邮箱账号健康状态无法唯一确认 keeper", ""
 
     def _persist_post_snapshot_error(self, accounts: list[dict], reason: str) -> None:
         by_id, by_email = self._account_maps(accounts)
@@ -533,6 +551,7 @@ class Sub2Api401Service:
                 group = by_email.get(email, []) if email else []
                 health = kinds.get(account_id, "unknown")
                 keeper = ""
+                keeper_health = ""
                 replacement_id = ""
                 cleanup_id = ""
                 preserve_decision_reason = False
@@ -541,7 +560,7 @@ class Sub2Api401Service:
                     preserve_decision_reason = True
                 elif len(group) != 1:
                     preserve_decision_reason = True
-                    keeper, keeper_reason = self._historical_keeper(group, kinds)
+                    keeper, keeper_reason, keeper_health = self._historical_keeper(group, kinds)
                     if keeper and account_id == keeper:
                         continue
                     if keeper:
@@ -570,6 +589,7 @@ class Sub2Api401Service:
                     "pre_retry_account_ids": [],
                     "post_retry_account_ids": [],
                     "replacement_account_id": replacement_id if len(group) != 1 and keeper else "",
+                    "replacement_health": keeper_health if len(group) != 1 and keeper else "",
                     "cleanup_account_id": cleanup_id if len(group) != 1 and keeper else "",
                     "candidate_count": len(group) if email else 1,
                     "checked_at": checked_at,
@@ -705,6 +725,7 @@ class Sub2Api401Service:
                     "account_id": account_id,
                     "email": item.get("email"),
                     "replacement_account_id": item.get("replacement_account_id"),
+                    "replacement_health": item.get("replacement_health"),
                     "cleanup_account_id": item.get("cleanup_account_id"),
                     "manual_action": "仅删除检测与验证阶段锁定的旧 account_id",
                 })
@@ -723,6 +744,7 @@ class Sub2Api401Service:
                 and current.get("state") == "cleanup_ready"
                 and _account_id(current.get("cleanup_account_id")) == _account_id(review_item.get("cleanup_account_id"))
                 and _account_id(current.get("replacement_account_id")) == _account_id(review_item.get("replacement_account_id"))
+                and current.get("replacement_health") == review_item.get("replacement_health")
                 and _email(current.get("email")) == _email(review_item.get("email"))
             )
 
@@ -744,15 +766,23 @@ class Sub2Api401Service:
         stale_review_ids: set[str] = set()
         tracked_snapshots: dict[str, dict] = {}
         cleaned_ids_by_keeper: dict[tuple[str, str], set[str]] = {}
+        historical_created_at_by_keeper: dict[tuple[str, str], dict[str, str]] = {}
         with self._lock:
             for tracked_id, tracked_item in self._tracked.items():
-                if tracked_item.get("state") != "cleaned":
-                    continue
                 key = (
                     _email(tracked_item.get("email")),
                     _account_id(tracked_item.get("replacement_account_id")),
                 )
-                cleaned_ids_by_keeper.setdefault(key, set()).add(_account_id(tracked_id))
+                if tracked_item.get("state") == "cleaned":
+                    cleaned_ids_by_keeper.setdefault(key, set()).add(_account_id(tracked_id))
+                elif (
+                    key[0]
+                    and key[1]
+                    and tracked_item.get("replacement_health") == "unauthorized"
+                ):
+                    historical_created_at_by_keeper.setdefault(key, {})[
+                        _account_id(tracked_id)
+                    ] = _created_at(tracked_item.get("created_at"))
             for review_item in review:
                 account_id = _account_id(review_item.get("account_id"))
                 current = self._tracked.get(account_id)
@@ -773,8 +803,19 @@ class Sub2Api401Service:
             for item in review
             if _account_id(item.get("account_id")) in tracked_snapshots
         ])
+        precheck_refresh_ids = list(replacement_ids)
+        for review_item in review:
+            account_id = _account_id(review_item.get("account_id"))
+            tracked = tracked_snapshots.get(account_id) or {}
+            if tracked.get("replacement_health") != "unauthorized":
+                continue
+            email = _email(tracked.get("email"))
+            precheck_refresh_ids.extend(
+                row.get("account_id") for row in before_by_email.get(email, [])
+            )
+        precheck_refresh_ids = _dedupe_ids(precheck_refresh_ids)
         try:
-            refresh_payload = self._refresh_fn(replacement_ids) if replacement_ids else {
+            refresh_payload = self._refresh_fn(precheck_refresh_ids) if precheck_refresh_ids else {
                 "total": 0,
                 "success": 0,
                 "failed": 0,
@@ -783,7 +824,7 @@ class Sub2Api401Service:
         except Exception:
             persist_operational_failure("清理前无法刷新替代 account_id，未执行删除；请重试清理")
             raise
-        replacement_kinds, _ = self._refresh_maps(replacement_ids, refresh_payload)
+        precheck_kinds, _ = self._refresh_maps(precheck_refresh_ids, refresh_payload)
 
         precheck_errors: dict[str, str] = {}
         ambiguous_ids: set[str] = set()
@@ -830,7 +871,31 @@ class Sub2Api401Service:
                 precheck_errors[account_id] = "替代 account_id 不存在或邮箱不一致，未执行删除；请重新检测"
                 ambiguous_ids.add(account_id)
                 continue
-            if replacement_kinds.get(replacement_id) != "healthy":
+            replacement_health = tracked.get("replacement_health") or "healthy"
+            if replacement_health == "unauthorized":
+                current_group = before_by_email.get(email, [])
+                expected_created_at = historical_created_at_by_keeper.get(
+                    (email, replacement_id),
+                    {},
+                )
+                created_at_drifted = any(
+                    row.get("account_id") != replacement_id
+                    and row.get("created_at") != expected_created_at.get(row.get("account_id"), "")
+                    for row in current_group
+                )
+                if created_at_drifted:
+                    precheck_errors[account_id] = "清理前同邮箱账号 created_at 快照已变化，未执行删除；请重新检测"
+                    ambiguous_ids.add(account_id)
+                    continue
+                current_keeper, _, current_keeper_health = self._historical_keeper(
+                    current_group,
+                    precheck_kinds,
+                )
+                if current_keeper != replacement_id or current_keeper_health != "unauthorized":
+                    precheck_errors[account_id] = "清理前同邮箱账号分类或唯一最新 keeper 已变化，未执行删除；请重新检测"
+                    ambiguous_ids.add(account_id)
+                    continue
+            elif precheck_kinds.get(replacement_id) != "healthy":
                 precheck_errors[account_id] = "替代 account_id 未通过刷新验证，未执行删除；请重试清理"
                 if old_already_absent:
                     ambiguous_ids.add(account_id)
@@ -868,7 +933,10 @@ class Sub2Api401Service:
             after = before
         after_by_id, after_by_email = self._account_maps(after)
 
-        post_replacement_kinds = replacement_kinds
+        post_replacement_kinds = {
+            account_id: precheck_kinds.get(account_id, "unknown")
+            for account_id in replacement_ids
+        }
         if not after_error and (eligible_ids or reconciled_ids):
             try:
                 post_refresh = self._refresh_fn(replacement_ids) if replacement_ids else {
@@ -897,6 +965,7 @@ class Sub2Api401Service:
                 replacement_id = _account_id(review_item.get("replacement_account_id"))
                 email = _email(review_item.get("email"))
                 tracked = self._tracked.get(account_id) or {}
+                replacement_health = tracked.get("replacement_health") or "healthy"
                 stale_review = account_id in stale_review_ids
                 error = precheck_errors.get(account_id, "")
                 state = "cleanup_ready"
@@ -921,9 +990,31 @@ class Sub2Api401Service:
                 if not error and after_refresh_error:
                     error = after_refresh_error
                     state = "ambiguous" if old_id not in after_by_id else "cleanup_ready"
-                if not error and post_replacement_kinds.get(replacement_id) != "healthy":
-                    error = "清理后替代 account_id 未通过刷新验证，结果无法确认"
+                if not error and post_replacement_kinds.get(replacement_id) != replacement_health:
+                    error = (
+                        "清理后替代 account_id 未保持 unauthorized 状态，结果无法确认"
+                        if replacement_health == "unauthorized"
+                        else "清理后替代 account_id 未通过刷新验证，结果无法确认"
+                    )
                     state = "ambiguous" if old_id not in after_by_id else "cleanup_ready"
+                if not error and replacement_health == "unauthorized":
+                    current_group = after_by_email.get(email, [])
+                    expected_created_at = historical_created_at_by_keeper.get(
+                        (email, replacement_id),
+                        {},
+                    )
+                    created_at_drifted = any(
+                        row.get("account_id") != replacement_id
+                        and row.get("created_at") != expected_created_at.get(row.get("account_id"), "")
+                        for row in current_group
+                    )
+                    latest_keeper, _ = self._unique_latest_keeper(current_group)
+                    if created_at_drifted:
+                        error = "清理后同邮箱账号 created_at 快照发生变化，结果无法确认"
+                        state = "ambiguous" if old_id not in after_by_id else "cleanup_ready"
+                    elif latest_keeper != replacement_id:
+                        error = "清理后替代 account_id 不再是唯一最新 keeper，结果无法确认"
+                        state = "ambiguous" if old_id not in after_by_id else "cleanup_ready"
 
                 absent = not after_error and old_id not in after_by_id
                 ok = not error and absent and (
@@ -935,8 +1026,12 @@ class Sub2Api401Service:
                         **tracked,
                         "state": "cleaned",
                         "reason": (
-                            "已删除锁定的旧 Sub2API account_id，并确认该 ID 已消失且替代账号健康"
+                            "已删除锁定的旧 Sub2API account_id，并确认该 ID 已消失且失效 keeper 保持 unauthorized"
+                            if attempted and replacement_health == "unauthorized"
+                            else "已删除锁定的旧 Sub2API account_id，并确认该 ID 已消失且替代账号健康"
                             if attempted
+                            else "锁定的旧 Sub2API account_id 已不存在，并确认失效 keeper 保持 unauthorized"
+                            if replacement_health == "unauthorized"
                             else "锁定的旧 Sub2API account_id 已不存在，并确认替代账号保持健康"
                         ),
                         "observed_account_ids": current_after_ids,

@@ -91,6 +91,46 @@ class Sub2Api401ServiceTests(unittest.TestCase):
         self.assertEqual(["old"], item["pre_retry_account_ids"])
         self.assertEqual(["new", "old"], item["post_retry_account_ids"])
 
+    def test_legacy_cleanup_ready_audit_defaults_replacement_health_to_healthy(self):
+        rows = [{"account_id": "old", "email": "one@example.com"}]
+        deleted = []
+
+        def refresh(ids):
+            failures = [
+                {"account_id": account_id, "error": "401 unauthorized"}
+                for account_id in ids
+                if account_id == "old"
+            ]
+            return {
+                "total": len(ids),
+                "success": len(ids) - len(failures),
+                "failed": len(failures),
+                "errors": failures,
+            }
+
+        def delete(account_id):
+            deleted.append(account_id)
+            rows[:] = [row for row in rows if row["account_id"] != account_id]
+            return {"ok": True}
+
+        service = self.service(rows=rows, refresh=refresh, delete=delete)
+        service.detect()
+        service.mark_retrying(["old"])
+        rows.append({"account_id": "new", "email": "one@example.com"})
+        service.detect({"one@example.com": "success"})
+
+        payload = json.loads(self.audit_path.read_text(encoding="utf-8"))
+        payload["items"]["old"].pop("replacement_health")
+        self.audit_path.write_text(json.dumps(payload), encoding="utf-8")
+
+        reloaded = self.service(rows=rows, refresh=refresh, delete=delete)
+        self.assertEqual("healthy", reloaded.state()["items"][0]["replacement_health"])
+        result = reloaded.cleanup(["old"], opt_in=True)
+
+        self.assertEqual(["old"], deleted)
+        self.assertTrue(result["items"][0]["ok"])
+        self.assertEqual("cleaned", reloaded.state()["items"][0]["state"])
+
     def test_detect_reconciles_cleanup_ready_when_locked_old_id_disappears(self):
         rows = [{"account_id": "old", "email": "one@example.com"}]
 
@@ -220,6 +260,333 @@ class Sub2Api401ServiceTests(unittest.TestCase):
         self.assertTrue(all(item["state"] == "cleanup_ready" for item in by_id.values()))
         self.assertTrue(all(item["replacement_account_id"] == "keeper" for item in by_id.values()))
         self.assertTrue(all("唯一健康账号为 keeper" in item["reason"] for item in by_id.values()))
+
+    def test_historical_all_unauthorized_duplicates_keep_unique_latest_out_of_items(self):
+        rows = [
+            {"account_id": "19", "email": "one@example.com", "created_at": "2026-10-11T00:00:00Z"},
+            {"account_id": "22", "email": "one@example.com", "created_at": "2026-10-13T00:00:00Z"},
+        ]
+
+        def refresh(ids):
+            return {
+                "total": len(ids),
+                "success": 0,
+                "failed": len(ids),
+                "errors": [
+                    {"account_id": account_id, "error": "401 unauthorized"}
+                    for account_id in ids
+                ],
+            }
+
+        result = self.service(rows=rows, refresh=refresh).detect()
+
+        self.assertEqual(["19"], [item["account_id"] for item in result["items"]])
+        item = result["items"][0]
+        self.assertEqual("cleanup_ready", item["state"])
+        self.assertEqual("22", item["replacement_account_id"])
+        self.assertEqual("unauthorized", item["replacement_health"])
+        self.assertEqual("19", item["cleanup_account_id"])
+        self.assertIn("唯一最新失效账号为 keeper", item["reason"])
+
+    def test_historical_all_unauthorized_duplicates_require_complete_unique_timestamps(self):
+        cases = {
+            "missing": [
+                {"account_id": "19", "email": "one@example.com"},
+                {"account_id": "22", "email": "one@example.com", "created_at": "2026-10-13T00:00:00Z"},
+            ],
+            "invalid": [
+                {"account_id": "19", "email": "one@example.com", "created_at": "not-a-date"},
+                {"account_id": "22", "email": "one@example.com", "created_at": "2026-10-13T00:00:00Z"},
+            ],
+            "tied": [
+                {"account_id": "19", "email": "one@example.com", "created_at": "2026-10-13T00:00:00Z"},
+                {"account_id": "22", "email": "one@example.com", "created_at": "2026-10-13T00:00:00Z"},
+            ],
+        }
+
+        for name, rows in cases.items():
+            with self.subTest(name=name):
+                service = self.service(
+                    rows=rows,
+                    refresh=lambda ids: {
+                        "total": len(ids),
+                        "success": 0,
+                        "failed": len(ids),
+                        "errors": [
+                            {"account_id": account_id, "error": "401 unauthorized"}
+                            for account_id in ids
+                        ],
+                    },
+                    audit_path=Path(self.temp_dir.name) / f"{name}.json",
+                )
+                result = service.detect()
+
+                self.assertEqual({"19", "22"}, {item["account_id"] for item in result["items"]})
+                self.assertTrue(all(item["state"] == "ambiguous" for item in result["items"]))
+                self.assertTrue(all(not item["cleanup_account_id"] for item in result["items"]))
+
+    def test_historical_duplicates_with_incomplete_health_remain_ambiguous(self):
+        rows = [
+            {"account_id": "19", "email": "one@example.com", "created_at": "2026-10-11T00:00:00Z"},
+            {"account_id": "22", "email": "one@example.com", "created_at": "2026-10-13T00:00:00Z"},
+        ]
+
+        for error in ("request timeout", "provider unavailable"):
+            with self.subTest(error=error):
+                result = self.service(
+                    rows=rows,
+                    refresh=lambda ids, message=error: {
+                        "total": len(ids),
+                        "success": 0,
+                        "failed": len(ids),
+                        "errors": [
+                            {
+                                "account_id": account_id,
+                                "error": "401 unauthorized" if account_id == "19" else message,
+                            }
+                            for account_id in ids
+                        ],
+                    },
+                    audit_path=Path(self.temp_dir.name) / f"health-{error.split()[0]}.json",
+                ).detect()
+
+                self.assertEqual({"19", "22"}, {item["account_id"] for item in result["items"]})
+                self.assertTrue(all(item["state"] == "ambiguous" for item in result["items"]))
+                self.assertTrue(all(not item["cleanup_account_id"] for item in result["items"]))
+
+    def test_historical_all_unauthorized_cleanup_deletes_exact_old_id_then_exposes_keeper_pending(self):
+        rows = [
+            {"account_id": "19", "email": "one@example.com", "created_at": "2026-10-11T00:00:00Z"},
+            {"account_id": "22", "email": "one@example.com", "created_at": "2026-10-13T00:00:00Z"},
+        ]
+        deleted = []
+        refresh_calls = []
+
+        def refresh(ids):
+            refresh_calls.append(list(ids))
+            return {
+                "total": len(ids),
+                "success": 0,
+                "failed": len(ids),
+                "errors": [
+                    {"account_id": account_id, "error": "401 unauthorized"}
+                    for account_id in ids
+                ],
+            }
+
+        def delete(account_id):
+            deleted.append(account_id)
+            rows[:] = [row for row in rows if row["account_id"] != account_id]
+            return {"ok": True}
+
+        service = self.service(rows=rows, refresh=refresh, delete=delete)
+        service.detect()
+        service = self.service(rows=rows, refresh=refresh, delete=delete)
+
+        preview = service.cleanup(["19"], opt_in=False)
+        self.assertFalse(preview["cleanup_performed"])
+        self.assertEqual([], deleted)
+        result = service.cleanup(["22", "19", "missing"], opt_in=True)
+
+        self.assertEqual(["19"], deleted)
+        self.assertTrue(result["items"][0]["ok"])
+        self.assertEqual("cleaned", service.state()["items"][0]["state"])
+        self.assertGreaterEqual(refresh_calls.count(["19", "22"]), 2)
+        self.assertIn(["22"], refresh_calls)
+
+        next_result = service.detect()
+        self.assertEqual(["22"], [item["account_id"] for item in next_result["items"]])
+        self.assertEqual("pending", next_result["items"][0]["state"])
+        self.assertTrue(next_result["items"][0]["retryable"])
+
+    def test_historical_all_unauthorized_cleanup_refuses_classification_drift(self):
+        rows = [
+            {"account_id": "19", "email": "one@example.com", "created_at": "2026-10-11T00:00:00Z"},
+            {"account_id": "22", "email": "one@example.com", "created_at": "2026-10-13T00:00:00Z"},
+        ]
+        drifted = False
+        deleted = []
+
+        def refresh(ids):
+            unauthorized_ids = [
+                account_id for account_id in ids
+                if not drifted or account_id != "22"
+            ]
+            return {
+                "total": len(ids),
+                "success": len(ids) - len(unauthorized_ids),
+                "failed": len(unauthorized_ids),
+                "errors": [
+                    {"account_id": account_id, "error": "401 unauthorized"}
+                    for account_id in unauthorized_ids
+                ],
+            }
+
+        service = self.service(
+            rows=rows,
+            refresh=refresh,
+            delete=lambda account_id: deleted.append(account_id) or {"ok": True},
+        )
+        service.detect()
+        drifted = True
+        result = service.cleanup(["19"], opt_in=True)
+
+        self.assertEqual([], deleted)
+        self.assertFalse(result["items"][0]["ok"])
+        item = service.state()["items"][0]
+        self.assertEqual("ambiguous", item["state"])
+        self.assertIn("分类或唯一最新 keeper 已变化", item["reason"])
+
+    def test_historical_all_unauthorized_cleanup_refuses_created_at_drift_before_delete(self):
+        rows = [
+            {"account_id": "19", "email": "one@example.com", "created_at": "2026-10-11T00:00:00Z"},
+            {"account_id": "22", "email": "one@example.com", "created_at": "2026-10-13T00:00:00Z"},
+        ]
+        deleted = []
+
+        def refresh(ids):
+            return {
+                "total": len(ids),
+                "success": 0,
+                "failed": len(ids),
+                "errors": [
+                    {"account_id": account_id, "error": "401 unauthorized"}
+                    for account_id in ids
+                ],
+            }
+
+        service = self.service(
+            rows=rows,
+            refresh=refresh,
+            delete=lambda account_id: deleted.append(account_id) or {"ok": True},
+        )
+        service.detect()
+        rows[0]["created_at"] = "2026-10-12T00:00:00Z"
+        result = service.cleanup(["19"], opt_in=True)
+
+        self.assertEqual([], deleted)
+        self.assertFalse(result["items"][0]["ok"])
+        item = service.state()["items"][0]
+        self.assertEqual("ambiguous", item["state"])
+        self.assertIn("created_at 快照已变化", item["reason"])
+
+    def test_historical_all_unauthorized_cleanup_retains_post_delete_created_at_drift(self):
+        rows = [
+            {"account_id": "old-a", "email": "one@example.com", "created_at": "2026-10-10T00:00:00Z"},
+            {"account_id": "old-b", "email": "one@example.com", "created_at": "2026-10-11T00:00:00Z"},
+            {"account_id": "keeper", "email": "one@example.com", "created_at": "2026-10-13T00:00:00Z"},
+        ]
+        deleted = []
+
+        def refresh(ids):
+            return {
+                "total": len(ids),
+                "success": 0,
+                "failed": len(ids),
+                "errors": [
+                    {"account_id": account_id, "error": "401 unauthorized"}
+                    for account_id in ids
+                ],
+            }
+
+        def delete(account_id):
+            deleted.append(account_id)
+            rows[:] = [row for row in rows if row["account_id"] != account_id]
+            next(row for row in rows if row["account_id"] == "old-b")["created_at"] = "2026-10-12T00:00:00Z"
+            return {"ok": True}
+
+        service = self.service(rows=rows, refresh=refresh, delete=delete)
+        service.detect()
+        result = service.cleanup(["old-a"], opt_in=True)
+
+        self.assertEqual(["old-a"], deleted)
+        self.assertFalse(result["items"][0]["ok"])
+        item = {entry["account_id"]: entry for entry in service.state()["items"]}["old-a"]
+        self.assertEqual("ambiguous", item["state"])
+        self.assertIn("created_at 快照发生变化", item["reason"])
+
+    def test_historical_all_unauthorized_cleanup_retains_post_delete_keeper_drift(self):
+        rows = [
+            {"account_id": "19", "email": "one@example.com", "created_at": "2026-10-11T00:00:00Z"},
+            {"account_id": "22", "email": "one@example.com", "created_at": "2026-10-13T00:00:00Z"},
+        ]
+        keeper_became_healthy = False
+        deleted = []
+
+        def refresh(ids):
+            unauthorized_ids = [
+                account_id for account_id in ids
+                if not keeper_became_healthy or account_id != "22"
+            ]
+            return {
+                "total": len(ids),
+                "success": len(ids) - len(unauthorized_ids),
+                "failed": len(unauthorized_ids),
+                "errors": [
+                    {"account_id": account_id, "error": "401 unauthorized"}
+                    for account_id in unauthorized_ids
+                ],
+            }
+
+        def delete(account_id):
+            nonlocal keeper_became_healthy
+            deleted.append(account_id)
+            rows[:] = [row for row in rows if row["account_id"] != account_id]
+            keeper_became_healthy = True
+            return {"ok": True}
+
+        service = self.service(rows=rows, refresh=refresh, delete=delete)
+        service.detect()
+        result = service.cleanup(["19"], opt_in=True)
+
+        self.assertEqual(["19"], deleted)
+        self.assertFalse(result["items"][0]["ok"])
+        item = service.state()["items"][0]
+        self.assertEqual("ambiguous", item["state"])
+        self.assertEqual("19", item["cleanup_account_id"])
+        self.assertEqual("22", item["replacement_account_id"])
+        self.assertEqual("unauthorized", item["replacement_health"])
+        self.assertIn("未保持 unauthorized", item["reason"])
+
+    def test_historical_all_unauthorized_cleanup_allows_sequential_ids_after_restart(self):
+        rows = [
+            {"account_id": "old-a", "email": "one@example.com", "created_at": "2026-10-11T00:00:00Z"},
+            {"account_id": "old-b", "email": "one@example.com", "created_at": "2026-10-12T00:00:00Z"},
+            {"account_id": "keeper", "email": "one@example.com", "created_at": "2026-10-13T00:00:00Z"},
+        ]
+        deleted = []
+
+        def refresh(ids):
+            return {
+                "total": len(ids),
+                "success": 0,
+                "failed": len(ids),
+                "errors": [
+                    {"account_id": account_id, "error": "401 unauthorized"}
+                    for account_id in ids
+                ],
+            }
+
+        def delete(account_id):
+            deleted.append(account_id)
+            rows[:] = [row for row in rows if row["account_id"] != account_id]
+            return {"ok": True}
+
+        service = self.service(rows=rows, refresh=refresh, delete=delete)
+        service.detect()
+        first = service.cleanup(["old-a"], opt_in=True)
+        self.assertTrue(first["items"][0]["ok"])
+
+        reloaded = self.service(rows=rows, refresh=refresh, delete=delete)
+        second = reloaded.cleanup(["old-b"], opt_in=True)
+
+        self.assertTrue(second["items"][0]["ok"])
+        self.assertEqual(["old-a", "old-b"], deleted)
+        self.assertEqual(["keeper"], [row["account_id"] for row in rows])
+        next_result = reloaded.detect()
+        self.assertEqual(["keeper"], [item["account_id"] for item in next_result["items"]])
+        self.assertEqual("pending", next_result["items"][0]["state"])
+        self.assertTrue(next_result["items"][0]["retryable"])
 
     def test_historical_cleanup_deletes_only_exact_old_ids(self):
         rows = [

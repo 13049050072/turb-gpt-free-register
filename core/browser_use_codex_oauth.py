@@ -124,7 +124,7 @@ def _extract_callback_url_from_page(page) -> str:
         ) or []
         for url in urls:
             if _is_callback_url(str(url)):
-                logger.info("[Codex][BrowserUse] 已从页面性能记录提取 callback URL：%s", str(url)[:160])
+                logger.info("[Codex][BrowserUse] 已从页面性能记录提取 callback URL（内容不写日志）")
                 return str(url)
     except Exception as exc:
         logger.debug("[Codex][BrowserUse] 提取 callback URL 失败：%s", exc)
@@ -156,7 +156,7 @@ def _wait_for_callback(context, page, timeout: int | None = None) -> str:
         try:
             current = str(page.url or "")
             if current != last_url:
-                logger.debug("[Codex][BrowserUse] 当前 URL: %s", current)
+                logger.debug("[Codex][BrowserUse] 当前页面: %s", _codex_proto._safe_url_for_log(current))
                 last_url = current
             callback = _extract_callback_url_from_context(context, page)
             if callback:
@@ -164,7 +164,7 @@ def _wait_for_callback(context, page, timeout: int | None = None) -> str:
         except Exception:
             pass
         time.sleep(0.25 if _fast_mode() else 0.5)
-    raise RuntimeError(f"等待 Codex callback 超时，最后 URL={last_url}")
+    raise RuntimeError(f"等待 Codex callback 超时，最后页面={_codex_proto._safe_url_for_log(last_url)}")
 
 
 def _wait_for_fresh_email_otp(otp_provider, email: str, after_ts: float, used_codes: set[str] | None = None, timeout: int = 90) -> str:
@@ -218,7 +218,7 @@ def _wait_auth_page_ready(page, timeout: int = 8) -> None:
         except Exception:
             pass
         time.sleep(0.25 if _fast_mode() else 0.6)
-    logger.warning("[Codex][BrowserUse] 登录页等待渲染超时，最后 URL=%s", last_url or "-")
+    logger.warning("[Codex][BrowserUse] 登录页等待渲染超时，最后页面=%s", _codex_proto._safe_url_for_log(last_url))
 
 
 def _visible_locator_any_frame(page, selectors: list[str], timeout_ms: int = 1000):
@@ -637,7 +637,7 @@ def _maybe_click_passwordless_after_email(page, email: str, timeout: int = 18) -
                 return
             url = _page_url(page)
             if url != last_url:
-                logger.info("[Codex][BrowserUse] 提交邮箱后检测密码/OTP 跳转：url=%s", url or "-")
+                logger.info("[Codex][BrowserUse] 提交邮箱后检测密码/OTP 跳转：page=%s", _codex_proto._safe_url_for_log(url))
                 last_url = url
             lower = str(url or "").lower()
             if "/password" in lower or "auth.openai.com" in lower:
@@ -802,8 +802,7 @@ def _fill_login_password_if_present(page, email: str, timeout: int = 18) -> str 
 
 def _fill_email_and_otp(page, email: str, otp_provider, auth_url: str, dead_tracker: dict | None = None) -> None:
     otp_after_ts = time.time()
-    logger.info("[Codex][BrowserUse] 打开授权地址")
-    logger.info("[Codex][BrowserUse] 完整授权地址: %s", auth_url)
+    logger.info("[Codex][BrowserUse] 打开授权地址（完整 URL 不写日志）")
     _t_goto = _StepTimer("打开授权页")
     page.goto(auth_url, wait_until="domcontentloaded", timeout=_timeout_ms(getattr(_cfg, "BROWSER_USE_NAVIGATION_TIMEOUT", 90)))
     try:
@@ -895,7 +894,7 @@ def _fill_email_and_otp(page, email: str, otp_provider, auth_url: str, dead_trac
             _restart_email_otp_flow("等待验证码超时，避免点击 resend 导致 500")
             continue
         used_codes.add(str(code))
-        logger.info("[Codex][BrowserUse] 邮箱 OTP 收到：%s", code)
+        logger.info("[Codex][BrowserUse] 邮箱 OTP 已收到（验证码不写日志）")
         _t_otp_submit = _StepTimer("提交邮箱 OTP")
         _clear_otp_inputs(page)
         _type_otp(page, code)
@@ -1309,7 +1308,7 @@ def _ensure_add_phone_form(page, *, reason: str = "") -> bool:
     if _wait_phone_form_ready(page, timeout=2):
         return True
 
-    logger.info("[Codex][BrowserUse] 准备回到手机号输入页：reason=%s url=%s", reason or "retry", _page_url(page) or "-")
+    logger.info("[Codex][BrowserUse] 准备回到手机号输入页：reason=%s page=%s", reason or "retry", _codex_proto._safe_url_for_log(_page_url(page)))
 
     # 如果在短信验证码页，优先点击 change/back 或浏览器后退，保留 auth transaction state。
     try:
@@ -1390,7 +1389,7 @@ def _do_phone_verification_if_present(page) -> None:
             _t_sms = _StepTimer(f"等待手机短信 attempt={attempt}")
             sms_code = sms_provider.wait_for_sms_code(activation_id, http)
             _t_sms.done()
-            logger.info("[Codex][BrowserUse] 手机 OTP 收到：%s", sms_code)
+            logger.info("[Codex][BrowserUse] 手机 OTP 已收到（验证码不写日志）")
             _clear_otp_inputs(page)
             _type_otp(page, sms_code)
             _bu_delay("otp_input")
@@ -1529,7 +1528,7 @@ def _run_browser_use_codex_oauth_once(email: str, otp_provider=None, proxy: str 
             callback_url = _finish_consent_workspace(context, page)
             _t_callback.done()
             code = proto._extract_code(callback_url, state)
-            logger.info("[Codex][BrowserUse] 已捕获 callback code：%s...", code[:24])
+            logger.info("[Codex][BrowserUse] 已捕获 callback code（内容不写日志）")
 
             if auth_source == "cpa":
                 submit_payload = proto._submit_cpa_callback(callback_url)
@@ -1588,8 +1587,11 @@ def _run_browser_use_codex_oauth_once(email: str, otp_provider=None, proxy: str 
             message=f"账号已废（{exc.error_code or 'account_deactivated'}）",
         )
     except Exception as exc:
-        logger.error("[Codex][BrowserUse] 授权失败：%s: %s", type(exc).__name__, exc)
-        logger.debug("[Codex][BrowserUse] 失败详情", exc_info=True)
+        logger.error(
+            "[Codex][BrowserUse] 授权失败：%s: %s",
+            type(exc).__name__,
+            proto._safe_sensitive_text(exc, limit=300),
+        )
         return proto._codex_result(status="failed", email=email, message=f"{type(exc).__name__}: {str(exc)[:300]}")
     finally:
         keep_open = bool(getattr(_cfg, "BROWSER_USE_KEEP_BROWSER_OPEN", False))

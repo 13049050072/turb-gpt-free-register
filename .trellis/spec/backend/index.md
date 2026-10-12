@@ -18,7 +18,7 @@ This directory contains guidelines for backend development. Fill in each file wi
 | [Database Guidelines](./database-guidelines.md) | ORM patterns, queries, migrations | To fill |
 | [Error Handling](./error-handling.md) | Error types, handling strategies | To fill |
 | [Quality Guidelines](./quality-guidelines.md) | Code standards, forbidden patterns | To fill |
-| [CPA Credential Rotation](./cpa-credential-rotation.md) | Verification-first CPA 401 OAuth retry, audit state, and cleanup gating | Ready |
+| [Sub2API Credential Rotation](./sub2api-credential-rotation.md) | Verification-first Sub2API OpenAI OAuth retry, account-ID replacement proof, and cleanup gating | Ready |
 
 ---
 

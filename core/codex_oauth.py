@@ -21,6 +21,7 @@ import hashlib
 import json
 import logging
 import random
+import re
 import secrets
 import time
 import uuid
@@ -80,7 +81,7 @@ def _with_net_retry(label: str, fn):
                 break
             backoff = _NET_BACKOFF_BASE ** (attempt - 1)
             logger.warning(
-                f"[Codex] {label} 临时性网络错误 ({type(exc).__name__}: {str(exc)[:120]})，"
+                f"[Codex] {label} 临时性网络错误 ({type(exc).__name__}: {_safe_sensitive_text(exc, limit=120)})，"
                 f"{backoff:.1f}s 后重试 (尝试 {attempt}/{_NET_MAX_ATTEMPTS})..."
             )
             time.sleep(backoff)
@@ -96,7 +97,7 @@ def _with_auth_navigation_retry(session: BrowserSession, label: str, fn):
             status = int(getattr(resp, "status_code", 0) or 0)
             if status >= 400:
                 error = RuntimeError(
-                    f"{label} status={status}, body={(getattr(resp, 'text', '') or '')[:180]}"
+                    f"{label} status={status}, body={_safe_sensitive_text(getattr(resp, 'text', ''), limit=180)}"
                 )
                 error.response = resp
                 raise error
@@ -113,7 +114,7 @@ def _with_auth_navigation_retry(session: BrowserSession, label: str, fn):
                 "[Codex] %s 临时失败（%s/%s）：%s: %s；"
                 "保留当前 session/deviceId/CF Cookie，%.1fs 后重试",
                 label, attempt, _NET_MAX_ATTEMPTS, type(exc).__name__,
-                str(exc)[:160], backoff,
+                _safe_sensitive_text(exc, limit=160), backoff,
             )
             time.sleep(backoff)
     raise last_exc if last_exc else RuntimeError(f"[Codex] {label} 重试耗尽")
@@ -153,8 +154,8 @@ def _codex_result(
         "http_status": http_status,
         "email": email,
         "file_path": file_path,
-        "callback_url": callback_url,
-        "message": message,
+        "callback_url": None,
+        "message": _safe_sensitive_text(message, limit=500),
     }
 
 
@@ -357,6 +358,37 @@ def _sub2_codex_headers() -> dict:
     return headers
 
 
+def _safe_sensitive_text(value: object, *, limit: int = 180) -> str:
+    text = " ".join(str(value or "").replace("\r", " ").replace("\n", " ").split())
+    text = re.sub(
+        r"(?i)([\"']?\b(?:access[_ -]?token|refresh[_ -]?token|id[_ -]?token|authorization|bearer|"
+        r"api[_ -]?key|password|secret|callback(?:_url)?|redirect_uri|oauth[_ -]?code|code)\b[\"']?)"
+        r"\s*[:=]\s*[\"']?[^\s,;}\]\"']+",
+        r"\1=[redacted]",
+        text,
+    )
+    text = re.sub(r"(?i)\bbearer\s+[A-Za-z0-9._~+/=-]+", "bearer [redacted]", text)
+    text = re.sub(r"https?://[^\s,;}\]\\\"'，。；！？、）】》]+", "[url-redacted]", text, flags=re.I)
+    return text[:limit]
+
+
+def _safe_url_for_log(value: object) -> str:
+    try:
+        parsed = urlparse(str(value or ""))
+        if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+            return "[url-redacted]"
+        host = parsed.hostname
+        if parsed.port:
+            host = f"{host}:{parsed.port}"
+        return f"{parsed.scheme}://{host}{parsed.path or '/'}"
+    except (TypeError, ValueError):
+        return "[url-redacted]"
+
+
+def _safe_sub2_error_detail(value: object) -> str:
+    return _safe_sensitive_text(value)
+
+
 def _sub2_codex_request_json(method: str, path: str, body: dict | None = None) -> dict:
     from config import sub2api as _sub2_cfg
     base = _sub2_codex_base()
@@ -380,9 +412,10 @@ def _sub2_codex_request_json(method: str, path: str, body: dict | None = None) -
             msg = ""
             if isinstance(payload, dict):
                 msg = payload.get("error") or payload.get("message") or payload.get("detail") or payload.get("reason") or ""
+            detail = _safe_sub2_error_detail(msg or (resp.text or ""))
+            suffix = f": {detail}" if detail else ""
             raise RuntimeError(
-                f"[Codex][sub2] 接口失败 {method.upper()} {normalized_path} status={resp.status_code}: "
-                f"{msg or (resp.text or '')[:300]}"
+                f"[Codex][sub2] 接口失败 {method.upper()} {normalized_path} status={resp.status_code}{suffix}"
             )
         return payload if isinstance(payload, dict) else {}
     finally:
@@ -390,6 +423,11 @@ def _sub2_codex_request_json(method: str, path: str, body: dict | None = None) -
             session.close()
         except Exception:
             pass
+
+
+def sub2api_admin_request_json(method: str, path: str, body: dict | None = None) -> dict:
+    """Reuse the configured Sub2API management transport without exposing credentials."""
+    return _sub2_codex_request_json(method, path, body)
 
 
 def _request_sub2_authorize_url() -> dict:
@@ -413,34 +451,32 @@ def _request_sub2_authorize_url() -> dict:
         _extract_state_from_auth_url(auth_url),
     )
     if not auth_url.startswith("http"):
-        raise RuntimeError(f"[Codex][sub2] sub2 未返回有效 auth_url: {payload}")
+        raise RuntimeError("[Codex][sub2] sub2 未返回有效 auth_url")
     if not state:
         raise RuntimeError("[Codex][sub2] 授权地址缺少 state")
-    logger.info("[Codex][sub2] 已获取授权地址，state=%s...", state[:12])
-    logger.info("[Codex][sub2] 完整授权地址: %s", auth_url)
+    logger.info("[Codex][sub2] 已获取授权地址（授权 URL 与 state 不写日志）")
     if not session_id:
         logger.warning("[Codex][sub2] 授权地址响应缺少 session_id，后续 exchange-code 可能失败")
     return {"auth_url": auth_url, "state": state, "session_id": session_id, "origin": _sub2_codex_base(), "raw": payload}
 
 
 def _summarize_sub2_response(payload: dict) -> str:
-    """压缩 sub2api 响应日志，避免整包刷屏，同时保留账号创建关键信息。"""
+    """只记录非敏感账号标识；不回显 OAuth code、callback 或完整响应。"""
     try:
         data = payload.get("data") if isinstance(payload.get("data"), dict) else payload
         parts = []
         if isinstance(data, dict):
             for key in ("id", "account_id", "name", "email", "platform", "type"):
-                val = data.get(key)
-                if val not in (None, ""):
-                    parts.append(f"{key}={val}")
+                value = data.get(key)
+                if value not in (None, ""):
+                    parts.append(f"{key}={_safe_sub2_error_detail(value)}")
         if parts:
             return " ".join(parts)
-        if isinstance(payload, dict):
-            compact = {k: payload.get(k) for k in ("code", "message", "success") if k in payload}
-            return str(compact or payload)[:300]
+        if isinstance(payload, dict) and "success" in payload:
+            return f"success={bool(payload.get('success'))}"
     except Exception:
         pass
-    return str(payload)[:300]
+    return "响应已接收（敏感字段不写日志）"
 
 
 def _submit_sub2_callback(callback_url: str, *, session_id: str = "", redirect_uri: str = "") -> dict:
@@ -460,9 +496,9 @@ def _submit_sub2_callback(callback_url: str, *, session_id: str = "", redirect_u
         if not session_id:
             raise RuntimeError("[Codex][sub2] exchange-code 缺少 session_id")
         if not code:
-            raise RuntimeError(f"[Codex][sub2] callback_url 缺少 code: {callback_url}")
+            raise RuntimeError("[Codex][sub2] callback_url 缺少 code")
         if not state:
-            raise RuntimeError(f"[Codex][sub2] callback_url 缺少 state: {callback_url}")
+            raise RuntimeError("[Codex][sub2] callback_url 缺少 state")
         body = {"session_id": session_id, "code": code, "state": state}
         if redirect_uri:
             body["redirect_uri"] = redirect_uri
@@ -475,7 +511,7 @@ def _submit_sub2_callback(callback_url: str, *, session_id: str = "", redirect_u
     last_exc = None
     for attempt in range(1, max_attempts + 1):
         try:
-            logger.info("[Codex][sub2] 正在上传 OAuth callback（第 %s/%s 次）... callback=%s", attempt, max_attempts, callback_url)
+            logger.info("[Codex][sub2] 正在上传 OAuth callback（第 %s/%s 次，callback 内容不写日志）", attempt, max_attempts)
             payload = _sub2_codex_request_json("POST", path, body)
             logger.info("[Codex][sub2] callback 已上传并处理完成（第 %s 次成功）响应=%s", attempt, _summarize_sub2_response(payload))
             return payload
@@ -483,10 +519,10 @@ def _submit_sub2_callback(callback_url: str, *, session_id: str = "", redirect_u
             last_exc = exc
             retryable = _is_cpa_callback_retryable(exc)
             if attempt >= max_attempts or not retryable:
-                logger.warning("[Codex][sub2] callback 上传失败且不再重试：attempt=%s/%s retryable=%s error=%s", attempt, max_attempts, retryable, exc)
+                logger.warning("[Codex][sub2] callback 上传失败且不再重试：attempt=%s/%s retryable=%s error=%s", attempt, max_attempts, retryable, _safe_sensitive_text(exc))
                 raise
             delay = base_delay * attempt
-            logger.warning("[Codex][sub2] callback 上传失败，将在 %.1fs 后重试：attempt=%s/%s error=%s", delay, attempt, max_attempts, exc)
+            logger.warning("[Codex][sub2] callback 上传失败，将在 %.1fs 后重试：attempt=%s/%s error=%s", delay, attempt, max_attempts, _safe_sensitive_text(exc))
             time.sleep(delay)
     raise RuntimeError(f"[Codex][sub2] callback 上传失败：{last_exc}")
 
@@ -672,8 +708,7 @@ def _request_cpa_authorize_url() -> dict:
         raise RuntimeError(f"[Codex][CPA] CPA 未返回有效 auth_url: {payload}")
     if not state:
         raise RuntimeError("[Codex][CPA] CPA 授权地址缺少 state")
-    logger.info(f"[Codex][CPA] 已获取授权地址，state={state[:12]}...")
-    logger.info(f"[Codex][CPA] 完整授权地址: {auth_url}")
+    logger.info("[Codex][CPA] 已获取授权地址（state 与完整 URL 不写日志）")
     return {
         "auth_url": auth_url,
         "state": state,
@@ -908,14 +943,17 @@ def _bootstrap_authorize(
     # Codex CLI/CPA 授权地址是用户从外部客户端直接打开的顶层导航，不是从
     # chatgpt.com 页面点击而来。使用 sec-fetch-site:none 且不伪造 Referer。
     headers = session.get_auth_navigate_headers(referer="", user_initiated=True)
-    logger.info("[Codex] 跟随 Codex authorize URL 建立会话...")
-    logger.info(f"[Codex] 完整授权地址: {auth_url}")
+    logger.info("[Codex] 跟随 Codex authorize URL 建立会话（查询参数不写日志）...")
     resp = _with_auth_navigation_retry(
         session,
         "bootstrap authorize",
         lambda: session.get(auth_url, headers=headers, allow_redirects=True),
     )
-    logger.debug(f"[Codex] authorize 落点: {getattr(resp, 'url', '')}, status={getattr(resp, 'status_code', '')}")
+    logger.debug(
+        "[Codex] authorize 落点: %s, status=%s",
+        _safe_url_for_log(getattr(resp, "url", "")),
+        getattr(resp, "status_code", ""),
+    )
 
 
 # ============================================================
@@ -1461,11 +1499,16 @@ def _follow_until_callback(session: BrowserSession, url: str, state: str) -> str
         headers = session.get_auth_navigate_headers(referer="https://auth.openai.com/")
         resp = session.get(url, headers=headers, allow_redirects=False)
         loc = resp.headers.get("location") or resp.headers.get("Location")
-        logger.debug(f"[Codex] callback 跟随 hop {hop}: status={getattr(resp,'status_code','')}, location={loc}")
+        logger.debug(
+            "[Codex] callback 跟随 hop %s: status=%s, location=%s",
+            hop,
+            getattr(resp, "status_code", ""),
+            _safe_url_for_log(loc),
+        )
         if loc is None:
             raise RuntimeError(
-                f"[Codex] 跟随中断，未命中 callback: url={url}, "
-                f"status={getattr(resp,'status_code','')}, body={(resp.text or '')[:200]}"
+                f"[Codex] 跟随中断，未命中 callback: url={_safe_url_for_log(url)}, "
+                f"status={getattr(resp,'status_code','')}"
             )
         if _is_redirect_uri(loc):
             return loc
@@ -1525,7 +1568,7 @@ def _parse_id_token(id_token: str) -> dict:
             return {}
         claims = _decode_jwt_segment(parts[1])
     except Exception as exc:
-        logger.warning(f"[Codex] id_token 解析失败: {exc}")
+        logger.warning("[Codex] id_token 解析失败: %s", _safe_sensitive_text(exc))
         return {}
 
     auth_claim = claims.get("https://api.openai.com/auth", {}) or {}
@@ -1829,12 +1872,12 @@ def run_codex_oauth(
             cpa_auth = _request_cpa_authorize_url()
             state = cpa_auth["state"]
             auth_url = cpa_auth["auth_url"]
-            logger.info(f"[Codex] 当前使用 CPA 授权地址: {auth_url}")
+            logger.info("[Codex] 当前使用 CPA 授权地址（完整 URL 不写日志）")
         elif auth_source == "sub2":
             sub2_auth = _request_sub2_authorize_url()
             state = sub2_auth["state"]
             auth_url = sub2_auth["auth_url"]
-            logger.info(f"[Codex] 当前使用 sub2 授权地址: {auth_url}")
+            logger.info("[Codex] 当前使用 sub2 授权地址（完整 URL 不写日志）")
         elif auth_source == "local":
             code_verifier, code_challenge = _generate_pkce()
             state = _generate_state()
@@ -1893,7 +1936,7 @@ def run_codex_oauth(
                         auth_result = retry_result
                         break
             if not password_login_done:
-                logger.info(f"[Codex] 邮箱 OTP 收到：{email_otp}")
+                logger.info("[Codex] 邮箱 OTP 已收到（验证码不写日志）")
                 human_delay("otp_input")
                 auth_result = _submit_email_otp(session, email_otp)
                 human_delay("api")
@@ -1930,7 +1973,7 @@ def run_codex_oauth(
         # 6. 选 workspace → 拿 callback code；若登录 continue 已经直接命中 callback，则复用。
         callback_url = early_callback_url or _select_workspace_and_get_callback(session, state)
         code = _extract_code(callback_url, state)
-        logger.info(f"[Codex] 已拿到 authorization code：{code[:24]}...")
+        logger.info("[Codex] 已拿到 authorization code（内容不写日志）")
 
         # 7A. CPA 模式：把 callback URL 交给 CPA，由 CPA 持有 verifier 并完成换 token / 写 auth。
         #     本地不再用 code 换 token；仅保存 CPA 返回的授权文件或回调回执。
@@ -2023,7 +2066,7 @@ def run_codex_oauth(
                 force=force,
                 _cpa_reauth_round=_cpa_reauth_round + 1,
             )
-        logger.warning(f"[Codex] 失败：{email}，{type(exc).__name__}: {str(exc)[:200]}")
+        logger.warning("[Codex] 失败：%s，%s: %s", email, type(exc).__name__, _safe_sensitive_text(exc, limit=200))
         logger.debug("[Codex] 失败详情:", exc_info=True)
         return _codex_result(
             status="failed",

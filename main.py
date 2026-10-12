@@ -723,8 +723,7 @@ def run_registration(
 
         if codex_result.get("ok"):
             logger.info(
-                f"[Codex] 成功：{email}，file={codex_result.get('file_path')}，"
-                f"callback={codex_result.get('callback_url')}"
+                f"[Codex] 成功：{email}，file={codex_result.get('file_path')}，callback 内容不写日志"
             )
         elif codex_result.get("status") == "skipped":
             logger.info(f"[Codex] 跳过：{email}，原因={codex_result.get('message')}")
@@ -754,7 +753,7 @@ def run_registration(
             },
         )
 
-        logger.info(f"[完成] {email}，账号ID={account_id}，Token={access_token[:16]}...")
+        logger.info(f"[完成] {email}，账号ID={account_id}，Token 已保存（内容不写日志）")
 
         pool_import_result = {"status": "skipped", "ok": False, "message": "disabled"}
         try:
@@ -798,7 +797,7 @@ def run_registration(
                 f"原因={flow_result.get('message')}"
             )
 
-        logger.debug(f"[完成] TOTP Secret: {totp_secret or '(未设置)'}")
+        logger.debug("[完成] TOTP 状态: %s", "已设置" if totp_secret else "未设置")
 
         # 注册任务的成功判定只看注册账号是否成功落库；Codex 是独立的
         # 可选后续操作，即使授权失败也不能把已经完成的注册标成 partial_success。

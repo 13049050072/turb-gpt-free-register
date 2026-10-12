@@ -127,7 +127,7 @@ def _extract_callback_url_from_page(driver) -> str:
         """) or []
         for url in urls:
             if _is_callback_url(str(url)):
-                logger.info("[Codex][Browser] 已从浏览器性能记录提取 callback URL：%s", str(url)[:160])
+                logger.info("[Codex][Browser] 已从浏览器性能记录提取 callback URL（内容不写日志）")
                 return str(url)
     except Exception as exc:
         logger.debug("[Codex][Browser] 从页面提取 callback URL 失败：%s", exc)
@@ -159,7 +159,7 @@ def _wait_for_callback(driver, timeout: int | None = None) -> str:
         try:
             current = str(driver.current_url or "")
             if current != last_url:
-                logger.debug("[Codex][Browser] 当前 URL: %s", current)
+                logger.debug("[Codex][Browser] 当前页面: %s", _codex_proto._safe_url_for_log(current))
                 last_url = current
             callback = _extract_callback_url_from_any_window(driver)
             if callback:
@@ -167,7 +167,7 @@ def _wait_for_callback(driver, timeout: int | None = None) -> str:
         except Exception:
             pass
         time.sleep(0.5)
-    raise RuntimeError(f"等待 Codex callback 超时，最后 URL={last_url}")
+    raise RuntimeError(f"等待 Codex callback 超时，最后页面={_codex_proto._safe_url_for_log(last_url)}")
 
 
 def _click_if_present(driver, selectors: list[str], timeout: int = 3) -> bool:
@@ -194,7 +194,7 @@ def _maybe_click_passwordless_after_email(driver, email: str, timeout: int = 18)
                 return
             url = str(driver.current_url or "")
             if url != last_url:
-                logger.info("[Codex][Browser] 提交邮箱后检测密码/OTP 跳转：url=%s", url or "-")
+                logger.info("[Codex][Browser] 提交邮箱后检测密码/OTP 跳转：page=%s", _codex_proto._safe_url_for_log(url))
                 last_url = url
             lower = url.lower()
             if any(x in lower for x in ("phone", "workspace", "consent", "authorize", "localhost:1455")):
@@ -375,8 +375,7 @@ def _fill_login_password_if_present(driver, email: str, timeout: int = 18) -> st
 
 def _fill_email_and_otp(driver, email: str, otp_provider, auth_url: str) -> None:
     otp_after_ts = time.time()
-    logger.info("[Codex][Browser] 打开授权地址")
-    logger.info("[Codex][Browser] 完整授权地址: %s", auth_url)
+    logger.info("[Codex][Browser] 打开授权地址（完整 URL 不写日志）")
     driver.get(auth_url)
     human_delay("navigate")
     logger.info("[Codex][Browser] 授权页加载完成，检查是否需要邮箱登录")
@@ -462,7 +461,7 @@ def _fill_email_and_otp(driver, email: str, otp_provider, auth_url: str) -> None
             _restart_email_otp_flow("等待验证码超时，避免点击 resend 导致 500")
             continue
         used_codes.add(str(code))
-        logger.info("[Codex][Browser] 邮箱 OTP 收到：%s", code)
+        logger.info("[Codex][Browser] 邮箱 OTP 已收到（验证码不写日志）")
         _wait_for_otp_input(driver, timeout=30)
         _clear_otp_inputs(driver)
         _type_otp(driver, code)
@@ -634,7 +633,7 @@ def _wait_after_email_otp_submit(driver, timeout: int = 45) -> str:
                 return f"deactivated:{dead_code}"
             url = str(driver.current_url or "")
             if url != last_url:
-                logger.info("[Codex][Browser] 邮箱 OTP 后等待跳转：url=%s", url)
+                logger.info("[Codex][Browser] 邮箱 OTP 后等待跳转：page=%s", _codex_proto._safe_url_for_log(url))
                 last_url = url
             if _is_callback_url(url):
                 return "accepted"
@@ -667,7 +666,7 @@ def _wait_after_email_otp_submit(driver, timeout: int = 45) -> str:
         except Exception:
             pass
         time.sleep(0.5)
-    logger.warning("[Codex][Browser] 邮箱 OTP 后等待跳转超时，当前 url=%s，按验证码无效/过期处理", getattr(driver, "current_url", ""))
+    logger.warning("[Codex][Browser] 邮箱 OTP 后等待跳转超时，当前 page=%s，按验证码无效/过期处理", _codex_proto._safe_url_for_log(getattr(driver, "current_url", "")))
     return "invalid"
 
 
@@ -1261,7 +1260,7 @@ def _do_phone_verification_if_present(driver) -> None:
                     activation_id, sms_provider._cfg.SMS_CODE_WAIT, sms_provider._cfg.SMS_POLL_INTERVAL
                 )
                 sms_code = sms_provider.wait_for_sms_code(activation_id, http)
-                logger.info("[Codex][Browser] 手机 OTP 收到：%s", sms_code)
+                logger.info("[Codex][Browser] 手机 OTP 已收到（验证码不写日志）")
                 _type_otp(driver, sms_code)
                 logger.info("[Codex][Browser] 已填写手机 OTP")
                 human_delay("otp_input")
@@ -1420,17 +1419,17 @@ def _run_roxy_codex_oauth_once(
             cpa_auth = proto._request_cpa_authorize_url()
             state = cpa_auth["state"]
             auth_url = cpa_auth["auth_url"]
-            logger.info("[Codex][Browser] 当前使用 CPA 授权地址: %s", auth_url)
+            logger.info("[Codex][Browser] 当前使用 CPA 授权地址（完整 URL 不写日志）")
         elif auth_source == "sub2":
             sub2_auth = proto._request_sub2_authorize_url()
             state = sub2_auth["state"]
             auth_url = sub2_auth["auth_url"]
-            logger.info("[Codex][Browser] 当前使用 sub2 授权地址: %s", auth_url)
+            logger.info("[Codex][Browser] 当前使用 sub2 授权地址（完整 URL 不写日志）")
         elif auth_source == "local":
             code_verifier, code_challenge = proto._generate_pkce()
             state = proto._generate_state()
             auth_url = proto._build_authorize_url(state, code_challenge, prompt="login")
-            logger.info("[Codex][Browser] 当前使用本地 PKCE 授权地址: %s", auth_url)
+            logger.info("[Codex][Browser] 当前使用本地 PKCE 授权地址（完整 URL 不写日志）")
         else:
             raise RuntimeError(f"[Codex][Browser] 不支持的 CODEX_AUTH_URL_SOURCE={auth_source!r}")
 
@@ -1449,7 +1448,7 @@ def _run_roxy_codex_oauth_once(
         logger.info("[Codex][Browser] 手机验证处理完成/无需处理，等待授权确认和 callback")
         callback_url = _finish_consent_workspace(driver)
         code = proto._extract_code(callback_url, state)
-        logger.info("[Codex][Browser] 已捕获 callback code：%s...", code[:24])
+        logger.info("[Codex][Browser] 已捕获 callback code（内容不写日志）")
 
         if auth_source == "cpa":
             submit_payload = proto._submit_cpa_callback(callback_url)
@@ -1517,8 +1516,7 @@ def _run_roxy_codex_oauth_once(
             message=f"账号已废（{exc.error_code or 'account_deactivated'}）",
         )
     except Exception as exc:
-        logger.warning("[Codex][Browser] 失败：%s，%s: %s", email, type(exc).__name__, str(exc)[:240])
-        logger.debug("[Codex][Browser] 失败详情", exc_info=True)
+        logger.warning("[Codex][Browser] 失败：%s，%s: %s", email, type(exc).__name__, _codex_proto._safe_sensitive_text(exc, limit=240))
         return proto._codex_result(status="failed", email=email, message=f"{type(exc).__name__}: {str(exc)[:220]}")
     finally:
         # 注册后复用窗口时，driver/profile 生命周期由注册流程统一清理，

@@ -22,6 +22,15 @@ class CodexRetryStopped(Exception):
     """用户手动停止 Codex 补跑。"""
 
 
+def _safe_detail(value: object) -> str:
+    try:
+        from core.codex_oauth import _safe_sensitive_text
+
+        return _safe_sensitive_text(value, limit=500)
+    except Exception:
+        return type(value).__name__ if isinstance(value, BaseException) else "Codex 补跑失败"
+
+
 def _thread_alive(thread_id: int | None) -> bool:
     if not thread_id:
         return False
@@ -209,7 +218,7 @@ def run_worker(
                 getattr(roxy_cfg, "ROXY_KEEP_BROWSER_OPEN", ""),
             )
         except Exception as exc:
-            logger.warning("[Codex 补跑] 配置热加载失败，将继续使用当前内存配置：%s: %s", type(exc).__name__, exc)
+            logger.warning("[Codex 补跑] 配置热加载失败，将继续使用当前内存配置：%s", type(exc).__name__)
 
         if batch_label:
             logger.info("[Codex 补跑] 批量任务：%s", batch_label)
@@ -218,9 +227,11 @@ def run_worker(
         check_stop_requested(email)
         result = run_codex_oauth(email, force=True)
         check_stop_requested(email)
+        result["message"] = _safe_detail(result.get("message"))
+        result["callback_url"] = None
         logger.info(
-            "[Codex 补跑] 结果：status=%s ok=%s file=%s callback=%s",
-            result.get("status"), result.get("ok"), result.get("file_path"), result.get("callback_url"),
+            "[Codex 补跑] 结果：status=%s ok=%s file=%s",
+            result.get("status"), result.get("ok"), result.get("file_path"),
         )
         result_status = result.get("status", "failed")
         if result.get("ok"):
@@ -228,13 +239,13 @@ def run_worker(
             logger.info("[Codex 补跑] %s 成功", email)
         elif result_status == "deactivated":
             db.update_account_codex_status(email, "deactivated", result.get("message"))
-            logger.warning("[Codex 补跑] %s 账号已废: %s", email, result.get("message"))
+            logger.warning("[Codex 补跑] %s 账号已废: %s", email, _safe_detail(result.get("message")))
         else:
             db.update_account_codex_status(email, result_status, result.get("message"))
-            logger.warning("[Codex 补跑] %s 失败: %s", email, result.get("message"))
+            logger.warning("[Codex 补跑] %s 失败: %s", email, _safe_detail(result.get("message")))
         return result
     except CodexRetryStopped as exc:
-        result = {"status": "stopped", "ok": False, "message": str(exc) or "用户手动停止 Codex 补跑"}
+        result = {"status": "stopped", "ok": False, "message": _safe_detail(str(exc) or "用户手动停止 Codex 补跑")}
         db.update_account_codex_status(email, "stopped", result["message"])
         logger.warning("[Codex 补跑] %s 已停止: %s", email, result["message"])
         return result
@@ -244,9 +255,9 @@ def run_worker(
             db.update_account_codex_status(email, "stopped", result["message"])
             logger.warning("[Codex 补跑] %s 已停止", email)
             return result
-        result = {"status": "failed", "ok": False, "message": f"{type(exc).__name__}: {exc}"}
+        result = {"status": "failed", "ok": False, "message": f"{type(exc).__name__}: {_safe_detail(exc)}"}
         db.update_account_codex_status(email, "failed", result["message"])
-        logger.exception("[Codex 补跑] %s 异常", email)
+        logger.warning("[Codex 补跑] %s 异常: %s", email, type(exc).__name__)
         logger.error("[Codex 补跑] 已结束：异常失败")
         return result
     finally:

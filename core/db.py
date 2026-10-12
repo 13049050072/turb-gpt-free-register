@@ -3106,7 +3106,7 @@ def recover_interrupted_registration_jobs() -> int:
         changed = 0
         now = _now()
         for row in rows:
-            if row.get("status") in {"running", "stopping"}:
+            if row.get("status") in {"pending", "running", "stopping"}:
                 row["status"] = "stopped"
                 row["error"] = "服务重启，注册任务被中断并释放"
                 row["completed_at"] = now

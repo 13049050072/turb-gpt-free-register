@@ -1,0 +1,11 @@
+.trellis/spec/backend/sub2api-credential-rotation.md
+.trellis/tasks/10-13-sub2api-cleanup-duplicates/prd.md
+.trellis/tasks/10-13-sub2api-cleanup-duplicates/task.json
+core/sub2api_401_service.py
+core/sub2api_admin.py
+tests/test_sub2api_401_service.py
+tests/test_sub2api_401_templates.py
+tests/test_sub2api_admin.py
+tests/test_webui_sub2api_401.py
+webui/app.py
+webui/templates/sub2api_401.html

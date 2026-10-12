@@ -40,6 +40,8 @@ class Sub2Api401TemplateTests(unittest.TestCase):
             self.assertIn(text, page)
         self.assertNotIn("/api/cpa-401", page)
         self.assertNotIn("auth-files", page)
+        self.assertIn('<option selected>3</option>', page)
+        self.assertIn("workers:Number($('#workers').value || 3)", page)
 
 
 if __name__ == "__main__":

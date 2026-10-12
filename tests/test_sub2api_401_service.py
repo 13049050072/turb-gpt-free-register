@@ -5,6 +5,7 @@ import threading
 import unittest
 from pathlib import Path
 
+from core.sub2api_admin import Sub2ApiAdminClient
 from core.sub2api_401_service import Sub2Api401Service, Sub2ApiSnapshotConflict
 
 
@@ -852,6 +853,172 @@ class Sub2Api401ServiceTests(unittest.TestCase):
         self.assertEqual("cleanup_ready", item["state"])
         self.assertEqual("old", item["cleanup_account_id"])
         self.assertEqual("new", item["replacement_account_id"])
+
+    def test_cleanup_deactivation_failure_preserves_safe_retry_evidence(self):
+        rows = [{"account_id": "42", "email": "one@example.com"}]
+        errors = {"42": "401 unauthorized"}
+        calls = []
+
+        def refresh(ids):
+            failures = [
+                {"account_id": value, "error": errors[value]}
+                for value in ids
+                if value in errors
+            ]
+            return {
+                "total": len(ids),
+                "success": len(ids) - len(failures),
+                "failed": len(failures),
+                "errors": failures,
+            }
+
+        def request(method, path, body):
+            calls.append((method, path, body))
+            return {
+                "code": 500,
+                "message": "deactivation failed authorization=super-secret callback=https://secret.example/cb",
+            }
+
+        service = self.service(
+            rows=rows,
+            refresh=refresh,
+            delete=Sub2ApiAdminClient(request).delete_account,
+        )
+        service.detect()
+        service.mark_retrying(["42"])
+        rows.append({"account_id": "84", "email": "one@example.com"})
+        service.detect({"one@example.com": "success"})
+
+        result = service.cleanup(["42"], opt_in=True)
+
+        self.assertFalse(result["items"][0]["ok"])
+        self.assertEqual([
+            ("PUT", "/api/v1/admin/accounts/42", {"status": "inactive"}),
+        ], calls)
+        item = service.state()["items"][0]
+        self.assertEqual("cleanup_ready", item["state"])
+        self.assertEqual("42", item["cleanup_account_id"])
+        self.assertEqual("84", item["replacement_account_id"])
+        self.assertIn("deactivation failed", item["reason"])
+        persisted = self.audit_path.read_text(encoding="utf-8")
+        self.assertNotIn("super-secret", persisted)
+        self.assertNotIn("secret.example", persisted)
+
+    def test_cleanup_request_failure_stays_retryable_when_old_id_disappears_concurrently(self):
+        rows = [{"account_id": "42", "email": "one@example.com"}]
+        errors = {"42": "401 unauthorized"}
+        calls = []
+
+        def refresh(ids):
+            failures = [
+                {"account_id": value, "error": errors[value]}
+                for value in ids
+                if value in errors
+            ]
+            return {
+                "total": len(ids),
+                "success": len(ids) - len(failures),
+                "failed": len(failures),
+                "errors": failures,
+            }
+
+        def request(method, path, body):
+            calls.append((method, path, body))
+            rows[:] = [row for row in rows if row["account_id"] != "42"]
+            return {"code": 500, "message": "deactivation failed"}
+
+        service = self.service(
+            rows=rows,
+            refresh=refresh,
+            delete=Sub2ApiAdminClient(request).delete_account,
+        )
+        service.detect()
+        service.mark_retrying(["42"])
+        rows.append({"account_id": "84", "email": "one@example.com"})
+        service.detect({"one@example.com": "success"})
+
+        first = service.cleanup(["42"], opt_in=True)
+
+        self.assertFalse(first["items"][0]["ok"])
+        self.assertEqual("not_deleted", first["items"][0]["result"])
+        self.assertEqual("cleanup_ready", service.state()["items"][0]["state"])
+        self.assertEqual([
+            ("PUT", "/api/v1/admin/accounts/42", {"status": "inactive"}),
+        ], calls)
+
+        second = service.cleanup(["42"], opt_in=True)
+
+        self.assertTrue(second["items"][0]["ok"])
+        self.assertEqual("absent_and_verified", second["items"][0]["result"])
+        self.assertEqual("cleaned", service.state()["items"][0]["state"])
+        self.assertEqual(1, len(calls))
+
+    def test_cleanup_delete_failure_retries_deactivation_and_preserves_evidence(self):
+        rows = [{"account_id": "42", "email": "one@example.com"}]
+        errors = {"42": "401 unauthorized"}
+        calls = []
+        delete_attempts = 0
+
+        def refresh(ids):
+            failures = [
+                {"account_id": value, "error": errors[value]}
+                for value in ids
+                if value in errors
+            ]
+            return {
+                "total": len(ids),
+                "success": len(ids) - len(failures),
+                "failed": len(failures),
+                "errors": failures,
+            }
+
+        def request(method, path, body):
+            nonlocal delete_attempts
+            calls.append((method, path, body))
+            if method == "DELETE":
+                delete_attempts += 1
+                if delete_attempts == 1:
+                    return {
+                        "code": 500,
+                        "message": "delete failed access_token=super-secret callback=https://secret.example/cb",
+                    }
+                rows[:] = [row for row in rows if row["account_id"] != "42"]
+            return {"data": {"access_token": "must-not-return"}}
+
+        service = self.service(
+            rows=rows,
+            refresh=refresh,
+            delete=Sub2ApiAdminClient(request).delete_account,
+        )
+        service.detect()
+        service.mark_retrying(["42"])
+        rows.append({"account_id": "84", "email": "one@example.com"})
+        service.detect({"one@example.com": "success"})
+
+        first = service.cleanup(["42"], opt_in=True)
+
+        self.assertFalse(first["items"][0]["ok"])
+        self.assertEqual([
+            ("PUT", "/api/v1/admin/accounts/42", {"status": "inactive"}),
+            ("DELETE", "/api/v1/admin/accounts/42", None),
+        ], calls)
+        item = service.state()["items"][0]
+        self.assertEqual("cleanup_ready", item["state"])
+        self.assertEqual("42", item["cleanup_account_id"])
+        self.assertEqual("84", item["replacement_account_id"])
+        self.assertIn("delete failed", item["reason"])
+        self.assertNotIn("super-secret", self.audit_path.read_text(encoding="utf-8"))
+
+        second = service.cleanup(["42"], opt_in=True)
+
+        self.assertTrue(second["items"][0]["ok"])
+        self.assertEqual([
+            ("PUT", "/api/v1/admin/accounts/42", {"status": "inactive"}),
+            ("DELETE", "/api/v1/admin/accounts/42", None),
+            ("PUT", "/api/v1/admin/accounts/42", {"status": "inactive"}),
+            ("DELETE", "/api/v1/admin/accounts/42", None),
+        ], calls)
+        self.assertEqual("cleaned", service.state()["items"][0]["state"])
 
     def test_cleanup_requires_healthy_replacement_after_delete(self):
         rows = [{"account_id": "old", "email": "one@example.com"}]

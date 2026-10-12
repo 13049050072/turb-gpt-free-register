@@ -9,7 +9,8 @@
 - 2026-10-13 Oracle 上 `/sub2api-401` 显示旧 ID `25` 为 `cleanup_ready`，替代 ID `40` 已验证，但旧 ID 未自动删除。
 - Sub2API 账号列表中同邮箱 `corsage.scalene0j@icloud.com` 同时存在 `#25`（`error`）和 `#40`（`active`）。
 - 初次审计显示四组历史双凭证：`16/21`、`17/20`、`18/24`、`19/22`，后者均有唯一更晚的 `created_at`。
-- 2026-10-13 部署后实测并清理：`16/21`、`17/20`、`18/24`、`25/40` 已收敛为单一 keeper；`19/22` 两条均为 `unauthorized`，因此暴露出“全失效但可由唯一最新时间确定 keeper”的遗漏分支。
+- 2026-10-13 部署后实测并清理：`16/21`、`17/20`、`18/24`、`25/40` 一度收敛为单一 keeper；`19/22` 两条均为 `unauthorized`，因此补充了“全失效但可由唯一最新时间确定 keeper”的分支。
+- 随后发现旧 ID `16/17/18/25` 在 Sub2API 后台周期后以相同 ID 重新出现。对线上 ID `16` 做最小实验：先 `PUT status=inactive` 再 DELETE，跨过 200 秒后台周期后未复活，keeper `21` 保持存在。因此 durable cleanup 必须先停用精确旧 ID，再删除。
 - 当前模板并发下拉框默认选中第一个值 1；用户要求默认 3。
 
 ## Requirements
@@ -19,6 +20,7 @@
 - 禁止按邮箱批量删除。
 - 所有删除目标必须是服务状态中锁定的精确旧 `account_id`。
 - 删除前必须重新列出并刷新候选 keeper ID，确认 keeper 仍存在且同邮箱。正常轮换 keeper 必须健康；历史“全 unauthorized”去重 keeper 必须仍稳定为 unauthorized 且仍是唯一最新 ID。
+- 删除动作必须先通过 Sub2API 官方账号更新接口把锁定旧 ID 设为 `inactive`，确认停用请求成功后再调用精确 ID DELETE，避免后台刷新任务用旧快照复活软删除行。
 - 删除后必须重新列出，确认旧 ID 消失并确认 keeper 分类未漂移；失败时保留可重试审计证据。
 - 不记录、返回或持久化管理密钥、OAuth token/code、callback URL 或完整凭证。
 
@@ -60,6 +62,7 @@
 - [ ] 适配器 `created_at` 解析/限制测试通过，秘密字段不泄漏。
 - [ ] 未来补跑：唯一健康新 ID 出现后，自动删除精确旧 ID并验证消失，最终状态 `cleaned`。
 - [ ] 自动删除失败时保留 `cleanup_ready` 与可重试证据。
+- [ ] 每次 cleanup 都严格按 `PUT old_id status=inactive` → `DELETE old_id` 顺序执行；停用失败时不得发 DELETE。
 - [ ] 自动清理不会删除未属于本次 batch 的其他账号。
 - [ ] 历史重复：唯一健康 keeper、多个健康时唯一最新 keeper、全部 unauthorized 时唯一最新 keeper、时间缺失和时间并列均有测试。
 - [ ] 同邮箱多个健康账号或全部 unauthorized 账号且唯一最新时，旧 ID 不再显示为 `ambiguous`，而是可精确清理；keeper 被保留且下一次检测可正常进入补跑。

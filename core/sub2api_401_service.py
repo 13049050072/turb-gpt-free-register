@@ -910,6 +910,7 @@ class Sub2Api401Service:
             eligible_ids.append(account_id)
 
         attempts: dict[str, bool] = {}
+        attempt_errors: dict[str, str] = {}
         for account_id in eligible_ids:
             try:
                 result = self._delete_fn(account_id)
@@ -918,8 +919,12 @@ class Sub2Api401Service:
                     if isinstance(result, dict)
                     else result is True
                 )
-            except Exception:
+            except Exception as exc:
                 attempts[account_id] = False
+                attempt_errors[account_id] = _reason(
+                    exc,
+                    "Sub2API 停用或删除请求失败",
+                )
 
         after_error = ""
         after_refresh_error = ""
@@ -1017,9 +1022,11 @@ class Sub2Api401Service:
                         state = "ambiguous" if old_id not in after_by_id else "cleanup_ready"
 
                 absent = not after_error and old_id not in after_by_id
-                ok = not error and absent and (
-                    account_id in eligible_ids or account_id in reconciled_ids
+                operation_confirmed = (
+                    account_id in reconciled_ids
+                    or attempts.get(account_id, False)
                 )
+                ok = not error and absent and operation_confirmed
                 if ok:
                     attempted = account_id in eligible_ids
                     self._tracked[account_id] = self._sanitize_entry({
@@ -1043,9 +1050,9 @@ class Sub2Api401Service:
                     result_reason = ""
                 else:
                     if not error:
-                        error = (
-                            "Sub2API 删除请求失败"
-                            if not attempts.get(old_id, False)
+                        error = attempt_errors.get(account_id) or (
+                            "Sub2API 停用或删除请求失败"
+                            if not attempts.get(account_id, False)
                             else "删除后旧 account_id 仍存在"
                         )
                     if account_id in ambiguous_ids:

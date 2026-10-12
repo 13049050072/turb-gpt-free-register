@@ -1,0 +1,7 @@
+test_delete_deactivates_then_deletes_exact_encoded_account_id_and_discards_payloads (tests.test_sub2api_admin.Sub2ApiAdminClientTests.test_delete_deactivates_then_deletes_exact_encoded_account_id_and_discards_payloads) ... ok
+test_cleanup_request_failure_stays_retryable_when_old_id_disappears_concurrently (tests.test_sub2api_401_service.Sub2Api401ServiceTests.test_cleanup_request_failure_stays_retryable_when_old_id_disappears_concurrently) ... ok
+
+----------------------------------------------------------------------
+Ran 2 tests in 0.002s
+
+OK

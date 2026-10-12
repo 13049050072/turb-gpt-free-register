@@ -1,0 +1,2214 @@
+diff --git a/.trellis/spec/backend/sub2api-credential-rotation.md b/.trellis/spec/backend/sub2api-credential-rotation.md
+index 9be55d6..3c7a83d 100644
+--- a/.trellis/spec/backend/sub2api-credential-rotation.md
++++ b/.trellis/spec/backend/sub2api-credential-rotation.md
+@@ -45,15 +45,18 @@ Sub2API operations:
+ ```text
+ GET    /api/v1/admin/accounts?platform=openai&type=oauth&page=<n>&page_size=<n>&lite=1
+ POST   /api/v1/admin/accounts/batch-refresh  {"account_ids": [integer|string, ...]}
++PUT    /api/v1/admin/accounts/<exact account_id>  {"status": "inactive"}
+ DELETE /api/v1/admin/accounts/<exact account_id>
+ ```
+ 
+ ### 3. Contracts
+ 
+-Environment is reused from `config/sub2api.py`: `SUB2API_API_BASE`, `SUB2API_API_KEY` or `SUB2API_API_TOKEN`, `SUB2API_API_AUTH_HEADER`, `SUB2API_API_AUTH_SCHEME`, and `SUB2API_API_TIMEOUT`. Do not introduce a second management-secret configuration.
++Environment is reused from `config/sub2api.py`: `SUB2API_API_BASE`, `SUB2API_API_KEY` or `SUB2API_API_TOKEN`, `SUB2API_API_AUTH_HEADER`, `SUB2API_API_AUTH_SCHEME`, and `SUB2API_API_TIMEOUT`. Do not introduce a second management-secret configuration. The list adapter may retain only a bounded, validated non-sensitive `created_at` value; malformed, missing, or tied latest timestamps are not usable for keeper selection.
+ 
+ The list adapter accepts direct payloads and standard `{code, data}` envelopes, traverses bounded pagination, deduplicates by normalized `account_id`, and retains only `platform=openai` plus `type=oauth`. Numeric IDs remain strings in audit/UI state but are sent as integers on batch-refresh requests. Email candidates are normalized; missing or conflicting candidates set `email_ambiguous` and are ineligible for retry and cleanup.
+ 
++`delete_account(account_id)` is the durable exact-ID cleanup primitive. It normalizes and URL-encodes the ID once, sends `PUT {"status": "inactive"}` to that exact account path, and sends DELETE to the same path only after the PUT succeeds. Both server response payloads are discarded. A deactivation failure short-circuits DELETE; a later DELETE failure remains safe to retry because the same exact ID may be deactivated again before deletion.
++
+ Batch refresh returns only bounded operational fields:
+ 
+ ```text
+@@ -65,15 +68,15 @@ Errors matching HTTP 401, `unauthorized`, `invalid_grant`, or `invalid_token` ar
+ Audit entries contain non-sensitive evidence only:
+ 
+ ```text
+-account_id, account_name, email, state, health, reason,
++account_id, account_name, email, created_at, state, health, reason,
+ observed_account_ids, pre_retry_account_ids, post_retry_account_ids,
+-replacement_account_id, cleanup_account_id, candidate_count,
++replacement_account_id, replacement_health, cleanup_account_id, candidate_count,
+ checked_at, pre_retry_snapshot_at, post_retry_snapshot_at,
+ retry_started_at, retry_batch_id, local_codex_status,
+ retryable, cleanup_supported, manual_action
+ ```
+ 
+-Allowed states are `pending`, `retrying`, `verified`, `cleanup_ready`, `cleaned`, `failed`, and `ambiguous`. Management keys, access/refresh tokens, OAuth codes, callback URLs, cookies, and credential JSON must never be logged, persisted, or returned. Reasons are bounded and secret-like text is redacted.
++Allowed states are `pending`, `retrying`, `verified`, `cleanup_ready`, `cleaned`, `failed`, and `ambiguous`. `replacement_health` is empty without a keeper and otherwise records only the cleanup invariant `healthy` or `unauthorized`; audits created before this field existed default to `healthy` so deployed replacement cleanup remains restart-safe. Management keys, access/refresh tokens, OAuth codes, callback URLs, cookies, and credential JSON must never be logged, persisted, or returned. Reasons are bounded and secret-like text is redacted.
+ 
+ `sub2api_401_audit.json` is persisted atomically. If the configured audit path is a symlink, create the temporary file beside the resolved target so `os.replace()` remains on the writable data volume and preserves the symlink. Use mode `0600` where supported.
+ 
+@@ -94,22 +97,31 @@ All Sub2API-401 responses set `Cache-Control: no-store, max-age=0`, `Pragma: no-
+ | Email is missing or maps to multiple account IDs | `ambiguous`; retry and cleanup disabled |
+ | OAuth/local retry fails | `failed`; preserve the old ID and snapshot |
+ | No new ID or multiple new IDs appear | `ambiguous`; cleanup disabled |
+-| Exactly one new same-email ID refreshes healthy and old ID remains | `cleanup_ready` with exact old/new IDs locked |
+-| `confirm_cleanup` is not literal `true` | Review only; no DELETE request |
+-| Locked state changes before cleanup | Skip stale target; no DELETE request |
++| Exactly one new same-email ID refreshes healthy and old ID remains | `cleanup_ready` with exact old/new IDs locked and `replacement_health=healthy`; the retry runner immediately performs exact-ID cleanup |
++| Every member of a historical same-email duplicate group is unauthorized and one account has the unique latest valid `created_at` | Omit the latest keeper; mark each older exact ID `cleanup_ready` with `replacement_health=unauthorized`; detection performs no deletion |
++| Historical all-unauthorized group has missing/invalid/tied `created_at`, or any timeout/unknown classification | `ambiguous`; no cleanup target is locked |
++| `confirm_cleanup` is not literal `true` | Review only; no PUT or DELETE request |
++| Locked state changes before cleanup | Skip stale target; no PUT or DELETE request |
++| Historical unauthorized keeper cleanup precheck changes the group snapshot, any classification, email, persisted non-keeper `created_at`, or unique-latest result | `ambiguous`; no PUT or DELETE request |
++| Exact old-ID deactivation fails | Adapter raises a sanitized management error; service records a bounded reason, sends no DELETE, and keeps `cleanup_ready` evidence for retry |
++| Exact old-ID DELETE fails after deactivation | Keep `cleanup_ready` with bounded failure evidence; retry repeats PUT `inactive` before DELETE |
+ | Delete succeeds but old ID remains on re-list | Keep evidence and report verification failure |
+-| Delete and re-list confirm old ID absent | `cleaned` |
++| Delete/reconciliation confirms old ID absent but the replacement is missing or no longer matches its locked `healthy`/`unauthorized` invariant | `ambiguous`; keep bounded evidence for review |
++| Re-list confirms old ID absent and a second refresh confirms the replacement healthy | `cleaned` |
++| Re-list confirms an exact historical old ID absent, the keeper remains same-email and unique latest, and a second refresh confirms it unauthorized | `cleaned`; on the next detect the unauthorized singleton keeper becomes normal retryable `pending` |
++| Historical unauthorized old ID is absent but the keeper no longer refreshes unauthorized or is no longer unique latest | `ambiguous`; retain the exact cleanup and keeper evidence |
+ 
+ ### 5. Good/Base/Bad Cases
+ 
+-- Good: old ID `42` is unauthorized, its same-email ID set is snapshotted, OAuth creates healthy ID `84`, and ID `42` still exists. State becomes `cleanup_ready`; explicit confirmation deletes only `42`, then re-list confirms it is absent.
+-- Base: healthy accounts are counted but omitted from the actionable list. Unauthorized accounts remain `pending` until the operator selects their exact IDs.
+-- Bad: email extraction is ambiguous, the pre-retry ID set changes, OAuth creates zero or multiple candidates, the new ID is not healthy, or cleanup state becomes stale. State becomes `failed` or `ambiguous`; no deletion occurs.
++- Good: old ID `42` is unauthorized, its same-email ID set is snapshotted, OAuth creates healthy ID `84`, and ID `42` still exists. State becomes `cleanup_ready`; the retry runner sends PUT `status=inactive` and then DELETE only to locked ID `42`, then re-list confirms it is absent and state becomes `cleaned`.
++- Historical duplicate: one healthy account with unauthorized peers, multiple healthy accounts with one unique latest valid `created_at`, or all unauthorized accounts with one unique latest valid `created_at`, marks each older exact ID `cleanup_ready`; detection itself never deletes. The all-unauthorized branch refreshes the complete live same-email group before deletion, requires every classification to remain unauthorized, and refreshes the unique-latest keeper again after deletion.
++- Base: healthy accounts are counted but omitted from the actionable list. Unauthorized accounts remain `pending` until the operator selects their exact IDs. The page defaults retry workers to 3; cleanup is a manual action only for historical duplicates or an automatic cleanup failure.
++- Bad: email extraction is ambiguous, the pre-retry ID set changes, OAuth creates zero or multiple candidates, the new ID is not healthy, historical timestamps are missing/invalid/tied, historical health includes timeout/unknown, cleanup state/classification changes, or exact-ID deactivation fails. State becomes `failed`, `ambiguous`, or remains retryable `cleanup_ready`; DELETE is never sent after a failed deactivation.
+ 
+ ### 6. Tests Required
+ 
+-- Adapter tests assert direct and enveloped responses, bounded pagination, repeated-page protection, OpenAI OAuth filtering, numeric wire IDs, exact DELETE paths, safe error categories, and redaction.
+-- Service tests assert health classification, persisted snapshots, unique replacement, zero/multiple candidates, missing old IDs, local retry failure, email ambiguity, stale-snapshot conflict, concurrent detect/cleanup serialization, explicit cleanup opt-in, delete verification, and failed cleanup evidence retention.
++- Adapter tests assert direct and enveloped responses, bounded pagination, repeated-page protection, OpenAI OAuth filtering, numeric wire IDs, exact encoded account paths, PUT `inactive` then DELETE call order/body, deactivation failure short-circuiting, safe error categories, discarded response payloads, and redaction.
++- Service tests assert health classification, persisted snapshots, unique replacement, zero/multiple candidates, missing old IDs, local retry failure, email ambiguity, stale-snapshot conflict, concurrent detect/cleanup serialization, explicit cleanup opt-in, delete verification, safe deactivation/delete failure evidence retention, repeated deactivation on retry, and historical all-unauthorized unique-latest selection/refusal, classification drift, post-delete keeper drift, exact-ID deletion, and next-detect singleton retryability.
+ - Persistence tests assert atomic writes, resolved symlink target directories, preserved symlinks, mode `0600`, and no secret text.
+ - API tests assert authentication, request validation, HTTP 409/422 behavior, no-store headers, worker release on failures, exact-ID selection, and remote error mapping.
+ - Template tests assert modern/legacy navigation parity, all four Sub2API-401 endpoints, account ID evidence, explicit cleanup wording, and no CPA-401 links.
+@@ -132,7 +144,8 @@ Local completion is not remote proof, and email-wide deletion can remove the rep
+ service.mark_retrying([old_account_id], batch_id=batch_id)
+ run_existing_codex_retry(email)
+ result = service.detect({email: local_codex_status})
+-service.cleanup([old_account_id], opt_in=operator_confirmed)
++# The retry runner auto-cleans only the selected, locked IDs in cleanup_ready.
++service.cleanup([old_account_id], opt_in=True)
+ ```
+ 
+ Cleanup becomes available only after Sub2API shows one healthy new same-email `account_id` while the snapshotted old ID still exists. The delete target remains the exact locked old ID.
+diff --git a/.trellis/tasks/10-13-sub2api-cleanup-duplicates/prd.md b/.trellis/tasks/10-13-sub2api-cleanup-duplicates/prd.md
+new file mode 100644
+index 0000000..5125e19
+--- /dev/null
++++ b/.trellis/tasks/10-13-sub2api-cleanup-duplicates/prd.md
+@@ -0,0 +1,78 @@
++# Sub2API 重复凭证自动收敛
++
++## Goal
++
++修复 Sub2API 401 轮换在生成替代账号后仍保留旧 `account_id` 的问题。未来补跑完成并验证唯一健康替代账号后，自动删除检测时锁定的旧 ID；同时识别并安全收敛当前遗留的同邮箱双凭证。页面默认补跑并发改为 3。
++
++## Observed Production Evidence
++
++- 2026-10-13 Oracle 上 `/sub2api-401` 显示旧 ID `25` 为 `cleanup_ready`，替代 ID `40` 已验证，但旧 ID 未自动删除。
++- Sub2API 账号列表中同邮箱 `corsage.scalene0j@icloud.com` 同时存在 `#25`（`error`）和 `#40`（`active`）。
++- 初次审计显示四组历史双凭证：`16/21`、`17/20`、`18/24`、`19/22`，后者均有唯一更晚的 `created_at`。
++- 2026-10-13 部署后实测并清理：`16/21`、`17/20`、`18/24`、`25/40` 一度收敛为单一 keeper；`19/22` 两条均为 `unauthorized`，因此补充了“全失效但可由唯一最新时间确定 keeper”的分支。
++- 随后发现旧 ID `16/17/18/25` 在 Sub2API 后台周期后以相同 ID 重新出现。对线上 ID `16` 做最小实验：先 `PUT status=inactive` 再 DELETE，跨过 200 秒后台周期后未复活，keeper `21` 保持存在。因此 durable cleanup 必须先停用精确旧 ID，再删除。
++- 当前模板并发下拉框默认选中第一个值 1；用户要求默认 3。
++
++## Requirements
++
++### Preserve exact-ID safety
++
++- 禁止按邮箱批量删除。
++- 所有删除目标必须是服务状态中锁定的精确旧 `account_id`。
++- 删除前必须重新列出并刷新候选 keeper ID，确认 keeper 仍存在且同邮箱。正常轮换 keeper 必须健康；历史“全 unauthorized”去重 keeper 必须仍稳定为 unauthorized 且仍是唯一最新 ID。
++- 删除动作必须先通过 Sub2API 官方账号更新接口把锁定旧 ID 设为 `inactive`，确认停用请求成功后再调用精确 ID DELETE，避免后台刷新任务用旧快照复活软删除行。
++- 删除后必须重新列出，确认旧 ID 消失并确认 keeper 分类未漂移；失败时保留可重试审计证据。
++- 不记录、返回或持久化管理密钥、OAuth token/code、callback URL 或完整凭证。
++
++### Account metadata
++
++- Sub2API 列表适配器保留经过限制和校验的非敏感 `created_at` 字段，用于同邮箱重复账号的先后关系判定。
++- `created_at` 缺失、无效或出现并列最新时间时，不得自动判定旧账号。
++- 现有 `platform=openai`、`type=oauth`、分页边界、整数 wire ID 与脱敏约束保持不变。
++
++### Future retry auto-cleanup
++
++- `POST /api/sub2api-401/retry` 仍由用户显式选择旧 ID 并确认启动补跑。
++- 补跑完成后，继续用旧 ID 快照、同邮箱唯一新 ID 和 batch-refresh 健康结果验证替代关系。
++- 一旦选中的旧 ID 进入 `cleanup_ready`，后台流程立即调用精确 ID cleanup，不再要求用户第二次点击清理按钮。
++- 自动删除只处理本次 batch 选中的旧 ID；不得处理其他同邮箱账号。
++- 自动 cleanup 失败时保持 `cleanup_ready`，页面继续提供手动重试清理，并展示受控原因。
++- 成功时状态直接进入 `cleaned`，并确认替代 ID 保持健康。
++
++### Historical duplicate convergence
++
++检测同邮箱多个 OpenAI OAuth account ID 时：
++
++1. 若恰好一个账号健康、其余账号 unauthorized/error，则健康账号为 keeper，其余精确 ID 可进入 `cleanup_ready`。
++2. 若多个账号均健康，只有在存在唯一最新且合法的 `created_at` 时，最新 ID 为 keeper，所有更早 ID 分别进入 `cleanup_ready`。
++3. 若同邮箱所有账号均明确为 unauthorized，且存在唯一最新且合法的 `created_at`，最新 ID 为失效 keeper，所有更早 unauthorized ID 分别进入 `cleanup_ready`；cleanup 必须确认 keeper 仍为 unauthorized 且唯一最新。清理完成后，唯一保留的 unauthorized keeper 在下一次检测中进入正常可补跑状态。
++4. 若 keeper 不唯一、时间缺失/并列、邮箱歧义、账号快照变化、分类漂移或刷新结果不完整，则保持 `ambiguous`，禁止删除。
++5. 检测本身不执行删除；历史重复项由页面 cleanup 操作显式确认。部署后运维仅清理检测状态明确锁定的精确旧 ID。
++
++### UI and defaults
++
++- Sub2API 401 页面并发下拉框默认选中 3。
++- `/api/sub2api-401/retry` 未传 `workers` 时默认 3，仍限制在 `1..8`。
++- 补跑确认文案明确说明：唯一替代 ID 验证成功后会自动删除锁定旧 ID。
++- cleanup 按钮文案明确其用途是历史重复项或自动清理失败重试。
++- 页面继续展示旧 ID、补跑前/后 ID、唯一替代 ID、锁定清理 ID 与状态原因。
++
++## Acceptance Criteria
++
++- [ ] 适配器 `created_at` 解析/限制测试通过，秘密字段不泄漏。
++- [ ] 未来补跑：唯一健康新 ID 出现后，自动删除精确旧 ID并验证消失，最终状态 `cleaned`。
++- [ ] 自动删除失败时保留 `cleanup_ready` 与可重试证据。
++- [ ] 每次 cleanup 都严格按 `PUT old_id status=inactive` → `DELETE old_id` 顺序执行；停用失败时不得发 DELETE。
++- [ ] 自动清理不会删除未属于本次 batch 的其他账号。
++- [ ] 历史重复：唯一健康 keeper、多个健康时唯一最新 keeper、全部 unauthorized 时唯一最新 keeper、时间缺失和时间并列均有测试。
++- [ ] 同邮箱多个健康账号或全部 unauthorized 账号且唯一最新时，旧 ID 不再显示为 `ambiguous`，而是可精确清理；keeper 被保留且下一次检测可正常进入补跑。
++- [ ] 默认并发为 3（模板选择、前端 fallback、API fallback）。
++- [ ] 相关 adapter/service/API/template 测试、现有 Sub2API/Codex 回归、`py_compile`、JS syntax、`git diff --check` 通过。
++- [ ] 部署 Oracle 后清理当前 5 个遗留旧 ID，复查每个邮箱只剩唯一 keeper ID。
++
++## Out of Scope
++
++- 修改 Sub2API 服务端。
++- 按邮箱直接删除账号。
++- 自动处理无法唯一确认 keeper 的重复组。
++- 修改普通 Codex 注册、ChatGPT2API 401、Agent Token 上传或 CPA 兼容流程。
+diff --git a/.trellis/tasks/10-13-sub2api-cleanup-duplicates/task.json b/.trellis/tasks/10-13-sub2api-cleanup-duplicates/task.json
+new file mode 100644
+index 0000000..75ee629
+--- /dev/null
++++ b/.trellis/tasks/10-13-sub2api-cleanup-duplicates/task.json
+@@ -0,0 +1,26 @@
++{
++  "id": "sub2api-cleanup-duplicates",
++  "name": "sub2api-cleanup-duplicates",
++  "title": "Sub2API 重复凭证清理修复",
++  "description": "保留已验证的新旧 account_id 关系，防止重新检测降级为状态不明确；在替代账号确认后清理锁定旧 ID，并将页面默认并发设为 3。",
++  "status": "in_progress",
++  "dev_type": null,
++  "scope": null,
++  "package": null,
++  "priority": "P1",
++  "creator": "jiangdk",
++  "assignee": "jiangdk",
++  "createdAt": "2026-10-13",
++  "completedAt": null,
++  "branch": null,
++  "base_branch": "main",
++  "worktree_path": null,
++  "commit": null,
++  "pr_url": null,
++  "subtasks": [],
++  "children": [],
++  "parent": null,
++  "relatedFiles": [],
++  "notes": "",
++  "meta": {}
++}
+\ No newline at end of file
+diff --git a/core/sub2api_401_service.py b/core/sub2api_401_service.py
+index 8414586..bfff9cc 100644
+--- a/core/sub2api_401_service.py
++++ b/core/sub2api_401_service.py
+@@ -62,6 +62,20 @@ def _email(value: object) -> str:
+     return text if _EMAIL_RE.match(text) else ""
+ 
+ 
++def _created_at(value: object) -> str:
++    text = _text(value, 64)
++    if not text or "@" in text or "http://" in text.lower() or "https://" in text.lower():
++        return ""
++    candidate = text[:-1] + "+00:00" if text.endswith("Z") else text
++    try:
++        parsed = datetime.fromisoformat(candidate)
++    except ValueError:
++        return ""
++    if parsed.tzinfo is None:
++        parsed = parsed.replace(tzinfo=timezone.utc)
++    return parsed.astimezone(timezone.utc).isoformat()
++
++
+ def _bounded_int(value: object, *, minimum: int = 0, maximum: int = 10_000) -> int:
+     try:
+         parsed = int(value or 0)
+@@ -193,12 +207,19 @@ class Sub2Api401Service:
+             health = "unknown"
+         account_id = _account_id(raw.get("account_id"))
+         replacement_id = _account_id(raw.get("replacement_account_id"))
++        replacement_health = _text(raw.get("replacement_health"), 32).lower()
++        if replacement_id and replacement_health not in {"healthy", "unauthorized"}:
++            # Audits written before replacement_health existed always required a healthy keeper.
++            replacement_health = "healthy"
++        if not replacement_id:
++            replacement_health = ""
+         cleanup_id = _account_id(raw.get("cleanup_account_id"))
+         retryable = bool(raw.get("retryable")) and state in {"pending", "failed"}
+         return {
+             "account_id": account_id,
+             "account_name": _account_name(raw.get("account_name")),
+             "email": _email(raw.get("email")),
++            "created_at": _created_at(raw.get("created_at")),
+             "state": state,
+             "health": health,
+             "reason": _reason(raw.get("reason"), state),
+@@ -206,6 +227,7 @@ class Sub2Api401Service:
+             "pre_retry_account_ids": _dedupe_ids(raw.get("pre_retry_account_ids")),
+             "post_retry_account_ids": _dedupe_ids(raw.get("post_retry_account_ids")),
+             "replacement_account_id": replacement_id,
++            "replacement_health": replacement_health,
+             "cleanup_account_id": cleanup_id,
+             "candidate_count": _bounded_int(raw.get("candidate_count")),
+             "checked_at": _text(raw.get("checked_at"), 64),
+@@ -216,7 +238,10 @@ class Sub2Api401Service:
+             "local_codex_status": _text(raw.get("local_codex_status"), 64).lower(),
+             "retryable": retryable,
+             "cleanup_supported": self.cleanup_supported,
+-            "manual_action": "确认替代账号健康后，仅按锁定的旧 account_id 删除" if state == "cleanup_ready" else "",
++            "manual_action": (
++                "历史重复项或自动清理失败时，确认后仅按锁定的旧 account_id 重试清理"
++                if state == "cleanup_ready" else ""
++            ),
+         }
+ 
+     def _public_items_locked(self) -> list[dict]:
+@@ -262,6 +287,7 @@ class Sub2Api401Service:
+                 "account_name": _account_name(raw.get("account_name") or raw.get("name")),
+                 "email": email,
+                 "email_ambiguous": raw.get("email_ambiguous") is True,
++                "created_at": _created_at(raw.get("created_at")),
+             }
+             if account_id not in by_id:
+                 by_id[account_id] = account
+@@ -332,9 +358,44 @@ class Sub2Api401Service:
+ 
+         if old.get("state") == "cleaned" and replacement:
+             if old_id not in by_id and replacement in by_id and kinds.get(replacement) == "healthy":
+-                return self._sanitize_entry({**base, "state": "cleaned", "reason": "旧 Sub2API account_id 已删除，替代账号保持健康", "replacement_account_id": replacement})
++                return self._sanitize_entry({
++                    **base,
++                    "state": "cleaned",
++                    "reason": "旧 Sub2API account_id 已删除，替代账号保持健康",
++                    "replacement_account_id": replacement,
++                    "cleanup_account_id": old_id,
++                })
+             return self._sanitize_entry({**base, "state": "ambiguous", "reason": "清理后 Sub2API 账号状态发生变化，需要人工复核"})
+ 
++        if old.get("state") == "cleanup_ready" and replacement:
++            expected_ids = _dedupe_ids(old.get("post_retry_account_ids") or old.get("observed_account_ids"))
++            expected_current = set(expected_ids)
++            if not old_exists:
++                expected_current.discard(old_id)
++            if not expected_ids or set(current_ids) != expected_current:
++                return self._sanitize_entry({
++                    **base,
++                    "state": "ambiguous",
++                    "reason": "已验证的新旧 account_id 快照发生变化，禁止清理",
++                    "replacement_account_id": replacement,
++                })
++            replacement_row = by_id.get(replacement)
++            if not replacement_row or replacement_row.get("email") != email or kinds.get(replacement) != "healthy":
++                return self._sanitize_entry({
++                    **base,
++                    "state": "ambiguous",
++                    "reason": "已记录的替代 account_id 不再满足健康与邮箱一致性条件",
++                    "replacement_account_id": replacement,
++                })
++            if not old_exists:
++                return self._sanitize_entry({
++                    **base,
++                    "state": "cleaned",
++                    "reason": "锁定的旧 Sub2API account_id 已消失，并确认替代账号保持健康",
++                    "replacement_account_id": replacement,
++                    "cleanup_account_id": old_id,
++                })
++
+         if not email:
+             return self._sanitize_entry({**base, "state": "ambiguous", "reason": "无法唯一提取邮箱，禁止自动补跑或清理"})
+         if not old_exists:
+@@ -382,6 +443,38 @@ class Sub2Api401Service:
+             "retryable": kinds.get(old_id) == "unauthorized" and local_status in _FAILED_LOCAL_STATES,
+         })
+ 
++    @staticmethod
++    def _unique_latest_keeper(group: list[dict]) -> tuple[str, str]:
++        if not group:
++            return "", "同邮箱账号缺少合法 created_at，无法唯一确认 keeper"
++        dated = [row for row in group if row.get("created_at")]
++        if len(dated) != len(group):
++            return "", "同邮箱账号缺少合法 created_at，无法唯一确认 keeper"
++        latest = max(row["created_at"] for row in dated)
++        newest = [row for row in dated if row["created_at"] == latest]
++        if len(newest) != 1:
++            return "", "同邮箱账号 created_at 并列最新，无法唯一确认 keeper"
++        return newest[0]["account_id"], "唯一最新账号为 keeper"
++
++    @classmethod
++    def _historical_keeper(cls, group: list[dict], kinds: dict[str, str]) -> tuple[str, str, str]:
++        """Return a deterministic keeper, reason, and required keeper health."""
++        if any(row.get("email_ambiguous") for row in group):
++            return "", "同邮箱候选存在邮箱歧义，禁止自动确认 keeper", ""
++        healthy = [row for row in group if kinds.get(row["account_id"]) == "healthy"]
++        unauthorized = [row for row in group if kinds.get(row["account_id"]) == "unauthorized"]
++        if len(healthy) == 1 and len(healthy) + len(unauthorized) == len(group):
++            return healthy[0]["account_id"], "唯一健康账号为 keeper", "healthy"
++        if len(healthy) == len(group) or len(unauthorized) == len(group):
++            keeper, reason = cls._unique_latest_keeper(group)
++            if not keeper:
++                return "", reason, ""
++            keeper_health = "healthy" if healthy else "unauthorized"
++            if keeper_health == "unauthorized":
++                reason = "唯一最新失效账号为 keeper"
++            return keeper, reason, keeper_health
++        return "", "同邮箱账号健康状态无法唯一确认 keeper", ""
++
+     def _persist_post_snapshot_error(self, accounts: list[dict], reason: str) -> None:
+         by_id, by_email = self._account_maps(accounts)
+         checked_at = _now()
+@@ -457,10 +550,25 @@ class Sub2Api401Service:
+                 email = _email(account.get("email"))
+                 group = by_email.get(email, []) if email else []
+                 health = kinds.get(account_id, "unknown")
++                keeper = ""
++                keeper_health = ""
++                replacement_id = ""
++                cleanup_id = ""
++                preserve_decision_reason = False
+                 if account.get("email_ambiguous") or not email:
+                     state, reason, retryable = "ambiguous", "无法唯一提取邮箱，禁止自动补跑或清理", False
++                    preserve_decision_reason = True
+                 elif len(group) != 1:
+-                    state, reason, retryable = "ambiguous", "同一邮箱匹配到多个 Sub2API account_id，无法唯一关联本地账号", False
++                    preserve_decision_reason = True
++                    keeper, keeper_reason, keeper_health = self._historical_keeper(group, kinds)
++                    if keeper and account_id == keeper:
++                        continue
++                    if keeper:
++                        state, reason, retryable = "cleanup_ready", f"{keeper_reason}，可精确清理旧 account_id", False
++                        replacement_id, cleanup_id = keeper, account_id
++                    else:
++                        state, reason, retryable = "ambiguous", keeper_reason, False
++                        replacement_id, cleanup_id = "", ""
+                 elif health == "unauthorized":
+                     state, reason, retryable = "pending", "Sub2API 刷新返回 unauthorized/401", True
+                 elif health in {"timeout", "unknown"}:
+@@ -473,20 +581,21 @@ class Sub2Api401Service:
+                     "account_id": account_id,
+                     "account_name": account.get("account_name"),
+                     "email": email,
++                    "created_at": account.get("created_at"),
+                     "state": state,
+                     "health": health,
+-                    "reason": reasons.get(account_id) or reason,
++                    "reason": reason if preserve_decision_reason else reasons.get(account_id) or reason,
+                     "observed_account_ids": [row.get("account_id") for row in group] or [account_id],
+                     "pre_retry_account_ids": [],
+                     "post_retry_account_ids": [],
+-                    "replacement_account_id": "",
+-                    "cleanup_account_id": "",
++                    "replacement_account_id": replacement_id if len(group) != 1 and keeper else "",
++                    "replacement_health": keeper_health if len(group) != 1 and keeper else "",
++                    "cleanup_account_id": cleanup_id if len(group) != 1 and keeper else "",
+                     "candidate_count": len(group) if email else 1,
+                     "checked_at": checked_at,
+                     "retryable": retryable,
+                     "local_codex_status": local_status.get(email, ""),
+                 })
+-                processed_ids.update(row.get("account_id") for row in group)
+ 
+             self._tracked = next_tracked
+             self._health_counts = health_counts
+@@ -616,6 +725,7 @@ class Sub2Api401Service:
+                     "account_id": account_id,
+                     "email": item.get("email"),
+                     "replacement_account_id": item.get("replacement_account_id"),
++                    "replacement_health": item.get("replacement_health"),
+                     "cleanup_account_id": item.get("cleanup_account_id"),
+                     "manual_action": "仅删除检测与验证阶段锁定的旧 account_id",
+                 })
+@@ -628,107 +738,339 @@ class Sub2Api401Service:
+                 "manual_action": "确认替代账号和旧 account_id 后，勾选显式确认再执行删除",
+             }
+ 
+-        after_error = ""
+-        stale_review_ids: set[str] = set()
+-        with self._operation_lock:
+-            live_review_ids: set[str] = set()
++        def matches_review(current: dict | None, review_item: dict) -> bool:
++            return bool(
++                current
++                and current.get("state") == "cleanup_ready"
++                and _account_id(current.get("cleanup_account_id")) == _account_id(review_item.get("cleanup_account_id"))
++                and _account_id(current.get("replacement_account_id")) == _account_id(review_item.get("replacement_account_id"))
++                and current.get("replacement_health") == review_item.get("replacement_health")
++                and _email(current.get("email")) == _email(review_item.get("email"))
++            )
++
++        def persist_operational_failure(message: str) -> None:
+             with self._lock:
+-                for item in review:
+-                    account_id = _account_id(item.get("account_id"))
++                for review_item in review:
++                    account_id = _account_id(review_item.get("account_id"))
+                     current = self._tracked.get(account_id)
+-                    if (
+-                        current
+-                        and current.get("state") == "cleanup_ready"
+-                        and _account_id(current.get("cleanup_account_id")) == _account_id(item.get("cleanup_account_id"))
+-                        and _account_id(current.get("replacement_account_id")) == _account_id(item.get("replacement_account_id"))
+-                        and _email(current.get("email")) == _email(item.get("email"))
+-                    ):
+-                        live_review_ids.add(account_id)
+-                    else:
+-                        stale_review_ids.add(account_id)
++                    if not matches_review(current, review_item):
++                        continue
++                    self._tracked[account_id] = self._sanitize_entry({
++                        **current,
++                        "state": "cleanup_ready",
++                        "reason": message,
++                        "cleanup_account_id": account_id,
++                    })
++                self._persist_locked()
+ 
++        stale_review_ids: set[str] = set()
++        tracked_snapshots: dict[str, dict] = {}
++        cleaned_ids_by_keeper: dict[tuple[str, str], set[str]] = {}
++        historical_created_at_by_keeper: dict[tuple[str, str], dict[str, str]] = {}
++        with self._lock:
++            for tracked_id, tracked_item in self._tracked.items():
++                key = (
++                    _email(tracked_item.get("email")),
++                    _account_id(tracked_item.get("replacement_account_id")),
++                )
++                if tracked_item.get("state") == "cleaned":
++                    cleaned_ids_by_keeper.setdefault(key, set()).add(_account_id(tracked_id))
++                elif (
++                    key[0]
++                    and key[1]
++                    and tracked_item.get("replacement_health") == "unauthorized"
++                ):
++                    historical_created_at_by_keeper.setdefault(key, {})[
++                        _account_id(tracked_id)
++                    ] = _created_at(tracked_item.get("created_at"))
++            for review_item in review:
++                account_id = _account_id(review_item.get("account_id"))
++                current = self._tracked.get(account_id)
++                if matches_review(current, review_item):
++                    tracked_snapshots[account_id] = self._sanitize_entry(current)
++                else:
++                    stale_review_ids.add(account_id)
++
++        try:
+             before = self._list_fn()
+-            before_by_id, _ = self._account_maps(before)
+-            replacement_ids = _dedupe_ids([
+-                item.get("replacement_account_id")
+-                for item in review
+-                if _account_id(item.get("account_id")) in live_review_ids
++        except Exception:
++            persist_operational_failure("清理前无法重新读取 Sub2API 账号，未执行删除；请重试清理")
++            raise
++
++        before_by_id, before_by_email = self._account_maps(before)
++        replacement_ids = _dedupe_ids([
++            item.get("replacement_account_id")
++            for item in review
++            if _account_id(item.get("account_id")) in tracked_snapshots
++        ])
++        precheck_refresh_ids = list(replacement_ids)
++        for review_item in review:
++            account_id = _account_id(review_item.get("account_id"))
++            tracked = tracked_snapshots.get(account_id) or {}
++            if tracked.get("replacement_health") != "unauthorized":
++                continue
++            email = _email(tracked.get("email"))
++            precheck_refresh_ids.extend(
++                row.get("account_id") for row in before_by_email.get(email, [])
++            )
++        precheck_refresh_ids = _dedupe_ids(precheck_refresh_ids)
++        try:
++            refresh_payload = self._refresh_fn(precheck_refresh_ids) if precheck_refresh_ids else {
++                "total": 0,
++                "success": 0,
++                "failed": 0,
++                "errors": [],
++            }
++        except Exception:
++            persist_operational_failure("清理前无法刷新替代 account_id，未执行删除；请重试清理")
++            raise
++        precheck_kinds, _ = self._refresh_maps(precheck_refresh_ids, refresh_payload)
++
++        precheck_errors: dict[str, str] = {}
++        ambiguous_ids: set[str] = set()
++        reconciled_ids: set[str] = set()
++        before_group_ids: dict[str, list[str]] = {}
++        eligible_ids: list[str] = []
++        for review_item in review:
++            account_id = _account_id(review_item.get("account_id"))
++            old_id = _account_id(review_item.get("cleanup_account_id"))
++            replacement_id = _account_id(review_item.get("replacement_account_id"))
++            email = _email(review_item.get("email"))
++            if account_id in stale_review_ids:
++                precheck_errors[account_id] = "清理状态已变化，未执行删除"
++                continue
++            tracked = tracked_snapshots.get(account_id) or {}
++            if not old_id or old_id != account_id:
++                precheck_errors[account_id] = "清理目标不是检测时锁定的旧 account_id"
++                ambiguous_ids.add(account_id)
++                continue
++
++            current_ids = _dedupe_ids([
++                row.get("account_id") for row in before_by_email.get(email, [])
+             ])
+-            refresh_payload = self._refresh_fn(replacement_ids)
+-            replacement_kinds, _ = self._refresh_maps(replacement_ids, refresh_payload)
+-            attempts: dict[str, bool] = {}
+-            precheck_errors: dict[str, str] = {}
+-            for item in review:
+-                old_id = _account_id(item.get("cleanup_account_id"))
+-                replacement_id = _account_id(item.get("replacement_account_id"))
+-                email = _email(item.get("email"))
+-                old_row = before_by_id.get(old_id)
+-                replacement_row = before_by_id.get(replacement_id)
+-                if _account_id(item.get("account_id")) in stale_review_ids:
+-                    precheck_errors[old_id or item.get("account_id") or ""] = "清理状态已变化，未执行删除"
+-                    continue
+-                if not old_id or old_id != item.get("account_id"):
+-                    precheck_errors[old_id or item.get("account_id") or ""] = "清理目标不是检测时锁定的旧 account_id"
+-                    continue
+-                if not old_row:
+-                    precheck_errors[old_id] = "检测时锁定的旧 account_id 已不存在，未执行删除"
+-                    continue
+-                if not replacement_row or replacement_row.get("email") != email:
+-                    precheck_errors[old_id] = "替代 account_id 不存在或邮箱不一致，未执行删除"
++            before_group_ids[account_id] = current_ids
++            expected_ids = _dedupe_ids(
++                tracked.get("post_retry_account_ids")
++                or tracked.get("observed_account_ids")
++            )
++            known_cleaned = cleaned_ids_by_keeper.get((email, replacement_id), set())
++            expected_live = [value for value in expected_ids if value not in known_cleaned]
++            old_already_absent = (
++                old_id not in current_ids
++                and set(current_ids) == (set(expected_live) - {old_id})
++            )
++            if not expected_live or (
++                set(current_ids) != set(expected_live) and not old_already_absent
++            ):
++                precheck_errors[account_id] = "清理前同邮箱 account_id 快照已变化，未执行删除；请重新检测"
++                ambiguous_ids.add(account_id)
++                continue
++
++            replacement_row = before_by_id.get(replacement_id)
++            if not replacement_row or replacement_row.get("email") != email:
++                precheck_errors[account_id] = "替代 account_id 不存在或邮箱不一致，未执行删除；请重新检测"
++                ambiguous_ids.add(account_id)
++                continue
++            replacement_health = tracked.get("replacement_health") or "healthy"
++            if replacement_health == "unauthorized":
++                current_group = before_by_email.get(email, [])
++                expected_created_at = historical_created_at_by_keeper.get(
++                    (email, replacement_id),
++                    {},
++                )
++                created_at_drifted = any(
++                    row.get("account_id") != replacement_id
++                    and row.get("created_at") != expected_created_at.get(row.get("account_id"), "")
++                    for row in current_group
++                )
++                if created_at_drifted:
++                    precheck_errors[account_id] = "清理前同邮箱账号 created_at 快照已变化，未执行删除；请重新检测"
++                    ambiguous_ids.add(account_id)
+                     continue
+-                if replacement_kinds.get(replacement_id) != "healthy":
+-                    precheck_errors[old_id] = "替代 account_id 未通过刷新验证，未执行删除"
++                current_keeper, _, current_keeper_health = self._historical_keeper(
++                    current_group,
++                    precheck_kinds,
++                )
++                if current_keeper != replacement_id or current_keeper_health != "unauthorized":
++                    precheck_errors[account_id] = "清理前同邮箱账号分类或唯一最新 keeper 已变化，未执行删除；请重新检测"
++                    ambiguous_ids.add(account_id)
+                     continue
+-                try:
+-                    result = self._delete_fn(old_id)
+-                    attempts[old_id] = bool(result.get("ok", result.get("success"))) if isinstance(result, dict) else result is True
+-                except Exception:
+-                    attempts[old_id] = False
++            elif precheck_kinds.get(replacement_id) != "healthy":
++                precheck_errors[account_id] = "替代 account_id 未通过刷新验证，未执行删除；请重试清理"
++                if old_already_absent:
++                    ambiguous_ids.add(account_id)
++                continue
++            if old_already_absent:
++                reconciled_ids.add(account_id)
++                continue
++            if old_id not in before_by_id:
++                precheck_errors[account_id] = "检测时锁定的旧 account_id 已不存在，但快照无法确认"
++                ambiguous_ids.add(account_id)
++                continue
++            eligible_ids.append(account_id)
++
++        attempts: dict[str, bool] = {}
++        attempt_errors: dict[str, str] = {}
++        for account_id in eligible_ids:
++            try:
++                result = self._delete_fn(account_id)
++                attempts[account_id] = (
++                    bool(result.get("ok", result.get("success")))
++                    if isinstance(result, dict)
++                    else result is True
++                )
++            except Exception as exc:
++                attempts[account_id] = False
++                attempt_errors[account_id] = _reason(
++                    exc,
++                    "Sub2API 停用或删除请求失败",
++                )
++
++        after_error = ""
++        after_refresh_error = ""
++        if eligible_ids:
+             try:
+                 after = self._list_fn()
+             except Exception:
+                 after = []
+                 after_error = "删除请求后无法重新读取 Sub2API 账号，保留清理状态等待复核"
++        else:
++            after = before
++        after_by_id, after_by_email = self._account_maps(after)
++
++        post_replacement_kinds = {
++            account_id: precheck_kinds.get(account_id, "unknown")
++            for account_id in replacement_ids
++        }
++        if not after_error and (eligible_ids or reconciled_ids):
++            try:
++                post_refresh = self._refresh_fn(replacement_ids) if replacement_ids else {
++                    "total": 0,
++                    "success": 0,
++                    "failed": 0,
++                    "errors": [],
++                }
++                post_replacement_kinds, _ = self._refresh_maps(replacement_ids, post_refresh)
++            except Exception:
++                post_replacement_kinds = {}
++                after_refresh_error = "清理后无法刷新替代 account_id，清理结果等待复核"
++
++        absent_ids_by_email: dict[str, set[str]] = {}
++        for review_item in review:
++            old_id = _account_id(review_item.get("cleanup_account_id"))
++            email = _email(review_item.get("email"))
++            if old_id and old_id not in after_by_id:
++                absent_ids_by_email.setdefault(email, set()).add(old_id)
+ 
+-        after_by_id, _ = self._account_maps(after)
+         results = []
+         with self._lock:
+-            for item in review:
+-                account_id = _account_id(item.get("account_id"))
+-                old_id = _account_id(item.get("cleanup_account_id"))
++            for review_item in review:
++                account_id = _account_id(review_item.get("account_id"))
++                old_id = _account_id(review_item.get("cleanup_account_id"))
++                replacement_id = _account_id(review_item.get("replacement_account_id"))
++                email = _email(review_item.get("email"))
+                 tracked = self._tracked.get(account_id) or {}
+-                error = precheck_errors.get(old_id)
++                replacement_health = tracked.get("replacement_health") or "healthy"
+                 stale_review = account_id in stale_review_ids
+-                if after_error and attempts.get(old_id, False):
++                error = precheck_errors.get(account_id, "")
++                state = "cleanup_ready"
++
++                if not error and after_error:
+                     error = after_error
++                current_after_ids = _dedupe_ids([
++                    row.get("account_id") for row in after_by_email.get(email, [])
++                ])
++                if not error:
++                    expected_after = set(before_group_ids.get(account_id, []))
++                    expected_after -= absent_ids_by_email.get(email, set())
++                    if set(current_after_ids) != expected_after:
++                        error = "清理后同邮箱 account_id 快照发生变化，结果无法确认"
++                        state = "ambiguous"
++                replacement_row = after_by_id.get(replacement_id)
++                if not error and (
++                    not replacement_row or replacement_row.get("email") != email
++                ):
++                    error = "清理后替代 account_id 不存在或邮箱不一致，结果无法确认"
++                    state = "ambiguous"
++                if not error and after_refresh_error:
++                    error = after_refresh_error
++                    state = "ambiguous" if old_id not in after_by_id else "cleanup_ready"
++                if not error and post_replacement_kinds.get(replacement_id) != replacement_health:
++                    error = (
++                        "清理后替代 account_id 未保持 unauthorized 状态，结果无法确认"
++                        if replacement_health == "unauthorized"
++                        else "清理后替代 account_id 未通过刷新验证，结果无法确认"
++                    )
++                    state = "ambiguous" if old_id not in after_by_id else "cleanup_ready"
++                if not error and replacement_health == "unauthorized":
++                    current_group = after_by_email.get(email, [])
++                    expected_created_at = historical_created_at_by_keeper.get(
++                        (email, replacement_id),
++                        {},
++                    )
++                    created_at_drifted = any(
++                        row.get("account_id") != replacement_id
++                        and row.get("created_at") != expected_created_at.get(row.get("account_id"), "")
++                        for row in current_group
++                    )
++                    latest_keeper, _ = self._unique_latest_keeper(current_group)
++                    if created_at_drifted:
++                        error = "清理后同邮箱账号 created_at 快照发生变化，结果无法确认"
++                        state = "ambiguous" if old_id not in after_by_id else "cleanup_ready"
++                    elif latest_keeper != replacement_id:
++                        error = "清理后替代 account_id 不再是唯一最新 keeper，结果无法确认"
++                        state = "ambiguous" if old_id not in after_by_id else "cleanup_ready"
++
+                 absent = not after_error and old_id not in after_by_id
+-                ok = not error and attempts.get(old_id, False) and absent
++                operation_confirmed = (
++                    account_id in reconciled_ids
++                    or attempts.get(account_id, False)
++                )
++                ok = not error and absent and operation_confirmed
+                 if ok:
++                    attempted = account_id in eligible_ids
+                     self._tracked[account_id] = self._sanitize_entry({
+                         **tracked,
+                         "state": "cleaned",
+-                        "reason": "已显式删除锁定的旧 Sub2API account_id，并确认该 ID 已消失",
+-                        "observed_account_ids": [tracked.get("replacement_account_id")],
+-                        "post_retry_account_ids": [tracked.get("replacement_account_id")],
+-                        "cleanup_account_id": "",
++                        "reason": (
++                            "已删除锁定的旧 Sub2API account_id，并确认该 ID 已消失且失效 keeper 保持 unauthorized"
++                            if attempted and replacement_health == "unauthorized"
++                            else "已删除锁定的旧 Sub2API account_id，并确认该 ID 已消失且替代账号健康"
++                            if attempted
++                            else "锁定的旧 Sub2API account_id 已不存在，并确认失效 keeper 保持 unauthorized"
++                            if replacement_health == "unauthorized"
++                            else "锁定的旧 Sub2API account_id 已不存在，并确认替代账号保持健康"
++                        ),
++                        "observed_account_ids": current_after_ids,
++                        "post_retry_account_ids": current_after_ids,
++                        "cleanup_account_id": old_id,
+                         "retryable": False,
+                     })
+-                    result_text = "deleted_and_verified"
++                    result_text = "deleted_and_verified" if attempted else "absent_and_verified"
+                     result_reason = ""
+                 else:
+-                    result_reason = error or ("Sub2API 删除请求失败" if not attempts.get(old_id, False) else "删除后旧 account_id 仍存在")
++                    if not error:
++                        error = attempt_errors.get(account_id) or (
++                            "Sub2API 停用或删除请求失败"
++                            if not attempts.get(account_id, False)
++                            else "删除后旧 account_id 仍存在"
++                        )
++                    if account_id in ambiguous_ids:
++                        state = "ambiguous"
+                     if not stale_review:
+                         self._tracked[account_id] = self._sanitize_entry({
+                             **tracked,
+-                            "state": "cleanup_ready",
+-                            "reason": result_reason,
++                            "state": state,
++                            "reason": error,
+                             "cleanup_account_id": old_id,
++                            "retryable": False,
+                         })
+                     result_text = "not_deleted"
++                    result_reason = error
+                 results.append({
+                     "account_id": account_id,
+                     "cleanup_account_id": old_id,
+-                    "replacement_account_id": item.get("replacement_account_id"),
++                    "replacement_account_id": replacement_id,
+                     "ok": ok,
+                     "result": result_text,
+                     "reason": result_reason,
+diff --git a/core/sub2api_admin.py b/core/sub2api_admin.py
+index fbdc8b2..161ecab 100644
+--- a/core/sub2api_admin.py
++++ b/core/sub2api_admin.py
+@@ -3,6 +3,8 @@
+ from __future__ import annotations
+ 
+ import re
++from datetime import datetime, timezone
++from math import isfinite
+ from typing import Callable
+ from urllib.parse import quote, urlencode
+ 
+@@ -119,6 +121,27 @@ def _bool(value: object) -> bool | None:
+     return None
+ 
+ 
++def _created_at(value: object) -> str:
++    """保留可排序的非敏感创建时间，拒绝任意长文本和无效值。"""
++    if isinstance(value, bool) or value is None:
++        return ""
++    if isinstance(value, (int, float)):
++        if not isfinite(float(value)) or not 0 < float(value) < 4_102_444_800:
++            return ""
++        return datetime.fromtimestamp(float(value), timezone.utc).isoformat()
++    text = _clean_text(value, 64)
++    if not text or "@" in text or "http://" in text.lower() or "https://" in text.lower():
++        return ""
++    candidate = text[:-1] + "+00:00" if text.endswith("Z") else text
++    try:
++        parsed = datetime.fromisoformat(candidate)
++    except ValueError:
++        return ""
++    if parsed.tzinfo is None:
++        parsed = parsed.replace(tzinfo=timezone.utc)
++    return parsed.astimezone(timezone.utc).isoformat()
++
++
+ def _extract_email(row: dict) -> tuple[str, bool]:
+     candidates: list[str] = []
+     for key in ("email", "account_email", "username", "name"):
+@@ -143,6 +166,7 @@ def _sanitize_account(row: dict) -> dict:
+         "status": _clean_text(row.get("status"), 64).lower(),
+         "disabled": row.get("disabled") is True,
+         "unavailable": row.get("unavailable") is True,
++        "created_at": _created_at(row.get("created_at") or row.get("createdAt")),
+     }
+ 
+ 
+@@ -276,5 +300,7 @@ class Sub2ApiAdminClient:
+         normalized = _account_id(account_id)
+         if not normalized:
+             raise ValueError("account_id 不能为空")
+-        self._request("DELETE", f"/api/v1/admin/accounts/{quote(normalized, safe='')}")
++        path = f"/api/v1/admin/accounts/{quote(normalized, safe='')}"
++        self._request("PUT", path, {"status": "inactive"})
++        self._request("DELETE", path)
+         return {"ok": True, "account_id": normalized}
+diff --git a/tests/test_sub2api_401_service.py b/tests/test_sub2api_401_service.py
+index 4eef15d..97e0bec 100644
+--- a/tests/test_sub2api_401_service.py
++++ b/tests/test_sub2api_401_service.py
+@@ -5,6 +5,7 @@ import threading
+ import unittest
+ from pathlib import Path
+ 
++from core.sub2api_admin import Sub2ApiAdminClient
+ from core.sub2api_401_service import Sub2Api401Service, Sub2ApiSnapshotConflict
+ 
+ 
+@@ -91,6 +92,588 @@ class Sub2Api401ServiceTests(unittest.TestCase):
+         self.assertEqual(["old"], item["pre_retry_account_ids"])
+         self.assertEqual(["new", "old"], item["post_retry_account_ids"])
+ 
++    def test_legacy_cleanup_ready_audit_defaults_replacement_health_to_healthy(self):
++        rows = [{"account_id": "old", "email": "one@example.com"}]
++        deleted = []
++
++        def refresh(ids):
++            failures = [
++                {"account_id": account_id, "error": "401 unauthorized"}
++                for account_id in ids
++                if account_id == "old"
++            ]
++            return {
++                "total": len(ids),
++                "success": len(ids) - len(failures),
++                "failed": len(failures),
++                "errors": failures,
++            }
++
++        def delete(account_id):
++            deleted.append(account_id)
++            rows[:] = [row for row in rows if row["account_id"] != account_id]
++            return {"ok": True}
++
++        service = self.service(rows=rows, refresh=refresh, delete=delete)
++        service.detect()
++        service.mark_retrying(["old"])
++        rows.append({"account_id": "new", "email": "one@example.com"})
++        service.detect({"one@example.com": "success"})
++
++        payload = json.loads(self.audit_path.read_text(encoding="utf-8"))
++        payload["items"]["old"].pop("replacement_health")
++        self.audit_path.write_text(json.dumps(payload), encoding="utf-8")
++
++        reloaded = self.service(rows=rows, refresh=refresh, delete=delete)
++        self.assertEqual("healthy", reloaded.state()["items"][0]["replacement_health"])
++        result = reloaded.cleanup(["old"], opt_in=True)
++
++        self.assertEqual(["old"], deleted)
++        self.assertTrue(result["items"][0]["ok"])
++        self.assertEqual("cleaned", reloaded.state()["items"][0]["state"])
++
++    def test_detect_reconciles_cleanup_ready_when_locked_old_id_disappears(self):
++        rows = [{"account_id": "old", "email": "one@example.com"}]
++
++        def refresh(ids):
++            failures = [
++                {"account_id": value, "error": "401 unauthorized"}
++                for value in ids
++                if value == "old"
++            ]
++            return {
++                "total": len(ids),
++                "success": len(ids) - len(failures),
++                "failed": len(failures),
++                "errors": failures,
++            }
++
++        service = self.service(rows=rows, refresh=refresh)
++        service.detect()
++        service.mark_retrying(["old"])
++        rows.append({"account_id": "new", "email": "one@example.com"})
++        service.detect({"one@example.com": "success"})
++        rows[:] = [{"account_id": "new", "email": "one@example.com"}]
++
++        reloaded = self.service(rows=rows, refresh=refresh)
++        item = reloaded.detect()["items"][0]
++
++        self.assertEqual("cleaned", item["state"])
++        self.assertEqual("new", item["replacement_account_id"])
++        self.assertEqual("old", item["cleanup_account_id"])
++
++    def test_detect_blocks_cleanup_ready_when_verified_snapshot_changes(self):
++        rows = [{"account_id": "old", "email": "one@example.com"}]
++
++        def refresh(ids):
++            failures = [
++                {"account_id": value, "error": "401 unauthorized"}
++                for value in ids
++                if value == "old"
++            ]
++            return {
++                "total": len(ids),
++                "success": len(ids) - len(failures),
++                "failed": len(failures),
++                "errors": failures,
++            }
++
++        service = self.service(rows=rows, refresh=refresh)
++        service.detect()
++        service.mark_retrying(["old"])
++        rows.append({"account_id": "new", "email": "one@example.com"})
++        service.detect({"one@example.com": "success"})
++        rows.append({"account_id": "unexpected", "email": "one@example.com"})
++
++        item = service.detect()["items"][0]
++
++        self.assertEqual("ambiguous", item["state"])
++        self.assertEqual("", item["cleanup_account_id"])
++        self.assertIn("快照发生变化", item["reason"])
++
++    def test_historical_all_healthy_duplicates_keep_unique_latest_out_of_items(self):
++        rows = [
++            {"account_id": "old-a", "email": "one@example.com", "created_at": "2026-10-11T00:00:00Z"},
++            {"account_id": "old-b", "email": "one@example.com", "created_at": "2026-10-12T00:00:00Z"},
++            {"account_id": "keeper", "email": "one@example.com", "created_at": "2026-10-13T00:00:00Z"},
++        ]
++
++        result = self.service(rows=rows).detect()
++        by_id = {item["account_id"]: item for item in result["items"]}
++
++        self.assertEqual({"old-a", "old-b"}, set(by_id))
++        for account_id in ("old-a", "old-b"):
++            with self.subTest(account_id=account_id):
++                self.assertEqual("cleanup_ready", by_id[account_id]["state"])
++                self.assertEqual("keeper", by_id[account_id]["replacement_account_id"])
++                self.assertEqual(account_id, by_id[account_id]["cleanup_account_id"])
++                self.assertIn("唯一最新账号为 keeper", by_id[account_id]["reason"])
++
++    def test_historical_healthy_duplicates_without_created_at_remain_ambiguous(self):
++        rows = [
++            {"account_id": "a", "email": "one@example.com"},
++            {"account_id": "b", "email": "one@example.com", "created_at": "2026-10-13T00:00:00Z"},
++        ]
++
++        result = self.service(rows=rows).detect()
++
++        self.assertEqual({"a", "b"}, {item["account_id"] for item in result["items"]})
++        self.assertTrue(all(item["state"] == "ambiguous" for item in result["items"]))
++        self.assertTrue(all("缺少合法 created_at" in item["reason"] for item in result["items"]))
++
++    def test_historical_healthy_duplicates_with_tied_latest_remain_ambiguous(self):
++        rows = [
++            {"account_id": "a", "email": "one@example.com", "created_at": "2026-10-13T00:00:00Z"},
++            {"account_id": "b", "email": "one@example.com", "created_at": "2026-10-13T00:00:00Z"},
++            {"account_id": "older", "email": "one@example.com", "created_at": "2026-10-12T00:00:00Z"},
++        ]
++
++        result = self.service(rows=rows).detect()
++
++        self.assertEqual(3, len(result["items"]))
++        self.assertTrue(all(item["state"] == "ambiguous" for item in result["items"]))
++        self.assertTrue(all("created_at 并列最新" in item["reason"] for item in result["items"]))
++
++    def test_historical_unique_healthy_keeper_marks_all_unauthorized_older_ids(self):
++        rows = [
++            {"account_id": "old-a", "email": "one@example.com"},
++            {"account_id": "old-b", "email": "one@example.com"},
++            {"account_id": "keeper", "email": "one@example.com"},
++        ]
++
++        def refresh(ids):
++            errors = [
++                {"account_id": account_id, "error": "401 unauthorized"}
++                for account_id in ids
++                if account_id != "keeper"
++            ]
++            return {
++                "total": len(ids),
++                "success": len(ids) - len(errors),
++                "failed": len(errors),
++                "errors": errors,
++            }
++
++        result = self.service(rows=rows, refresh=refresh).detect()
++        by_id = {item["account_id"]: item for item in result["items"]}
++
++        self.assertEqual({"old-a", "old-b"}, set(by_id))
++        self.assertTrue(all(item["state"] == "cleanup_ready" for item in by_id.values()))
++        self.assertTrue(all(item["replacement_account_id"] == "keeper" for item in by_id.values()))
++        self.assertTrue(all("唯一健康账号为 keeper" in item["reason"] for item in by_id.values()))
++
++    def test_historical_all_unauthorized_duplicates_keep_unique_latest_out_of_items(self):
++        rows = [
++            {"account_id": "19", "email": "one@example.com", "created_at": "2026-10-11T00:00:00Z"},
++            {"account_id": "22", "email": "one@example.com", "created_at": "2026-10-13T00:00:00Z"},
++        ]
++
++        def refresh(ids):
++            return {
++                "total": len(ids),
++                "success": 0,
++                "failed": len(ids),
++                "errors": [
++                    {"account_id": account_id, "error": "401 unauthorized"}
++                    for account_id in ids
++                ],
++            }
++
++        result = self.service(rows=rows, refresh=refresh).detect()
++
++        self.assertEqual(["19"], [item["account_id"] for item in result["items"]])
++        item = result["items"][0]
++        self.assertEqual("cleanup_ready", item["state"])
++        self.assertEqual("22", item["replacement_account_id"])
++        self.assertEqual("unauthorized", item["replacement_health"])
++        self.assertEqual("19", item["cleanup_account_id"])
++        self.assertIn("唯一最新失效账号为 keeper", item["reason"])
++
++    def test_historical_all_unauthorized_duplicates_require_complete_unique_timestamps(self):
++        cases = {
++            "missing": [
++                {"account_id": "19", "email": "one@example.com"},
++                {"account_id": "22", "email": "one@example.com", "created_at": "2026-10-13T00:00:00Z"},
++            ],
++            "invalid": [
++                {"account_id": "19", "email": "one@example.com", "created_at": "not-a-date"},
++                {"account_id": "22", "email": "one@example.com", "created_at": "2026-10-13T00:00:00Z"},
++            ],
++            "tied": [
++                {"account_id": "19", "email": "one@example.com", "created_at": "2026-10-13T00:00:00Z"},
++                {"account_id": "22", "email": "one@example.com", "created_at": "2026-10-13T00:00:00Z"},
++            ],
++        }
++
++        for name, rows in cases.items():
++            with self.subTest(name=name):
++                service = self.service(
++                    rows=rows,
++                    refresh=lambda ids: {
++                        "total": len(ids),
++                        "success": 0,
++                        "failed": len(ids),
++                        "errors": [
++                            {"account_id": account_id, "error": "401 unauthorized"}
++                            for account_id in ids
++                        ],
++                    },
++                    audit_path=Path(self.temp_dir.name) / f"{name}.json",
++                )
++                result = service.detect()
++
++                self.assertEqual({"19", "22"}, {item["account_id"] for item in result["items"]})
++                self.assertTrue(all(item["state"] == "ambiguous" for item in result["items"]))
++                self.assertTrue(all(not item["cleanup_account_id"] for item in result["items"]))
++
++    def test_historical_duplicates_with_incomplete_health_remain_ambiguous(self):
++        rows = [
++            {"account_id": "19", "email": "one@example.com", "created_at": "2026-10-11T00:00:00Z"},
++            {"account_id": "22", "email": "one@example.com", "created_at": "2026-10-13T00:00:00Z"},
++        ]
++
++        for error in ("request timeout", "provider unavailable"):
++            with self.subTest(error=error):
++                result = self.service(
++                    rows=rows,
++                    refresh=lambda ids, message=error: {
++                        "total": len(ids),
++                        "success": 0,
++                        "failed": len(ids),
++                        "errors": [
++                            {
++                                "account_id": account_id,
++                                "error": "401 unauthorized" if account_id == "19" else message,
++                            }
++                            for account_id in ids
++                        ],
++                    },
++                    audit_path=Path(self.temp_dir.name) / f"health-{error.split()[0]}.json",
++                ).detect()
++
++                self.assertEqual({"19", "22"}, {item["account_id"] for item in result["items"]})
++                self.assertTrue(all(item["state"] == "ambiguous" for item in result["items"]))
++                self.assertTrue(all(not item["cleanup_account_id"] for item in result["items"]))
++
++    def test_historical_all_unauthorized_cleanup_deletes_exact_old_id_then_exposes_keeper_pending(self):
++        rows = [
++            {"account_id": "19", "email": "one@example.com", "created_at": "2026-10-11T00:00:00Z"},
++            {"account_id": "22", "email": "one@example.com", "created_at": "2026-10-13T00:00:00Z"},
++        ]
++        deleted = []
++        refresh_calls = []
++
++        def refresh(ids):
++            refresh_calls.append(list(ids))
++            return {
++                "total": len(ids),
++                "success": 0,
++                "failed": len(ids),
++                "errors": [
++                    {"account_id": account_id, "error": "401 unauthorized"}
++                    for account_id in ids
++                ],
++            }
++
++        def delete(account_id):
++            deleted.append(account_id)
++            rows[:] = [row for row in rows if row["account_id"] != account_id]
++            return {"ok": True}
++
++        service = self.service(rows=rows, refresh=refresh, delete=delete)
++        service.detect()
++        service = self.service(rows=rows, refresh=refresh, delete=delete)
++
++        preview = service.cleanup(["19"], opt_in=False)
++        self.assertFalse(preview["cleanup_performed"])
++        self.assertEqual([], deleted)
++        result = service.cleanup(["22", "19", "missing"], opt_in=True)
++
++        self.assertEqual(["19"], deleted)
++        self.assertTrue(result["items"][0]["ok"])
++        self.assertEqual("cleaned", service.state()["items"][0]["state"])
++        self.assertGreaterEqual(refresh_calls.count(["19", "22"]), 2)
++        self.assertIn(["22"], refresh_calls)
++
++        next_result = service.detect()
++        self.assertEqual(["22"], [item["account_id"] for item in next_result["items"]])
++        self.assertEqual("pending", next_result["items"][0]["state"])
++        self.assertTrue(next_result["items"][0]["retryable"])
++
++    def test_historical_all_unauthorized_cleanup_refuses_classification_drift(self):
++        rows = [
++            {"account_id": "19", "email": "one@example.com", "created_at": "2026-10-11T00:00:00Z"},
++            {"account_id": "22", "email": "one@example.com", "created_at": "2026-10-13T00:00:00Z"},
++        ]
++        drifted = False
++        deleted = []
++
++        def refresh(ids):
++            unauthorized_ids = [
++                account_id for account_id in ids
++                if not drifted or account_id != "22"
++            ]
++            return {
++                "total": len(ids),
++                "success": len(ids) - len(unauthorized_ids),
++                "failed": len(unauthorized_ids),
++                "errors": [
++                    {"account_id": account_id, "error": "401 unauthorized"}
++                    for account_id in unauthorized_ids
++                ],
++            }
++
++        service = self.service(
++            rows=rows,
++            refresh=refresh,
++            delete=lambda account_id: deleted.append(account_id) or {"ok": True},
++        )
++        service.detect()
++        drifted = True
++        result = service.cleanup(["19"], opt_in=True)
++
++        self.assertEqual([], deleted)
++        self.assertFalse(result["items"][0]["ok"])
++        item = service.state()["items"][0]
++        self.assertEqual("ambiguous", item["state"])
++        self.assertIn("分类或唯一最新 keeper 已变化", item["reason"])
++
++    def test_historical_all_unauthorized_cleanup_refuses_created_at_drift_before_delete(self):
++        rows = [
++            {"account_id": "19", "email": "one@example.com", "created_at": "2026-10-11T00:00:00Z"},
++            {"account_id": "22", "email": "one@example.com", "created_at": "2026-10-13T00:00:00Z"},
++        ]
++        deleted = []
++
++        def refresh(ids):
++            return {
++                "total": len(ids),
++                "success": 0,
++                "failed": len(ids),
++                "errors": [
++                    {"account_id": account_id, "error": "401 unauthorized"}
++                    for account_id in ids
++                ],
++            }
++
++        service = self.service(
++            rows=rows,
++            refresh=refresh,
++            delete=lambda account_id: deleted.append(account_id) or {"ok": True},
++        )
++        service.detect()
++        rows[0]["created_at"] = "2026-10-12T00:00:00Z"
++        result = service.cleanup(["19"], opt_in=True)
++
++        self.assertEqual([], deleted)
++        self.assertFalse(result["items"][0]["ok"])
++        item = service.state()["items"][0]
++        self.assertEqual("ambiguous", item["state"])
++        self.assertIn("created_at 快照已变化", item["reason"])
++
++    def test_historical_all_unauthorized_cleanup_retains_post_delete_created_at_drift(self):
++        rows = [
++            {"account_id": "old-a", "email": "one@example.com", "created_at": "2026-10-10T00:00:00Z"},
++            {"account_id": "old-b", "email": "one@example.com", "created_at": "2026-10-11T00:00:00Z"},
++            {"account_id": "keeper", "email": "one@example.com", "created_at": "2026-10-13T00:00:00Z"},
++        ]
++        deleted = []
++
++        def refresh(ids):
++            return {
++                "total": len(ids),
++                "success": 0,
++                "failed": len(ids),
++                "errors": [
++                    {"account_id": account_id, "error": "401 unauthorized"}
++                    for account_id in ids
++                ],
++            }
++
++        def delete(account_id):
++            deleted.append(account_id)
++            rows[:] = [row for row in rows if row["account_id"] != account_id]
++            next(row for row in rows if row["account_id"] == "old-b")["created_at"] = "2026-10-12T00:00:00Z"
++            return {"ok": True}
++
++        service = self.service(rows=rows, refresh=refresh, delete=delete)
++        service.detect()
++        result = service.cleanup(["old-a"], opt_in=True)
++
++        self.assertEqual(["old-a"], deleted)
++        self.assertFalse(result["items"][0]["ok"])
++        item = {entry["account_id"]: entry for entry in service.state()["items"]}["old-a"]
++        self.assertEqual("ambiguous", item["state"])
++        self.assertIn("created_at 快照发生变化", item["reason"])
++
++    def test_historical_all_unauthorized_cleanup_retains_post_delete_keeper_drift(self):
++        rows = [
++            {"account_id": "19", "email": "one@example.com", "created_at": "2026-10-11T00:00:00Z"},
++            {"account_id": "22", "email": "one@example.com", "created_at": "2026-10-13T00:00:00Z"},
++        ]
++        keeper_became_healthy = False
++        deleted = []
++
++        def refresh(ids):
++            unauthorized_ids = [
++                account_id for account_id in ids
++                if not keeper_became_healthy or account_id != "22"
++            ]
++            return {
++                "total": len(ids),
++                "success": len(ids) - len(unauthorized_ids),
++                "failed": len(unauthorized_ids),
++                "errors": [
++                    {"account_id": account_id, "error": "401 unauthorized"}
++                    for account_id in unauthorized_ids
++                ],
++            }
++
++        def delete(account_id):
++            nonlocal keeper_became_healthy
++            deleted.append(account_id)
++            rows[:] = [row for row in rows if row["account_id"] != account_id]
++            keeper_became_healthy = True
++            return {"ok": True}
++
++        service = self.service(rows=rows, refresh=refresh, delete=delete)
++        service.detect()
++        result = service.cleanup(["19"], opt_in=True)
++
++        self.assertEqual(["19"], deleted)
++        self.assertFalse(result["items"][0]["ok"])
++        item = service.state()["items"][0]
++        self.assertEqual("ambiguous", item["state"])
++        self.assertEqual("19", item["cleanup_account_id"])
++        self.assertEqual("22", item["replacement_account_id"])
++        self.assertEqual("unauthorized", item["replacement_health"])
++        self.assertIn("未保持 unauthorized", item["reason"])
++
++    def test_historical_all_unauthorized_cleanup_allows_sequential_ids_after_restart(self):
++        rows = [
++            {"account_id": "old-a", "email": "one@example.com", "created_at": "2026-10-11T00:00:00Z"},
++            {"account_id": "old-b", "email": "one@example.com", "created_at": "2026-10-12T00:00:00Z"},
++            {"account_id": "keeper", "email": "one@example.com", "created_at": "2026-10-13T00:00:00Z"},
++        ]
++        deleted = []
++
++        def refresh(ids):
++            return {
++                "total": len(ids),
++                "success": 0,
++                "failed": len(ids),
++                "errors": [
++                    {"account_id": account_id, "error": "401 unauthorized"}
++                    for account_id in ids
++                ],
++            }
++
++        def delete(account_id):
++            deleted.append(account_id)
++            rows[:] = [row for row in rows if row["account_id"] != account_id]
++            return {"ok": True}
++
++        service = self.service(rows=rows, refresh=refresh, delete=delete)
++        service.detect()
++        first = service.cleanup(["old-a"], opt_in=True)
++        self.assertTrue(first["items"][0]["ok"])
++
++        reloaded = self.service(rows=rows, refresh=refresh, delete=delete)
++        second = reloaded.cleanup(["old-b"], opt_in=True)
++
++        self.assertTrue(second["items"][0]["ok"])
++        self.assertEqual(["old-a", "old-b"], deleted)
++        self.assertEqual(["keeper"], [row["account_id"] for row in rows])
++        next_result = reloaded.detect()
++        self.assertEqual(["keeper"], [item["account_id"] for item in next_result["items"]])
++        self.assertEqual("pending", next_result["items"][0]["state"])
++        self.assertTrue(next_result["items"][0]["retryable"])
++
++    def test_historical_cleanup_deletes_only_exact_old_ids(self):
++        rows = [
++            {"account_id": "old-a", "email": "one@example.com", "created_at": "2026-10-11T00:00:00Z"},
++            {"account_id": "old-b", "email": "one@example.com", "created_at": "2026-10-12T00:00:00Z"},
++            {"account_id": "keeper", "email": "one@example.com", "created_at": "2026-10-13T00:00:00Z"},
++        ]
++        deleted = []
++
++        def delete(account_id):
++            deleted.append(account_id)
++            rows[:] = [row for row in rows if row["account_id"] != account_id]
++            return {"ok": True}
++
++        service = self.service(rows=rows, delete=delete)
++        service.detect()
++        result = service.cleanup(["keeper", "old-b", "old-a", "old-b", "missing"], opt_in=True)
++
++        self.assertCountEqual(["old-a", "old-b"], deleted)
++        self.assertEqual(["keeper"], [row["account_id"] for row in rows])
++        self.assertEqual({"old-a", "old-b"}, {item["account_id"] for item in result["items"]})
++        self.assertTrue(all(item["ok"] for item in result["items"]))
++        self.assertTrue(all(item["state"] == "cleaned" for item in service.state()["items"]))
++
++    def test_historical_cleanup_allows_sequential_exact_id_cleanup_after_restart(self):
++        rows = [
++            {"account_id": "old-a", "email": "one@example.com", "created_at": "2026-10-11T00:00:00Z"},
++            {"account_id": "old-b", "email": "one@example.com", "created_at": "2026-10-12T00:00:00Z"},
++            {"account_id": "keeper", "email": "one@example.com", "created_at": "2026-10-13T00:00:00Z"},
++        ]
++        deleted = []
++
++        def delete(account_id):
++            deleted.append(account_id)
++            rows[:] = [row for row in rows if row["account_id"] != account_id]
++            return {"ok": True}
++
++        service = self.service(rows=rows, delete=delete)
++        service.detect()
++        first = service.cleanup(["old-a"], opt_in=True)
++        self.assertTrue(first["items"][0]["ok"])
++
++        reloaded = self.service(rows=rows, delete=delete)
++        second = reloaded.cleanup(["old-b"], opt_in=True)
++
++        self.assertTrue(second["items"][0]["ok"])
++        self.assertEqual(["old-a", "old-b"], deleted)
++        self.assertEqual(["keeper"], [row["account_id"] for row in rows])
++
++    def test_cleanup_blocks_when_same_email_snapshot_changes(self):
++        rows = [{"account_id": "old", "email": "one@example.com"}]
++        errors = {"old": "401 unauthorized"}
++        deleted = []
++
++        def refresh(ids):
++            failures = [
++                {"account_id": value, "error": errors[value]}
++                for value in ids
++                if value in errors
++            ]
++            return {
++                "total": len(ids),
++                "success": len(ids) - len(failures),
++                "failed": len(failures),
++                "errors": failures,
++            }
++
++        service = self.service(
++            rows=rows,
++            refresh=refresh,
++            delete=lambda account_id: deleted.append(account_id) or {"ok": True},
++        )
++        service.detect()
++        service.mark_retrying(["old"])
++        rows.append({"account_id": "new", "email": "one@example.com"})
++        service.detect({"one@example.com": "success"})
++        rows.append({"account_id": "unexpected", "email": "one@example.com"})
++
++        result = service.cleanup(["old"], opt_in=True)
++
++        self.assertEqual([], deleted)
++        self.assertFalse(result["items"][0]["ok"])
++        item = service.state()["items"][0]
++        self.assertEqual("ambiguous", item["state"])
++        self.assertIn("快照已变化", item["reason"])
++
+     def test_no_new_account_is_ambiguous_and_not_cleanup_ready(self):
+         rows = [{"account_id": "old", "email": "one@example.com"}]
+         service = self.service(
+@@ -204,6 +787,7 @@ class Sub2Api401ServiceTests(unittest.TestCase):
+         self.assertTrue(result["items"][0]["ok"])
+         self.assertEqual("deleted_and_verified", result["items"][0]["result"])
+         self.assertEqual("cleaned", service.state()["items"][0]["state"])
++        self.assertEqual("old", service.state()["items"][0]["cleanup_account_id"])
+ 
+     def test_cleanup_waits_for_detection_state_commit_and_does_not_delete_stale_target(self):
+         rows = [{"account_id": "old", "email": "one@example.com"}]
+@@ -270,6 +854,280 @@ class Sub2Api401ServiceTests(unittest.TestCase):
+         self.assertEqual("old", item["cleanup_account_id"])
+         self.assertEqual("new", item["replacement_account_id"])
+ 
++    def test_cleanup_deactivation_failure_preserves_safe_retry_evidence(self):
++        rows = [{"account_id": "42", "email": "one@example.com"}]
++        errors = {"42": "401 unauthorized"}
++        calls = []
++
++        def refresh(ids):
++            failures = [
++                {"account_id": value, "error": errors[value]}
++                for value in ids
++                if value in errors
++            ]
++            return {
++                "total": len(ids),
++                "success": len(ids) - len(failures),
++                "failed": len(failures),
++                "errors": failures,
++            }
++
++        def request(method, path, body):
++            calls.append((method, path, body))
++            return {
++                "code": 500,
++                "message": "deactivation failed authorization=super-secret callback=https://secret.example/cb",
++            }
++
++        service = self.service(
++            rows=rows,
++            refresh=refresh,
++            delete=Sub2ApiAdminClient(request).delete_account,
++        )
++        service.detect()
++        service.mark_retrying(["42"])
++        rows.append({"account_id": "84", "email": "one@example.com"})
++        service.detect({"one@example.com": "success"})
++
++        result = service.cleanup(["42"], opt_in=True)
++
++        self.assertFalse(result["items"][0]["ok"])
++        self.assertEqual([
++            ("PUT", "/api/v1/admin/accounts/42", {"status": "inactive"}),
++        ], calls)
++        item = service.state()["items"][0]
++        self.assertEqual("cleanup_ready", item["state"])
++        self.assertEqual("42", item["cleanup_account_id"])
++        self.assertEqual("84", item["replacement_account_id"])
++        self.assertIn("deactivation failed", item["reason"])
++        persisted = self.audit_path.read_text(encoding="utf-8")
++        self.assertNotIn("super-secret", persisted)
++        self.assertNotIn("secret.example", persisted)
++
++    def test_cleanup_request_failure_stays_retryable_when_old_id_disappears_concurrently(self):
++        rows = [{"account_id": "42", "email": "one@example.com"}]
++        errors = {"42": "401 unauthorized"}
++        calls = []
++
++        def refresh(ids):
++            failures = [
++                {"account_id": value, "error": errors[value]}
++                for value in ids
++                if value in errors
++            ]
++            return {
++                "total": len(ids),
++                "success": len(ids) - len(failures),
++                "failed": len(failures),
++                "errors": failures,
++            }
++
++        def request(method, path, body):
++            calls.append((method, path, body))
++            rows[:] = [row for row in rows if row["account_id"] != "42"]
++            return {"code": 500, "message": "deactivation failed"}
++
++        service = self.service(
++            rows=rows,
++            refresh=refresh,
++            delete=Sub2ApiAdminClient(request).delete_account,
++        )
++        service.detect()
++        service.mark_retrying(["42"])
++        rows.append({"account_id": "84", "email": "one@example.com"})
++        service.detect({"one@example.com": "success"})
++
++        first = service.cleanup(["42"], opt_in=True)
++
++        self.assertFalse(first["items"][0]["ok"])
++        self.assertEqual("not_deleted", first["items"][0]["result"])
++        self.assertEqual("cleanup_ready", service.state()["items"][0]["state"])
++        self.assertEqual([
++            ("PUT", "/api/v1/admin/accounts/42", {"status": "inactive"}),
++        ], calls)
++
++        second = service.cleanup(["42"], opt_in=True)
++
++        self.assertTrue(second["items"][0]["ok"])
++        self.assertEqual("absent_and_verified", second["items"][0]["result"])
++        self.assertEqual("cleaned", service.state()["items"][0]["state"])
++        self.assertEqual(1, len(calls))
++
++    def test_cleanup_delete_failure_retries_deactivation_and_preserves_evidence(self):
++        rows = [{"account_id": "42", "email": "one@example.com"}]
++        errors = {"42": "401 unauthorized"}
++        calls = []
++        delete_attempts = 0
++
++        def refresh(ids):
++            failures = [
++                {"account_id": value, "error": errors[value]}
++                for value in ids
++                if value in errors
++            ]
++            return {
++                "total": len(ids),
++                "success": len(ids) - len(failures),
++                "failed": len(failures),
++                "errors": failures,
++            }
++
++        def request(method, path, body):
++            nonlocal delete_attempts
++            calls.append((method, path, body))
++            if method == "DELETE":
++                delete_attempts += 1
++                if delete_attempts == 1:
++                    return {
++                        "code": 500,
++                        "message": "delete failed access_token=super-secret callback=https://secret.example/cb",
++                    }
++                rows[:] = [row for row in rows if row["account_id"] != "42"]
++            return {"data": {"access_token": "must-not-return"}}
++
++        service = self.service(
++            rows=rows,
++            refresh=refresh,
++            delete=Sub2ApiAdminClient(request).delete_account,
++        )
++        service.detect()
++        service.mark_retrying(["42"])
++        rows.append({"account_id": "84", "email": "one@example.com"})
++        service.detect({"one@example.com": "success"})
++
++        first = service.cleanup(["42"], opt_in=True)
++
++        self.assertFalse(first["items"][0]["ok"])
++        self.assertEqual([
++            ("PUT", "/api/v1/admin/accounts/42", {"status": "inactive"}),
++            ("DELETE", "/api/v1/admin/accounts/42", None),
++        ], calls)
++        item = service.state()["items"][0]
++        self.assertEqual("cleanup_ready", item["state"])
++        self.assertEqual("42", item["cleanup_account_id"])
++        self.assertEqual("84", item["replacement_account_id"])
++        self.assertIn("delete failed", item["reason"])
++        self.assertNotIn("super-secret", self.audit_path.read_text(encoding="utf-8"))
++
++        second = service.cleanup(["42"], opt_in=True)
++
++        self.assertTrue(second["items"][0]["ok"])
++        self.assertEqual([
++            ("PUT", "/api/v1/admin/accounts/42", {"status": "inactive"}),
++            ("DELETE", "/api/v1/admin/accounts/42", None),
++            ("PUT", "/api/v1/admin/accounts/42", {"status": "inactive"}),
++            ("DELETE", "/api/v1/admin/accounts/42", None),
++        ], calls)
++        self.assertEqual("cleaned", service.state()["items"][0]["state"])
++
++    def test_cleanup_requires_healthy_replacement_after_delete(self):
++        rows = [{"account_id": "old", "email": "one@example.com"}]
++        new_only_refreshes = 0
++        deleted = []
++
++        def refresh(ids):
++            nonlocal new_only_refreshes
++            if ids == ["new"]:
++                new_only_refreshes += 1
++                if new_only_refreshes >= 2:
++                    return {
++                        "total": 1,
++                        "success": 0,
++                        "failed": 1,
++                        "errors": [{"account_id": "new", "error": "401 unauthorized"}],
++                    }
++            failures = [
++                {"account_id": value, "error": "401 unauthorized"}
++                for value in ids
++                if value == "old"
++            ]
++            return {
++                "total": len(ids),
++                "success": len(ids) - len(failures),
++                "failed": len(failures),
++                "errors": failures,
++            }
++
++        def delete(account_id):
++            deleted.append(account_id)
++            rows[:] = [row for row in rows if row["account_id"] != account_id]
++            return {"ok": True}
++
++        service = self.service(rows=rows, refresh=refresh, delete=delete)
++        service.detect()
++        service.mark_retrying(["old"])
++        rows.append({"account_id": "new", "email": "one@example.com"})
++        service.detect({"one@example.com": "success"})
++
++        result = service.cleanup(["old"], opt_in=True)
++
++        self.assertEqual(["old"], deleted)
++        self.assertFalse(result["items"][0]["ok"])
++        item = service.state()["items"][0]
++        self.assertEqual("ambiguous", item["state"])
++        self.assertIn("清理后替代 account_id 未通过刷新验证", item["reason"])
++
++    def test_cleanup_reconciles_missing_old_id_after_relist_failure_and_restart(self):
++        rows = [{"account_id": "old", "email": "one@example.com"}]
++        deleted = []
++        fail_next_list = False
++
++        def list_accounts():
++            nonlocal fail_next_list
++            if fail_next_list:
++                fail_next_list = False
++                raise RuntimeError("transient list failure with secret detail")
++            return list(rows)
++
++        def refresh(ids):
++            failures = [
++                {"account_id": value, "error": "401 unauthorized"}
++                for value in ids
++                if value == "old"
++            ]
++            return {
++                "total": len(ids),
++                "success": len(ids) - len(failures),
++                "failed": len(failures),
++                "errors": failures,
++            }
++
++        def delete(account_id):
++            nonlocal fail_next_list
++            deleted.append(account_id)
++            rows[:] = [row for row in rows if row["account_id"] != account_id]
++            fail_next_list = True
++            return {"ok": True}
++
++        service = Sub2Api401Service(
++            list_fn=list_accounts,
++            refresh_fn=refresh,
++            delete_fn=delete,
++            audit_path=self.audit_path,
++        )
++        service.detect()
++        service.mark_retrying(["old"])
++        rows.append({"account_id": "new", "email": "one@example.com"})
++        service.detect({"one@example.com": "success"})
++
++        first = service.cleanup(["old"], opt_in=True)
++        self.assertFalse(first["items"][0]["ok"])
++        self.assertEqual("cleanup_ready", service.state()["items"][0]["state"])
++        self.assertNotIn("secret detail", self.audit_path.read_text(encoding="utf-8"))
++
++        reloaded = Sub2Api401Service(
++            list_fn=lambda: list(rows),
++            refresh_fn=refresh,
++            delete_fn=delete,
++            audit_path=self.audit_path,
++        )
++        second = reloaded.cleanup(["old"], opt_in=True)
++
++        self.assertTrue(second["items"][0]["ok"])
++        self.assertEqual("absent_and_verified", second["items"][0]["result"])
++        self.assertEqual(["old"], deleted)
++        self.assertEqual("cleaned", reloaded.state()["items"][0]["state"])
++
+     def test_audit_write_is_atomic_private_and_symlink_target_safe(self):
+         target_dir = Path(self.temp_dir.name) / "data"
+         target_dir.mkdir()
+diff --git a/tests/test_sub2api_401_templates.py b/tests/test_sub2api_401_templates.py
+index e576f8b..ed248c2 100644
+--- a/tests/test_sub2api_401_templates.py
++++ b/tests/test_sub2api_401_templates.py
+@@ -22,7 +22,8 @@ class Sub2Api401TemplateTests(unittest.TestCase):
+         for text in (
+             "检测 Sub2API 401",
+             "补跑 Codex",
+-            "确认清理旧 ID",
++            "重试清理旧 ID",
++            "按钮仅用于历史重复项或自动清理失败重试",
+             "补跑前 account_id",
+             "补跑后 account_id",
+             "唯一替代 account_id",
+@@ -39,6 +40,8 @@ class Sub2Api401TemplateTests(unittest.TestCase):
+             self.assertIn(text, page)
+         self.assertNotIn("/api/cpa-401", page)
+         self.assertNotIn("auth-files", page)
++        self.assertIn('<option selected>3</option>', page)
++        self.assertIn("workers:Number($('#workers').value || 3)", page)
+ 
+ 
+ if __name__ == "__main__":
+diff --git a/tests/test_sub2api_admin.py b/tests/test_sub2api_admin.py
+index 1b46eb3..0409bed 100644
+--- a/tests/test_sub2api_admin.py
++++ b/tests/test_sub2api_admin.py
+@@ -63,6 +63,25 @@ class Sub2ApiAdminClientTests(unittest.TestCase):
+         self.assertEqual(["0", "1"], [row["account_id"] for row in rows])
+         self.assertEqual(2, len(calls))
+ 
++    def test_list_preserves_only_valid_created_at(self):
++        def request(method, path, body):
++            return {"data": {"items": [
++                {"id": "valid", "email": "valid@example.com", "platform": "openai", "type": "oauth", "created_at": "2026-10-13T01:02:03Z", "access_token": "secret"},
++                {"id": "numeric", "email": "numeric@example.com", "platform": "openai", "type": "oauth", "createdAt": 1_760_317_323},
++                {"id": "invalid", "email": "invalid@example.com", "platform": "openai", "type": "oauth", "created_at": "not-a-date"},
++                {"id": "future", "email": "future@example.com", "platform": "openai", "type": "oauth", "created_at": 4_102_444_800},
++                {"id": "url", "email": "url@example.com", "platform": "openai", "type": "oauth", "created_at": "https://secret.example/callback"},
++                {"id": "overlong", "email": "long@example.com", "platform": "openai", "type": "oauth", "created_at": "2026-10-13T01:02:03Z" + "x" * 1000},
++            ]}}
++        rows = Sub2ApiAdminClient(request).list_openai_oauth_accounts()
++        by_id = {row["account_id"]: row for row in rows}
++        self.assertEqual("2026-10-13T01:02:03+00:00", by_id["valid"]["created_at"])
++        self.assertEqual("2025-10-13T01:02:03+00:00", by_id["numeric"]["created_at"])
++        for account_id in ("invalid", "future", "url", "overlong"):
++            self.assertEqual("", by_id[account_id]["created_at"])
++        self.assertNotIn("access_token", str(rows))
++        self.assertNotIn("secret.example", str(rows))
++
+     def test_list_marks_multiple_emails_in_account_name_ambiguous(self):
+         def request(method, path, body):
+             return {
+@@ -123,7 +142,7 @@ class Sub2ApiAdminClientTests(unittest.TestCase):
+         self.assertNotIn("secret.example", serialized)
+         self.assertEqual("202", result["errors"][0]["account_id"])
+ 
+-    def test_delete_uses_exact_encoded_account_id_and_discards_response_payload(self):
++    def test_delete_deactivates_then_deletes_exact_encoded_account_id_and_discards_payloads(self):
+         calls = []
+ 
+         def request(method, path, body):
+@@ -132,9 +151,70 @@ class Sub2ApiAdminClientTests(unittest.TestCase):
+ 
+         result = Sub2ApiAdminClient(request).delete_account("old/id")
+         self.assertEqual({"ok": True, "account_id": "old/id"}, result)
+-        self.assertEqual(("DELETE", "/api/v1/admin/accounts/old%2Fid", None), calls[0])
++        self.assertEqual([
++            ("PUT", "/api/v1/admin/accounts/old%2Fid", {"status": "inactive"}),
++            ("DELETE", "/api/v1/admin/accounts/old%2Fid", None),
++        ], calls)
+         self.assertNotIn("must-not-return", str(result))
+ 
++    def test_delete_normalizes_integer_account_id_for_exact_path(self):
++        calls = []
++
++        def request(method, path, body):
++            calls.append((method, path, body))
++            return {}
++
++        result = Sub2ApiAdminClient(request).delete_account(42)
++        self.assertEqual({"ok": True, "account_id": "42"}, result)
++        self.assertEqual([
++            ("PUT", "/api/v1/admin/accounts/42", {"status": "inactive"}),
++            ("DELETE", "/api/v1/admin/accounts/42", None),
++        ], calls)
++
++    def test_delete_does_not_send_delete_when_deactivation_fails(self):
++        calls = []
++
++        def request(method, path, body):
++            calls.append((method, path, body))
++            return {
++                "code": 500,
++                "message": "deactivation failed authorization=super-secret callback=https://secret.example/cb",
++            }
++
++        with self.assertRaises(Sub2ApiAdminError) as captured:
++            Sub2ApiAdminClient(request).delete_account("42")
++
++        self.assertEqual([
++            ("PUT", "/api/v1/admin/accounts/42", {"status": "inactive"}),
++        ], calls)
++        self.assertEqual("remote", captured.exception.category)
++        self.assertIn("deactivation failed", str(captured.exception))
++        self.assertNotIn("super-secret", str(captured.exception))
++        self.assertNotIn("secret.example", str(captured.exception))
++
++    def test_delete_propagates_sanitized_error_after_successful_deactivation(self):
++        calls = []
++
++        def request(method, path, body):
++            calls.append((method, path, body))
++            if method == "DELETE":
++                return {
++                    "code": 500,
++                    "message": "delete failed access_token=super-secret callback=https://secret.example/cb",
++                }
++            return {"data": {"access_token": "must-not-return"}}
++
++        with self.assertRaises(Sub2ApiAdminError) as captured:
++            Sub2ApiAdminClient(request).delete_account("42")
++
++        self.assertEqual([
++            ("PUT", "/api/v1/admin/accounts/42", {"status": "inactive"}),
++            ("DELETE", "/api/v1/admin/accounts/42", None),
++        ], calls)
++        self.assertIn("delete failed", str(captured.exception))
++        self.assertNotIn("super-secret", str(captured.exception))
++        self.assertNotIn("secret.example", str(captured.exception))
++
+     def test_nonzero_standard_envelope_is_rejected_without_leaking_message_secrets(self):
+         def request(method, path, body):
+             return {
+diff --git a/tests/test_webui_sub2api_401.py b/tests/test_webui_sub2api_401.py
+index 969c627..fecf1d7 100644
+--- a/tests/test_webui_sub2api_401.py
++++ b/tests/test_webui_sub2api_401.py
+@@ -119,9 +119,131 @@ class WebuiSub2Api401Tests(unittest.TestCase):
+         self.assert_sensitive_headers(response)
+         body = response.get_json()
+         self.assertEqual(1, body["started_count"])
++        self.assertIn("自动删除锁定旧 ID", body["message"])
+         self.assertEqual("old-id", body["started"][0]["account_id"])
+         mark_retrying.assert_called_once_with(["old-id"], batch_id=ANY)
+ 
++    def test_retry_defaults_workers_to_three(self):
++        candidate = {"account_id": "old-id", "email": "bad@example.com", "retryable": True, "state": "pending"}
++        with patch(
++            "core.sub2api_401_service.Sub2Api401Service.select_retryable",
++            return_value=([candidate], []),
++        ), patch(
++            "core.sub2api_401_service.Sub2Api401Service.mark_retrying"
++        ), patch(
++            "webui.app.db.get_account_by_email", return_value={"id": 1, "email": "bad@example.com"}
++        ), patch(
++            "webui.app.codex_retry_service.reserve", return_value=True
++        ), patch(
++            "webui.app.db.update_account_codex_status"
++        ), patch(
++            "webui.app.codex_retry_service.log_path",
++            return_value=Path(tempfile.gettempdir()) / "retry.log",
++        ), patch(
++            "webui.app.threading.Thread"
++        ) as thread:
++            response = self.client.post(
++                "/api/sub2api-401/retry",
++                headers=self.headers,
++                json={"account_ids": ["old-id"]},
++            )
++        self.assertEqual(200, response.status_code)
++        thread.assert_called_once()
++        self.assertEqual(3, thread.call_args.kwargs["args"][1])
++
++    def test_retry_runner_detects_after_workers_and_cleans_only_selected_ready_ids(self):
++        candidates = [
++            {"account_id": "old-a", "email": "a@example.com", "retryable": True, "state": "pending"},
++            {"account_id": "old-b", "email": "b@example.com", "retryable": True, "state": "pending"},
++        ]
++        events = []
++        batch_ids = []
++
++        def mark_retrying(_account_ids, *, batch_id):
++            batch_ids.append(batch_id)
++
++        def run_worker(email, **_kwargs):
++            events.append(f"worker:{email}")
++
++        def detect(_local_status):
++            events.append("detect")
++            return {
++                "items": [
++                    {"account_id": "old-a", "state": "cleanup_ready", "retry_batch_id": batch_ids[0]},
++                    {"account_id": "old-b", "state": "cleanup_ready", "retry_batch_id": "older-batch"},
++                    {"account_id": "unrelated", "state": "cleanup_ready", "retry_batch_id": batch_ids[0]},
++                ]
++            }
++
++        def cleanup(_account_ids, **_kwargs):
++            events.append("cleanup")
++            return {
++                "items": [{
++                    "account_id": "old-a",
++                    "cleanup_account_id": "old-a",
++                    "replacement_account_id": "new-a",
++                    "ok": False,
++                    "result": "not_deleted",
++                    "reason": "Sub2API 删除请求失败",
++                }]
++            }
++
++        with tempfile.TemporaryDirectory() as tmp, patch(
++            "core.sub2api_401_service.Sub2Api401Service.select_retryable",
++            return_value=(candidates, []),
++        ), patch(
++            "core.sub2api_401_service.Sub2Api401Service.mark_retrying",
++            side_effect=mark_retrying,
++        ), patch(
++            "core.sub2api_401_service.Sub2Api401Service.detect", side_effect=detect
++        ) as detect_mock, patch(
++            "core.sub2api_401_service.Sub2Api401Service.cleanup", side_effect=cleanup
++        ) as cleanup_mock, patch(
++            "webui.app.db.get_account_by_email",
++            side_effect=lambda email: {"id": email, "email": email},
++        ), patch(
++            "webui.app.codex_retry_service.reserve", return_value=True
++        ), patch(
++            "webui.app.db.update_account_codex_status"
++        ), patch(
++            "webui.app.codex_retry_service.log_path",
++            side_effect=lambda email: Path(tmp) / f"{email}.log",
++        ), patch(
++            "webui.app.db.list_accounts", return_value=[]
++        ), patch(
++            "webui.app.codex_retry_service.run_worker", side_effect=run_worker
++        ):
++            with patch("webui.app.threading.Thread") as thread:
++                response = self.client.post(
++                    "/api/sub2api-401/retry",
++                    headers=self.headers,
++                    json={"account_ids": ["old-a", "old-b"], "workers": 2},
++                )
++                runner = thread.call_args.kwargs["target"]
++                runner_args = thread.call_args.kwargs["args"]
++            runner(*runner_args)
++
++        self.assertEqual(200, response.status_code)
++        self.assert_sensitive_headers(response)
++        worker_indexes = [index for index, event in enumerate(events) if event.startswith("worker:")]
++        self.assertEqual(2, len(worker_indexes))
++        self.assertGreater(events.index("detect"), max(worker_indexes))
++        self.assertGreater(events.index("cleanup"), events.index("detect"))
++        detect_mock.assert_called_once_with({})
++        cleanup_mock.assert_called_once_with(["old-a"], opt_in=True, limit=50)
++
++    def test_retry_rejects_non_integer_workers(self):
++        for workers in (True, False, "3", 3.5, None):
++            with self.subTest(workers=workers):
++                response = self.client.post(
++                    "/api/sub2api-401/retry",
++                    headers=self.headers,
++                    json={"account_ids": ["old-id"], "workers": workers},
++                )
++                self.assertEqual(400, response.status_code)
++                self.assert_sensitive_headers(response)
++                self.assertEqual("workers 必须是整数", response.get_json()["error"])
++
+     def test_retry_snapshot_conflict_releases_reservation_and_returns_409(self):
+         candidate = {"account_id": "old-id", "email": "bad@example.com", "retryable": True, "state": "pending"}
+         with patch(
+@@ -186,6 +308,25 @@ class WebuiSub2Api401Tests(unittest.TestCase):
+         self.assert_sensitive_headers(response)
+         self.assertEqual(0, response.get_json()["started_count"])
+ 
++    def test_cleanup_errors_are_bounded_and_do_not_echo_secrets(self):
++        with patch(
++            "core.sub2api_401_service.Sub2Api401Service.cleanup",
++            side_effect=RuntimeError(
++                "access_token=super-secret callback=https://secret.example/cb?code=secret-code"
++            ),
++        ):
++            response = self.client.post(
++                "/api/sub2api-401/cleanup",
++                headers=self.headers,
++                json={"account_ids": ["old-id"], "confirm_cleanup": True},
++            )
++        self.assertEqual(502, response.status_code)
++        self.assert_sensitive_headers(response)
++        text = response.get_data(as_text=True).lower()
++        self.assertNotIn("super-secret", text)
++        self.assertNotIn("secret.example", text)
++        self.assertNotIn("secret-code", text)
++
+     def test_cleanup_passes_explicit_confirmation_and_account_ids(self):
+         payload = {
+             "ok": True,
+diff --git a/webui/app.py b/webui/app.py
+index 366df88..0114f79 100644
+--- a/webui/app.py
++++ b/webui/app.py
+@@ -2813,11 +2813,10 @@ def create_app(auth_code: str | None = None) -> Flask:
+             return _sub2api_401_response({"ok": False, "error": "account_ids 必须是非空数组"}, 400)
+         if len(account_ids) > 50:
+             return _sub2api_401_response({"ok": False, "error": "单次最多选择 50 个账号"}, 400)
+-        try:
+-            workers = int(data.get("workers") or 1)
+-        except (TypeError, ValueError):
++        raw_workers = data.get("workers", 3)
++        if isinstance(raw_workers, bool) or not isinstance(raw_workers, int):
+             return _sub2api_401_response({"ok": False, "error": "workers 必须是整数"}, 400)
+-        workers = max(1, min(8, workers))
++        workers = max(1, min(8, raw_workers))
+ 
+         candidates, skipped = sub2api_401_service.select_retryable(account_ids, limit=50)
+         selected: list[dict] = []
+@@ -2891,7 +2890,7 @@ def create_app(auth_code: str | None = None) -> Flask:
+                     except Exception as exc:
+                         logger.warning("Sub2API 401 Codex 补跑子任务异常 batch=%s error=%s", batch, type(exc).__name__)
+             try:
+-                sub2api_401_service.detect(_sub2api_401_local_statuses())
++                result = sub2api_401_service.detect(_sub2api_401_local_statuses())
+             except Exception as exc:
+                 error, _status = _sub2api_401_remote_error(exc)
+                 sub2api_401_service.mark_verification_error(
+@@ -2899,6 +2898,27 @@ def create_app(auth_code: str | None = None) -> Flask:
+                     f"{error}；旧账号保持不变",
+                 )
+                 logger.warning("Sub2API 401 后置验证失败 batch=%s: %s", batch, error)
++            else:
++                cleanup_ids = [
++                    item["account_id"] for item in result.get("items", [])
++                    if (
++                        item.get("account_id") in selected_ids
++                        and item.get("retry_batch_id") == batch
++                        and item.get("state") == "cleanup_ready"
++                    )
++                ]
++                if cleanup_ids:
++                    try:
++                        cleanup_result = sub2api_401_service.cleanup(cleanup_ids, opt_in=True, limit=50)
++                        failed_cleanup = sum(1 for item in cleanup_result.get("items", []) if not item.get("ok"))
++                        if failed_cleanup:
++                            logger.warning("Sub2API 401 自动清理失败 batch=%s count=%s", batch, failed_cleanup)
++                    except Exception as exc:
++                        logger.warning(
++                            "Sub2API 401 自动清理异常 batch=%s error=%s；保留 cleanup_ready",
++                            batch,
++                            type(exc).__name__,
++                        )
+ 
+         try:
+             threading.Thread(
+@@ -2915,7 +2935,7 @@ def create_app(auth_code: str | None = None) -> Flask:
+             return _sub2api_401_response({"ok": False, "error": "Sub2API 401 补跑调度失败"}, 500)
+         return _sub2api_401_response({
+             "ok": True,
+-            "message": f"已启动 {len(selected)} 个 Codex 补跑任务；完成后将自动验证 Sub2API 替代 account_id",
++            "message": f"已启动 {len(selected)} 个 Codex 补跑任务；唯一健康替代 account_id 验证成功后将自动删除锁定旧 ID",
+             "started": selected,
+             "started_count": len(selected),
+             "skipped": skipped[:50],
+diff --git a/webui/templates/sub2api_401.html b/webui/templates/sub2api_401.html
+index 710e180..051d963 100644
+--- a/webui/templates/sub2api_401.html
++++ b/webui/templates/sub2api_401.html
+@@ -20,13 +20,13 @@
+ </head>
+ <body>
+ <div class="wrap">
+-  <div class="top"><div><h1>Sub2API 401 凭证轮换</h1><div class="muted">批量刷新 OpenAI OAuth 账号 → 补跑 unauthorized → 验证同邮箱新 account_id → 显式删除锁定旧 ID。</div></div><a href="/">← 返回控制台</a></div>
++  <div class="top"><div><h1>Sub2API 401 凭证轮换</h1><div class="muted">批量刷新 OpenAI OAuth 账号 → 补跑 unauthorized → 验证同邮箱新 account_id → 自动清理锁定旧 ID（历史重复项或失败时可手动重试）。</div></div><a href="/">← 返回控制台</a></div>
+   <section class="card">
+     <div class="toolbar">
+       <button class="primary" id="detectBtn">检测 Sub2API 401</button>
+       <button id="retryBtn" disabled>补跑 Codex（已选 0）</button>
+-      <button class="danger" id="cleanupBtn" disabled>确认清理旧 ID（已选 0）</button>
+-      <label>并发 <select id="workers"><option>1</option><option>2</option><option>3</option><option>4</option><option>6</option><option>8</option></select></label>
++      <button class="danger" id="cleanupBtn" disabled>重试清理旧 ID（已选 0）</button>
++      <label>并发 <select id="workers"><option>1</option><option>2</option><option selected>3</option><option>4</option><option>6</option><option>8</option></select></label>
+       <span class="spacer"></span><span class="muted" id="checkedAt">正在读取审计状态…</span>
+     </div>
+     <div class="counts">
+@@ -37,7 +37,7 @@
+       <div class="metric"><span class="muted">状态正常</span><b id="healthyCount">0</b></div>
+       <div class="metric"><span class="muted">状态未知</span><b id="unknownCount">0</b></div>
+     </div>
+-    <div class="notice">系统仅处理 platform=openai 且 type=oauth 的 Sub2API 账号。清理必须显式确认，并且只会删除检测时锁定、验证时仍存在的旧 account_id；不会按邮箱批量删除。</div>
++    <div class="notice">系统仅处理 platform=openai 且 type=oauth 的 Sub2API 账号。补跑验证出唯一健康替代 ID 后会自动清理锁定旧 ID；按钮仅用于历史重复项或自动清理失败重试，并且不会按邮箱批量删除。</div>
+     <div id="message"></div>
+     <pre id="cleanupQueue" class="queue hidden"></pre>
+   </section>
+@@ -55,7 +55,7 @@
+   let items = [];
+   let cleanupSupported = true;
+   const esc = value => String(value ?? '').replace(/[&<>"']/g, ch => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch]));
+-  const stateText = {pending:'待补跑',retrying:'补跑中',verified:'已验证',cleanup_ready:'待显式清理',cleaned:'已清理',failed:'补跑失败',ambiguous:'状态不明确'};
++  const stateText = {pending:'待补跑',retrying:'补跑中',verified:'已验证',cleanup_ready:'待清理/可重试',cleaned:'已清理',failed:'补跑失败',ambiguous:'状态不明确'};
+   async function api(path, options={}) {
+     const response = await fetch(path, {...options, headers:{'Content-Type':'application/json', ...(options.headers || {})}});
+     const data = await response.json().catch(() => ({ok:false,error:`HTTP ${response.status}`}));
+@@ -90,7 +90,7 @@
+     $('#retryBtn').disabled = retryIds.length === 0;
+     $('#retryBtn').textContent = `补跑 Codex（已选 ${retryIds.length}）`;
+     $('#cleanupBtn').disabled = !cleanupSupported || cleanupIds.length === 0;
+-    $('#cleanupBtn').textContent = `确认清理旧 ID（已选 ${cleanupIds.length}）`;
++    $('#cleanupBtn').textContent = `重试清理旧 ID（已选 ${cleanupIds.length}）`;
+     $('#selectAll').checked = actionable.length > 0 && actionable.every(item => selected.has(item.account_id));
+     $('#selectAll').indeterminate = selected.size > 0 && !$('#selectAll').checked;
+   }
+@@ -111,10 +111,10 @@
+   $('#detectBtn').addEventListener('click', detect);
+   $('#retryBtn').addEventListener('click', async () => {
+     const accountIds = [...selected].filter(accountId => items.some(item => item.account_id === accountId && item.retryable));
+-    if (!accountIds.length || !confirm(`补跑选中的 ${accountIds.length} 个 Codex OAuth？\n\n系统会保存旧 account_id 快照；只有同邮箱出现唯一新 account_id 且旧 ID 仍存在时才允许清理。`)) return;
++    if (!accountIds.length || !confirm(`补跑选中的 ${accountIds.length} 个 Codex OAuth？\n\n系统会保存旧 account_id 快照；只有同邮箱出现唯一健康新 account_id 且旧 ID 仍存在时才会自动删除锁定旧 ID。`)) return;
+     $('#retryBtn').disabled = true;
+     try {
+-      const data = await api('/api/sub2api-401/retry', {method:'POST', body:JSON.stringify({account_ids:accountIds, workers:Number($('#workers').value || 1)})});
++      const data = await api('/api/sub2api-401/retry', {method:'POST', body:JSON.stringify({account_ids:accountIds, workers:Number($('#workers').value || 3)})});
+       for (const accountId of accountIds) {
+         const item = items.find(row => row.account_id === accountId);
+         if (item) { item.pre_retry_account_ids = [...(item.observed_account_ids || [accountId])]; item.state='retrying'; item.reason='已启动 Codex OAuth 补跑，等待 Sub2API 新 account_id 后置验证'; item.retryable=false; }
+@@ -134,7 +134,7 @@
+       const lines = (preview.items || []).map(item => `${item.email || '—'}\n  旧 account_id: ${item.cleanup_account_id || '—'}\n  已验证替代: ${item.replacement_account_id || '—'}`);
+       $('#cleanupQueue').textContent = `${preview.manual_action || ''}\n\n${lines.join('\n\n')}`.trim();
+       $('#cleanupQueue').classList.remove('hidden');
+-      if (!confirm(`确认删除 ${accountIds.length} 个已锁定的旧 Sub2API account_id？\n\n系统不会按邮箱删除，并会在删除后重新读取账号列表确认旧 ID 消失。`)) return;
++      if (!confirm(`确认删除 ${accountIds.length} 个已锁定的旧 Sub2API account_id？\n\n系统不会按邮箱删除，并会在删除后重新读取账号列表确认旧 ID 消失；此按钮仅重试历史重复项或自动清理失败。`)) return;
+       const result = await api('/api/sub2api-401/cleanup', {method:'POST', body:JSON.stringify({account_ids:accountIds, confirm_cleanup:true})});
+       await loadState();
+       const failed = (result.items || []).filter(item => !item.ok).length;

@@ -45,6 +45,7 @@ Sub2API operations:
 ```text
 GET    /api/v1/admin/accounts?platform=openai&type=oauth&page=<n>&page_size=<n>&lite=1
 POST   /api/v1/admin/accounts/batch-refresh  {"account_ids": [integer|string, ...]}
+PUT    /api/v1/admin/accounts/<exact account_id>  {"status": "inactive"}
 DELETE /api/v1/admin/accounts/<exact account_id>
 ```
 
@@ -53,6 +54,8 @@ DELETE /api/v1/admin/accounts/<exact account_id>
 Environment is reused from `config/sub2api.py`: `SUB2API_API_BASE`, `SUB2API_API_KEY` or `SUB2API_API_TOKEN`, `SUB2API_API_AUTH_HEADER`, `SUB2API_API_AUTH_SCHEME`, and `SUB2API_API_TIMEOUT`. Do not introduce a second management-secret configuration. The list adapter may retain only a bounded, validated non-sensitive `created_at` value; malformed, missing, or tied latest timestamps are not usable for keeper selection.
 
 The list adapter accepts direct payloads and standard `{code, data}` envelopes, traverses bounded pagination, deduplicates by normalized `account_id`, and retains only `platform=openai` plus `type=oauth`. Numeric IDs remain strings in audit/UI state but are sent as integers on batch-refresh requests. Email candidates are normalized; missing or conflicting candidates set `email_ambiguous` and are ineligible for retry and cleanup.
+
+`delete_account(account_id)` is the durable exact-ID cleanup primitive. It normalizes and URL-encodes the ID once, sends `PUT {"status": "inactive"}` to that exact account path, and sends DELETE to the same path only after the PUT succeeds. Both server response payloads are discarded. A deactivation failure short-circuits DELETE; a later DELETE failure remains safe to retry because the same exact ID may be deactivated again before deletion.
 
 Batch refresh returns only bounded operational fields:
 
@@ -97,9 +100,11 @@ All Sub2API-401 responses set `Cache-Control: no-store, max-age=0`, `Pragma: no-
 | Exactly one new same-email ID refreshes healthy and old ID remains | `cleanup_ready` with exact old/new IDs locked and `replacement_health=healthy`; the retry runner immediately performs exact-ID cleanup |
 | Every member of a historical same-email duplicate group is unauthorized and one account has the unique latest valid `created_at` | Omit the latest keeper; mark each older exact ID `cleanup_ready` with `replacement_health=unauthorized`; detection performs no deletion |
 | Historical all-unauthorized group has missing/invalid/tied `created_at`, or any timeout/unknown classification | `ambiguous`; no cleanup target is locked |
-| `confirm_cleanup` is not literal `true` | Review only; no DELETE request |
-| Locked state changes before cleanup | Skip stale target; no DELETE request |
-| Historical unauthorized keeper cleanup precheck changes the group snapshot, any classification, email, persisted non-keeper `created_at`, or unique-latest result | `ambiguous`; no DELETE request |
+| `confirm_cleanup` is not literal `true` | Review only; no PUT or DELETE request |
+| Locked state changes before cleanup | Skip stale target; no PUT or DELETE request |
+| Historical unauthorized keeper cleanup precheck changes the group snapshot, any classification, email, persisted non-keeper `created_at`, or unique-latest result | `ambiguous`; no PUT or DELETE request |
+| Exact old-ID deactivation fails | Adapter raises a sanitized management error; service records a bounded reason, sends no DELETE, and keeps `cleanup_ready` evidence for retry |
+| Exact old-ID DELETE fails after deactivation | Keep `cleanup_ready` with bounded failure evidence; retry repeats PUT `inactive` before DELETE |
 | Delete succeeds but old ID remains on re-list | Keep evidence and report verification failure |
 | Delete/reconciliation confirms old ID absent but the replacement is missing or no longer matches its locked `healthy`/`unauthorized` invariant | `ambiguous`; keep bounded evidence for review |
 | Re-list confirms old ID absent and a second refresh confirms the replacement healthy | `cleaned` |
@@ -108,15 +113,15 @@ All Sub2API-401 responses set `Cache-Control: no-store, max-age=0`, `Pragma: no-
 
 ### 5. Good/Base/Bad Cases
 
-- Good: old ID `42` is unauthorized, its same-email ID set is snapshotted, OAuth creates healthy ID `84`, and ID `42` still exists. State becomes `cleanup_ready`; the retry runner deletes only locked ID `42`, then re-list confirms it is absent and state becomes `cleaned`.
+- Good: old ID `42` is unauthorized, its same-email ID set is snapshotted, OAuth creates healthy ID `84`, and ID `42` still exists. State becomes `cleanup_ready`; the retry runner sends PUT `status=inactive` and then DELETE only to locked ID `42`, then re-list confirms it is absent and state becomes `cleaned`.
 - Historical duplicate: one healthy account with unauthorized peers, multiple healthy accounts with one unique latest valid `created_at`, or all unauthorized accounts with one unique latest valid `created_at`, marks each older exact ID `cleanup_ready`; detection itself never deletes. The all-unauthorized branch refreshes the complete live same-email group before deletion, requires every classification to remain unauthorized, and refreshes the unique-latest keeper again after deletion.
 - Base: healthy accounts are counted but omitted from the actionable list. Unauthorized accounts remain `pending` until the operator selects their exact IDs. The page defaults retry workers to 3; cleanup is a manual action only for historical duplicates or an automatic cleanup failure.
-- Bad: email extraction is ambiguous, the pre-retry ID set changes, OAuth creates zero or multiple candidates, the new ID is not healthy, historical timestamps are missing/invalid/tied, historical health includes timeout/unknown, or cleanup state/classification changes. State becomes `failed` or `ambiguous`; no deletion occurs.
+- Bad: email extraction is ambiguous, the pre-retry ID set changes, OAuth creates zero or multiple candidates, the new ID is not healthy, historical timestamps are missing/invalid/tied, historical health includes timeout/unknown, cleanup state/classification changes, or exact-ID deactivation fails. State becomes `failed`, `ambiguous`, or remains retryable `cleanup_ready`; DELETE is never sent after a failed deactivation.
 
 ### 6. Tests Required
 
-- Adapter tests assert direct and enveloped responses, bounded pagination, repeated-page protection, OpenAI OAuth filtering, numeric wire IDs, exact DELETE paths, safe error categories, and redaction.
-- Service tests assert health classification, persisted snapshots, unique replacement, zero/multiple candidates, missing old IDs, local retry failure, email ambiguity, stale-snapshot conflict, concurrent detect/cleanup serialization, explicit cleanup opt-in, delete verification, failed cleanup evidence retention, and historical all-unauthorized unique-latest selection/refusal, classification drift, post-delete keeper drift, exact-ID deletion, and next-detect singleton retryability.
+- Adapter tests assert direct and enveloped responses, bounded pagination, repeated-page protection, OpenAI OAuth filtering, numeric wire IDs, exact encoded account paths, PUT `inactive` then DELETE call order/body, deactivation failure short-circuiting, safe error categories, discarded response payloads, and redaction.
+- Service tests assert health classification, persisted snapshots, unique replacement, zero/multiple candidates, missing old IDs, local retry failure, email ambiguity, stale-snapshot conflict, concurrent detect/cleanup serialization, explicit cleanup opt-in, delete verification, safe deactivation/delete failure evidence retention, repeated deactivation on retry, and historical all-unauthorized unique-latest selection/refusal, classification drift, post-delete keeper drift, exact-ID deletion, and next-detect singleton retryability.
 - Persistence tests assert atomic writes, resolved symlink target directories, preserved symlinks, mode `0600`, and no secret text.
 - API tests assert authentication, request validation, HTTP 409/422 behavior, no-store headers, worker release on failures, exact-ID selection, and remote error mapping.
 - Template tests assert modern/legacy navigation parity, all four Sub2API-401 endpoints, account ID evidence, explicit cleanup wording, and no CPA-401 links.

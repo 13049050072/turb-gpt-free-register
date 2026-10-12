@@ -142,7 +142,7 @@ class Sub2ApiAdminClientTests(unittest.TestCase):
         self.assertNotIn("secret.example", serialized)
         self.assertEqual("202", result["errors"][0]["account_id"])
 
-    def test_delete_uses_exact_encoded_account_id_and_discards_response_payload(self):
+    def test_delete_deactivates_then_deletes_exact_encoded_account_id_and_discards_payloads(self):
         calls = []
 
         def request(method, path, body):
@@ -151,8 +151,69 @@ class Sub2ApiAdminClientTests(unittest.TestCase):
 
         result = Sub2ApiAdminClient(request).delete_account("old/id")
         self.assertEqual({"ok": True, "account_id": "old/id"}, result)
-        self.assertEqual(("DELETE", "/api/v1/admin/accounts/old%2Fid", None), calls[0])
+        self.assertEqual([
+            ("PUT", "/api/v1/admin/accounts/old%2Fid", {"status": "inactive"}),
+            ("DELETE", "/api/v1/admin/accounts/old%2Fid", None),
+        ], calls)
         self.assertNotIn("must-not-return", str(result))
+
+    def test_delete_normalizes_integer_account_id_for_exact_path(self):
+        calls = []
+
+        def request(method, path, body):
+            calls.append((method, path, body))
+            return {}
+
+        result = Sub2ApiAdminClient(request).delete_account(42)
+        self.assertEqual({"ok": True, "account_id": "42"}, result)
+        self.assertEqual([
+            ("PUT", "/api/v1/admin/accounts/42", {"status": "inactive"}),
+            ("DELETE", "/api/v1/admin/accounts/42", None),
+        ], calls)
+
+    def test_delete_does_not_send_delete_when_deactivation_fails(self):
+        calls = []
+
+        def request(method, path, body):
+            calls.append((method, path, body))
+            return {
+                "code": 500,
+                "message": "deactivation failed authorization=super-secret callback=https://secret.example/cb",
+            }
+
+        with self.assertRaises(Sub2ApiAdminError) as captured:
+            Sub2ApiAdminClient(request).delete_account("42")
+
+        self.assertEqual([
+            ("PUT", "/api/v1/admin/accounts/42", {"status": "inactive"}),
+        ], calls)
+        self.assertEqual("remote", captured.exception.category)
+        self.assertIn("deactivation failed", str(captured.exception))
+        self.assertNotIn("super-secret", str(captured.exception))
+        self.assertNotIn("secret.example", str(captured.exception))
+
+    def test_delete_propagates_sanitized_error_after_successful_deactivation(self):
+        calls = []
+
+        def request(method, path, body):
+            calls.append((method, path, body))
+            if method == "DELETE":
+                return {
+                    "code": 500,
+                    "message": "delete failed access_token=super-secret callback=https://secret.example/cb",
+                }
+            return {"data": {"access_token": "must-not-return"}}
+
+        with self.assertRaises(Sub2ApiAdminError) as captured:
+            Sub2ApiAdminClient(request).delete_account("42")
+
+        self.assertEqual([
+            ("PUT", "/api/v1/admin/accounts/42", {"status": "inactive"}),
+            ("DELETE", "/api/v1/admin/accounts/42", None),
+        ], calls)
+        self.assertIn("delete failed", str(captured.exception))
+        self.assertNotIn("super-secret", str(captured.exception))
+        self.assertNotIn("secret.example", str(captured.exception))
 
     def test_nonzero_standard_envelope_is_rejected_without_leaking_message_secrets(self):
         def request(method, path, body):

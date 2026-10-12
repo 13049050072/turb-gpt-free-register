@@ -1,0 +1,94 @@
+SUB2API DURABLE DUPLICATE CLEANUP - VERIFICATION LEDGER
+=======================================================
+
+Scope
+-----
+Converge Sub2API duplicate OpenAI OAuth credentials by exact account_id. Historical
+duplicate groups expose only deterministic old IDs, future verified OAuth replacement
+batches auto-clean their selected old IDs, retry concurrency defaults to 3, and every
+cleanup now performs PUT status=inactive before DELETE so Sub2API background activity
+cannot revive a soft-deleted old row.
+
+Pre-task baseline commit: 0bd089693f01dfde022861b999feb2fff7f59a74
+Pre-task baseline tree:   046c055984b577f093630b77a3aa06441c7f28dc
+First cleanup commit:     e2e7506ed5a7d7410d684482ce88c7d9db4e0811
+All-unauthorized commit:  1dae866655783373e1f77ec92734069539f6dfc4
+
+Four roles
+----------
+MODIFIED_FILE: /Users/jiangdk/code/personal/turb-gpt-free-register/.trellis/tasks/10-13-sub2api-cleanup-duplicates/artifacts/MODIFIED_FILE.tar.gz
+DIFF_FILE:     /Users/jiangdk/code/personal/turb-gpt-free-register/.trellis/tasks/10-13-sub2api-cleanup-duplicates/artifacts/DIFF_FILE.patch
+VERIFICATION:  /Users/jiangdk/code/personal/turb-gpt-free-register/.trellis/tasks/10-13-sub2api-cleanup-duplicates/artifacts/VERIFICATION.txt
+ROLLBACK:      /Users/jiangdk/code/personal/turb-gpt-free-register/.trellis/tasks/10-13-sub2api-cleanup-duplicates/artifacts/ROLLBACK.sh (mode 0755)
+
+Changed contracts
+-----------------
+-  sends exact encoded ID requests in
+  strict order: PUT /api/v1/admin/accounts/:id with {"status":"inactive"}, then DELETE.
+- DELETE is not sent if deactivation fails; deactivation and deletion failures are
+  sanitized and persisted as retryable cleanup evidence without secrets.
+-  requires exact locked old ID, deterministic keeper,
+  unchanged snapshots, full same-email group refresh, and explicit confirmation.
+- A request failure plus a concurrent old-ID disappearance is not falsely reported as
+  cleaned. A later reconciliation may mark it cleaned only after pre-call absence is
+  independently verified, without another destructive request.
+- Historical keeper rules remain: single healthy, unique latest healthy, or unique
+  latest account only when every account is definitively unauthorized. Ambiguous,
+  timeout, unknown, tied, missing, or invalid timestamps cannot be deleted.
+- Normal OAuth replacement cleanup still requires a unique healthy new account_id.
+- Future retry runner auto-cleans only selected same-batch cleanup_ready old IDs.
+- API and template retry concurrency default to 3.
+
+Behavior transaction
+--------------------
+Identical command/input for BASELINE, MODIFIED, and ROLLBACK:
+  .venv/bin/python -m unittest -v tests.test_sub2api_admin.Sub2ApiAdminClientTests.test_delete_deactivates_then_deletes_exact_encoded_account_id_and_discards_payloads tests.test_sub2api_401_service.Sub2Api401ServiceTests.test_cleanup_request_failure_stays_retryable_when_old_id_disappears_concurrently
+
+BASELINE
+- Detached worktree at 0bd089693f01dfde022861b999feb2fff7f59a74.
+- Exit status: 1.
+- Both durable-delete contract tests are absent at baseline and fail by AttributeError.
+- Literal output: BASELINE.stdout.log / BASELINE.stderr.log.
+
+MODIFIED
+- Detached baseline worktree with DIFF_FILE.patch applied.
+- Exit status: 0.
+- Adapter proves exact PUT inactive -> DELETE ordering and discards response secrets.
+- Service proves a failed request plus concurrent disappearance remains cleanup_ready,
+  then reconciles to cleaned without a second destructive call after pre-call absence.
+- Literal output: MODIFIED.stdout.log / MODIFIED.stderr.log.
+
+ROLLBACK
+- Separate detached baseline worktree with patch applied, then ROLLBACK.sh.
+- Rollback script exit: 0.
+- Matching probe exit: 1 (baseline behavior restored).
+- Diff-to-baseline exit: 0.
+- Restored tree: 046c055984b577f093630b77a3aa06441c7f28dc; expected 046c055984b577f093630b77a3aa06441c7f28dc.
+- Goal remains applied in primary worktree; rollback ran only under /tmp.
+
+Verification
+------------
+- Sub2API focused: 66/66 passed (focused-tests-durable.log).
+- Related Codex: 20/20 passed (codex-tests-durable.log).
+- ChatGPT2API: 37/37 passed (chatgpt2api-tests-durable.log).
+- Independent trellis-check: Sub2API 66/66, Codex 38/38, ChatGPT2API 56/56.
+- py_compile passed for changed Python modules/tests.
+- Inline JavaScript node --check passed for Sub2API and ChatGPT2API pages.
+- git diff --check passed; ROLLBACK.sh syntax and executable mode passed.
+
+Full regression
+---------------
+- `.venv/bin/python -m unittest discover -s tests -v`: 459 tests, 457 passed.
+- The two failures are reproduced unchanged at clean HEAD 0bd089693f01dfde022861b999feb2fff7f59a74:
+  1. `test_ensure_authorize_context_matches_20260914_capture_shape`: KeyError `ext-oai-did`.
+  2. `test_restore_context_requires_exact_email_match`: account unexpectedly `None`.
+- Current log: full-tests-durable.log; clean-head proof: CLEAN_HEAD_BASELINE_FAILURES.log.
+
+Production root-cause evidence
+------------------------------
+- Exact old IDs 16/17/18/25 reappeared after successful DELETE with the same IDs.
+- Oracle upstream source shows `DELETE /api/v1/admin/accounts/:id` is soft delete only.
+- Controlled trial on old ID 16: PUT status=inactive then DELETE; checked at +5, +35,
+  +95, and +200 seconds. ID 16 stayed absent and keeper 21 stayed present.
+- Remaining production old IDs 17/18/25 are intentionally deferred until this durable
+  implementation is committed, deployed, and invoked through the audited service.

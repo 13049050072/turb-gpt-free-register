@@ -1,0 +1,17 @@
+test_delete_deactivates_then_deletes_exact_encoded_account_id_and_discards_payloads (unittest.loader._FailedTest.test_delete_deactivates_then_deletes_exact_encoded_account_id_and_discards_payloads) ... ERROR
+test_cleanup_request_failure_stays_retryable_when_old_id_disappears_concurrently (unittest.loader._FailedTest.test_cleanup_request_failure_stays_retryable_when_old_id_disappears_concurrently) ... ERROR
+
+======================================================================
+ERROR: test_delete_deactivates_then_deletes_exact_encoded_account_id_and_discards_payloads (unittest.loader._FailedTest.test_delete_deactivates_then_deletes_exact_encoded_account_id_and_discards_payloads)
+----------------------------------------------------------------------
+AttributeError: type object 'Sub2ApiAdminClientTests' has no attribute 'test_delete_deactivates_then_deletes_exact_encoded_account_id_and_discards_payloads'
+
+======================================================================
+ERROR: test_cleanup_request_failure_stays_retryable_when_old_id_disappears_concurrently (unittest.loader._FailedTest.test_cleanup_request_failure_stays_retryable_when_old_id_disappears_concurrently)
+----------------------------------------------------------------------
+AttributeError: type object 'Sub2Api401ServiceTests' has no attribute 'test_cleanup_request_failure_stays_retryable_when_old_id_disappears_concurrently'
+
+----------------------------------------------------------------------
+Ran 2 tests in 0.000s
+
+FAILED (errors=2)

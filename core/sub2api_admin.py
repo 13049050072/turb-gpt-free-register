@@ -300,5 +300,7 @@ class Sub2ApiAdminClient:
         normalized = _account_id(account_id)
         if not normalized:
             raise ValueError("account_id 不能为空")
-        self._request("DELETE", f"/api/v1/admin/accounts/{quote(normalized, safe='')}")
+        path = f"/api/v1/admin/accounts/{quote(normalized, safe='')}"
+        self._request("PUT", path, {"status": "inactive"})
+        self._request("DELETE", path)
         return {"ok": True, "account_id": normalized}

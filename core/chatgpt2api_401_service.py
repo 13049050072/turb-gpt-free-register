@@ -7,6 +7,7 @@ import json
 import os
 import re
 import threading
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable
@@ -16,8 +17,10 @@ from core.chatgpt2api_admin import ChatGPT2APIAdminClient
 
 _MAX_ID = 160
 _MAX_REASON = 240
-_MAX_ITEMS = 50
-_STATES = {"pending", "refreshing", "ready", "replaced", "failed", "ambiguous", "conflict"}
+_MAX_ITEMS = 5_000
+_WORKERS = 5
+_STATES = {"pending", "queued", "refreshing", "ready", "replaced", "failed", "ambiguous", "conflict"}
+_FAILURE_STAGES = {"", "restart", "pre_liveness", "liveness", "pre_writeback", "writeback"}
 # Only dedicated secret endpoints are authoritative for credential evidence.
 # Email is verified by list mapping; password/client_id/last_refresh/id_token are
 # sanitized or lack a supported getter and must not be guessed.
@@ -37,20 +40,51 @@ _URL_RE = re.compile(r"https?://[^\s,;}\]\\\"'，。；！？、）】》]+", re
 _TOKENISH_RE = re.compile(r"(?<![A-Za-z0-9])[A-Za-z0-9_+/=-]{28,}(?:\.[A-Za-z0-9_+/=-]{8,})*")
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _OPERATION_LOCKS: dict[str, threading.RLock] = {}
-_OPERATION_LOCKS_GUARD = threading.Lock()
+_QUEUE_RUNTIMES: dict[str, "_QueueRuntime"] = {}
+_SHARED_STATE_GUARD = threading.Lock()
+_GLOBAL_EXECUTOR = ThreadPoolExecutor(max_workers=_WORKERS, thread_name_prefix="chatgpt2api-401")
+_QUEUE_CAPACITY = threading.BoundedSemaphore(_MAX_ITEMS)
+
+CHATGPT2API_401_MAX_ITEMS = _MAX_ITEMS
+CHATGPT2API_401_WORKERS = _WORKERS
+
+
+class ChatGPT2API401BusyError(RuntimeError):
+    """Raised when detection would invalidate an active in-process queue."""
+
+
+class _QueueRuntime:
+    """Process-local queue ownership for one persisted audit path."""
+
+    def __init__(self) -> None:
+        self.active_remote_ids: set[str] = set()
+
+
+def _path_key(path: Path) -> str:
+    try:
+        return str(path.resolve(strict=False))
+    except OSError:
+        return str(path.absolute())
 
 
 def _shared_operation_lock(path: Path) -> threading.RLock:
-    try:
-        key = str(path.resolve(strict=False))
-    except OSError:
-        key = str(path.absolute())
-    with _OPERATION_LOCKS_GUARD:
+    key = _path_key(path)
+    with _SHARED_STATE_GUARD:
         lock = _OPERATION_LOCKS.get(key)
         if lock is None:
             lock = threading.RLock()
             _OPERATION_LOCKS[key] = lock
         return lock
+
+
+def _shared_queue_runtime(path: Path) -> _QueueRuntime:
+    key = _path_key(path)
+    with _SHARED_STATE_GUARD:
+        runtime = _QUEUE_RUNTIMES.get(key)
+        if runtime is None:
+            runtime = _QueueRuntime()
+            _QUEUE_RUNTIMES[key] = runtime
+        return runtime
 
 
 def _now() -> str:
@@ -190,10 +224,21 @@ class ChatGPT2API401Service:
         self._liveness_fn = liveness_fn or liveness_runner.run_liveness_check
         self._audit_path = Path(audit_path) if audit_path is not None else Path(__file__).resolve().parent.parent / "chatgpt2api_401_audit.json"
         self._lock = threading.RLock()
-        self._operation_lock = _shared_operation_lock(self._audit_target())
+        audit_target = self._audit_target()
+        self._operation_lock = _shared_operation_lock(audit_target)
+        self._queue_runtime = _shared_queue_runtime(audit_target)
+        self._executor = _GLOBAL_EXECUTOR
         self._checked_at = ""
         self._remote_counts = {"total": 0, "invalid": 0, "healthy": 0}
-        self._tracked = self._load_audit()
+        self._recovered_interrupted = False
+        with self._operation_lock:
+            self._tracked = self._load_audit(
+                recover_interrupted=True,
+                active_remote_ids=set(self._queue_runtime.active_remote_ids),
+            )
+            if self._recovered_interrupted:
+                with self._lock:
+                    self._persist_locked()
 
     def _audit_target(self) -> Path:
         try:
@@ -235,6 +280,9 @@ class ChatGPT2API401Service:
         state = _text(raw.get("state") or "ambiguous", 32).lower()
         if state not in _STATES:
             state = "ambiguous"
+        failure_stage = _text(raw.get("failure_stage"), 32).lower()
+        if failure_stage not in _FAILURE_STAGES:
+            failure_stage = ""
         preserved = raw.get("preserved_sha256") if isinstance(raw.get("preserved_sha256"), dict) else {}
         return {
             "remote_id": _remote_id(raw.get("remote_id")),
@@ -242,6 +290,7 @@ class ChatGPT2API401Service:
             "local_account_id": _local_id(raw.get("local_account_id")),
             "state": state,
             "reason": _reason(raw.get("reason"), state),
+            "failure_stage": failure_stage,
             "old_at_sha256": _sha256(raw.get("old_at_sha256")),
             "new_at_sha256": _sha256(raw.get("new_at_sha256")),
             "preserved_sha256": {
@@ -249,6 +298,7 @@ class ChatGPT2API401Service:
                 for field in _PRESERVED_FIELDS
             },
             "detected_at": _text(raw.get("detected_at"), 64),
+            "queued_at": _text(raw.get("queued_at"), 64),
             "refresh_started_at": _text(raw.get("refresh_started_at"), 64),
             "refresh_completed_at": _text(raw.get("refresh_completed_at"), 64),
             "replaced_at": _text(raw.get("replaced_at"), 64),
@@ -256,7 +306,12 @@ class ChatGPT2API401Service:
             "replaceable": bool(raw.get("replaceable")) and state == "ready",
         }
 
-    def _load_audit(self) -> dict[str, dict]:
+    def _load_audit(
+        self,
+        *,
+        recover_interrupted: bool = False,
+        active_remote_ids: set[str] | None = None,
+    ) -> dict[str, dict]:
         try:
             payload = json.loads(self._audit_path.read_text(encoding="utf-8"))
         except (FileNotFoundError, json.JSONDecodeError, OSError):
@@ -280,16 +335,23 @@ class ChatGPT2API401Service:
             if stored_remote_id or not str(key).startswith("ambiguous-"):
                 value = {**value, "remote_id": stored_remote_id or key}
             item = self._sanitize_entry(value)
-            if item["state"] == "refreshing":
+            track_key = item["remote_id"] or _remote_id(key)
+            if (
+                recover_interrupted
+                and item["state"] in {"queued", "refreshing"}
+                and track_key not in (active_remote_ids or set())
+            ):
+                self._recovered_interrupted = True
                 item = self._sanitize_entry({
                     **item,
                     "state": "failed",
-                    "reason": "上次查活在完成前中断，必须重新执行并验证新 AT",
+                    "reason": "后台任务在完成前因进程中断，必须重新入队并验证新 AT",
+                    "failure_stage": "restart",
                     "new_at_sha256": "",
+                    "refresh_completed_at": _now(),
                     "retryable": True,
                     "replaceable": False,
                 })
-            track_key = item["remote_id"] or _remote_id(key)
             if track_key:
                 result[track_key] = item
         return result
@@ -298,13 +360,13 @@ class ChatGPT2API401Service:
         with self._lock:
             self._checked_at = ""
             self._remote_counts = {"total": 0, "invalid": 0, "healthy": 0}
-            self._tracked = self._load_audit()
+            self._tracked = self._load_audit(recover_interrupted=False)
 
     def _persist_locked(self) -> None:
         target = self._audit_target()
         target.parent.mkdir(parents=True, exist_ok=True)
         payload = {
-            "version": 1,
+            "version": 2,
             "updated_at": _now(),
             "checked_at": self._checked_at,
             "remote_counts": dict(self._remote_counts),
@@ -354,16 +416,16 @@ class ChatGPT2API401Service:
         return by_id, by_email
 
     @staticmethod
-    def _local_maps(rows: list[dict]) -> tuple[dict[int, dict], dict[str, list[dict]]]:
-        by_id: dict[int, dict] = {}
+    def _local_maps(rows: list[dict]) -> tuple[dict[int, list[dict]], dict[str, list[dict]]]:
+        by_id: dict[int, list[dict]] = {}
         by_email: dict[str, list[dict]] = {}
         for raw in rows:
             if not isinstance(raw, dict):
                 continue
             local_id = _local_id(raw.get("id") or raw.get("account_id"))
             email = _email(raw.get("email"))
-            if local_id and local_id not in by_id:
-                by_id[local_id] = raw
+            if local_id:
+                by_id.setdefault(local_id, []).append(raw)
             if email:
                 by_email.setdefault(email, []).append(raw)
         return by_id, by_email
@@ -376,9 +438,11 @@ class ChatGPT2API401Service:
             "local_account_id": clean["local_account_id"],
             "state": clean["state"],
             "reason": clean["reason"],
+            "failure_stage": clean["failure_stage"],
             "old_at_fingerprint": clean["old_at_sha256"][:12],
             "new_at_fingerprint": clean["new_at_sha256"][:12],
             "detected_at": clean["detected_at"],
+            "queued_at": clean["queued_at"],
             "refresh_started_at": clean["refresh_started_at"],
             "refresh_completed_at": clean["refresh_completed_at"],
             "replaced_at": clean["replaced_at"],
@@ -392,25 +456,39 @@ class ChatGPT2API401Service:
         for item in items:
             counts[item["state"]] += 1
         counts.update(self._remote_counts)
+        progress = {
+            "workers": _WORKERS,
+            "queued": counts["queued"],
+            "active": counts["refreshing"],
+            "completed": counts["replaced"],
+            "failed": counts["failed"] + counts["conflict"],
+        }
         return {
             "ok": True,
             "supported": True,
             "items": items,
             "counts": counts,
+            "progress": progress,
             "checked_at": self._checked_at,
         }
 
     def state(self) -> dict:
+        # Atomic replace makes an unlocked disk read safe, while reloading here
+        # keeps multiple service instances on the same audit path consistent.
+        self._reload_audit_locked()
         with self._lock:
             return self._state_locked()
 
     def detect(self) -> dict:
         with self._operation_lock:
             self._reload_audit_locked()
+            with self._lock:
+                if any(item.get("state") in {"queued", "refreshing"} for item in self._tracked.values()):
+                    raise ChatGPT2API401BusyError("后台查活写回队列仍在运行，请等待完成后重新检测")
             remote_rows = list(self._list_remote_fn() or [])
             local_rows = list(self._list_local_fn() or [])
             by_remote_id, by_remote_email = self._remote_maps(remote_rows)
-            _by_local_id, by_local_email = self._local_maps(local_rows)
+            by_local_id, by_local_email = self._local_maps(local_rows)
             checked_at = _now()
             invalid_rows = [row for row in remote_rows if isinstance(row, dict) and _remote_invalid(row)]
             next_tracked: dict[str, dict] = {}
@@ -424,10 +502,12 @@ class ChatGPT2API401Service:
                     "local_account_id": 0,
                     "state": "ambiguous",
                     "reason": "远端账号无法安全映射",
+                    "failure_stage": "",
                     "old_at_sha256": "",
                     "new_at_sha256": "",
                     "preserved_sha256": {},
                     "detected_at": checked_at,
+                    "queued_at": "",
                     "refresh_started_at": "",
                     "refresh_completed_at": "",
                     "replaced_at": "",
@@ -448,6 +528,8 @@ class ChatGPT2API401Service:
                     local_id = _local_id(local.get("id") or local.get("account_id"))
                     if not local_id:
                         base["reason"] = "本地账号缺少稳定 ID，禁止刷新与替换"
+                    elif len(by_local_id.get(local_id, [])) != 1:
+                        base["reason"] = "本地稳定 ID 重复，禁止刷新与替换"
                     else:
                         try:
                             snapshot = self._normalize_snapshot(self._snapshot_fn(remote_id))
@@ -515,108 +597,272 @@ class ChatGPT2API401Service:
             self._persist_locked()
             return item
 
-    def refresh(self, values: object, *, limit: int = _MAX_ITEMS) -> dict:
+    def refresh(self, values: object, *, opt_in: bool = False, limit: int = _MAX_ITEMS) -> dict:
+        """Persist selected jobs and submit them without waiting for liveness."""
+        if opt_in is not True:
+            return {
+                "ok": False,
+                "error": "confirm_replace 必须是字面量 true",
+                "queued_count": 0,
+                "workers": _WORKERS,
+                "skipped": [],
+            }
+
         with self._operation_lock:
             self._reload_audit_locked()
             selected, skipped = self.select_refreshable(values, limit=limit)
-            results: list[dict] = []
+            accepted: list[dict] = []
             for item in selected:
-                remote_id = item["remote_id"]
-                email = item["email"]
-                local_id = item["local_account_id"]
-                remote_rows = list(self._list_remote_fn() or [])
-                local_rows = list(self._list_local_fn() or [])
-                by_remote_id, by_remote_email = self._remote_maps(remote_rows)
-                by_local_id, by_local_email = self._local_maps(local_rows)
-                remote_matches = by_remote_id.get(remote_id, [])
-                local = by_local_id.get(local_id)
-                conflict_reason = ""
-                if len(remote_matches) != 1 or len(by_remote_email.get(email, [])) != 1:
-                    conflict_reason = "远端 ID 或邮箱映射已变化，查活已取消"
-                elif len(by_local_email.get(email, [])) != 1 or local is None or _email(local.get("email")) != email:
-                    conflict_reason = "本地账号映射已变化，查活已取消"
-                else:
-                    try:
-                        live_snapshot = self._normalize_snapshot(self._snapshot_fn(remote_id))
-                    except Exception as exc:
-                        conflict_reason = _reason(exc, "远端凭证快照复核失败")
-                    else:
-                        if not self._snapshot_complete(live_snapshot, remote_id):
-                            conflict_reason = "远端凭证快照不完整或账号 ID 不一致"
-                        elif live_snapshot["at_sha256"] != item["old_at_sha256"]:
-                            conflict_reason = "远端旧 AT 已变化，查活已取消"
-                        elif live_snapshot["preserved_sha256"] != item["preserved_sha256"]:
-                            conflict_reason = "远端保留字段已变化，查活已取消"
-                if conflict_reason:
-                    updated = self._set_item(remote_id, {
-                        "state": "conflict",
-                        "reason": conflict_reason,
-                        "retryable": False,
-                        "replaceable": False,
+                if not _QUEUE_CAPACITY.acquire(blocking=False):
+                    skipped.append({
+                        "remote_id": _public_remote_id(item.get("remote_id")),
+                        "reason": "后台队列容量已满",
                     })
-                    results.append({"remote_id": remote_id, "ok": False, "state": updated["state"], "reason": updated["reason"]})
                     continue
+                accepted.append(item)
+                self._queue_runtime.active_remote_ids.add(item["remote_id"])
 
-                before_local_sha = _hash_token(local.get("access_token"))
-                self._set_item(remote_id, {
-                    "state": "refreshing",
-                    "reason": "正在执行本地账号查活并持久化新 AT",
-                    "refresh_started_at": _now(),
-                    "retryable": False,
-                    "replaceable": False,
-                })
+            queued_at = _now()
+            try:
+                with self._lock:
+                    for item in accepted:
+                        remote_id = item["remote_id"]
+                        self._tracked[remote_id] = self._sanitize_entry({
+                            **item,
+                            "state": "queued",
+                            "reason": "已加入后台查活与精确 ID 写回队列",
+                            "failure_stage": "",
+                            "new_at_sha256": "",
+                            "queued_at": queued_at,
+                            "refresh_started_at": "",
+                            "refresh_completed_at": "",
+                            "replaced_at": "",
+                            "retryable": False,
+                            "replaceable": False,
+                        })
+                    if accepted:
+                        self._persist_locked()
+            except Exception:
+                for item in accepted:
+                    self._queue_runtime.active_remote_ids.discard(item["remote_id"])
+                    _QUEUE_CAPACITY.release()
+                raise
+
+            submitted: list[str] = []
+            for item in accepted:
+                remote_id = item["remote_id"]
                 try:
-                    liveness = self._liveness_fn(local_id)
+                    self._executor.submit(self._run_queued_item, remote_id)
                 except Exception as exc:
-                    liveness = {"ok": False, "error": _reason(exc, "本地查活执行失败")}
-                local_after_rows = list(self._list_local_fn() or [])
-                local_after_by_id, local_after_by_email = self._local_maps(local_after_rows)
-                local_after = local_after_by_id.get(local_id)
-                returned_sha = _hash_token(
-                    (liveness or {}).get("access_token") or (liveness or {}).get("accessToken")
-                ) if isinstance(liveness, dict) else ""
-                new_sha = _hash_token((local_after or {}).get("access_token"))
-                failure = ""
-                if not isinstance(liveness, dict) or liveness.get("ok") is not True:
-                    failure = _reason((liveness or {}).get("error") if isinstance(liveness, dict) else "", "本地查活失败")
-                elif not returned_sha:
-                    failure = "查活成功响应未返回可验证的新 AT"
-                elif local_after is None or _email(local_after.get("email")) != email or len(local_after_by_email.get(email, [])) != 1:
-                    failure = "查活后本地账号映射发生变化"
-                elif not new_sha:
-                    failure = "查活未在本地持久化可验证的新 AT"
-                elif returned_sha != new_sha:
-                    failure = "查活返回的 AT 与本地持久化 AT 不一致"
-                elif returned_sha == item["old_at_sha256"]:
-                    failure = "查活返回的 AT 与远端失效 AT 相同"
-                elif before_local_sha and new_sha == before_local_sha:
-                    failure = "查活未生成新的本地 AT"
-                if failure:
-                    updated = self._set_item(remote_id, {
+                    self._queue_runtime.active_remote_ids.discard(remote_id)
+                    _QUEUE_CAPACITY.release()
+                    self._set_item(remote_id, {
                         "state": "failed",
-                        "reason": failure,
-                        "new_at_sha256": "",
+                        "reason": _reason(exc, "后台执行器无法接收任务"),
+                        "failure_stage": "restart",
                         "refresh_completed_at": _now(),
                         "retryable": True,
                         "replaceable": False,
                     })
-                    results.append({"remote_id": remote_id, "ok": False, "state": updated["state"], "reason": updated["reason"]})
-                    continue
-                updated = self._set_item(remote_id, {
-                    "state": "ready",
-                    "reason": "本地查活成功且新 AT 已持久化；等待显式确认 PATCH",
-                    "new_at_sha256": new_sha,
-                    "refresh_completed_at": _now(),
-                    "retryable": False,
-                    "replaceable": True,
-                })
-                results.append({"remote_id": remote_id, "ok": True, "state": updated["state"], "reason": updated["reason"]})
+                    skipped.append({
+                        "remote_id": _public_remote_id(remote_id),
+                        "reason": "后台执行器无法接收任务，请稍后重试",
+                    })
+                else:
+                    submitted.append(remote_id)
+
+            with self._lock:
+                progress = dict(self._state_locked()["progress"])
             return {
                 "ok": True,
-                "items": results,
-                "refreshed_count": sum(1 for item in results if item["ok"]),
+                "queued_count": len(submitted),
+                "workers": _WORKERS,
                 "skipped": skipped,
+                "progress": progress,
             }
+
+    def _run_queued_item(self, remote_id: str) -> None:
+        try:
+            self._refresh_and_replace(remote_id)
+        except Exception as exc:
+            with self._operation_lock:
+                self._reload_audit_locked()
+                with self._lock:
+                    current = self._tracked.get(remote_id)
+                    state = (current or {}).get("state")
+                if state in {"queued", "refreshing", "ready"}:
+                    self._set_item(remote_id, {
+                        "state": "conflict" if state == "ready" else "failed",
+                        "reason": _reason(exc, "后台查活写回任务异常终止"),
+                        "failure_stage": "writeback" if state == "ready" else "liveness",
+                        "refresh_completed_at": _now(),
+                        "retryable": state != "ready",
+                        "replaceable": False,
+                    })
+        finally:
+            with self._operation_lock:
+                self._queue_runtime.active_remote_ids.discard(remote_id)
+            _QUEUE_CAPACITY.release()
+
+    def _refresh_and_replace(self, remote_id: str) -> None:
+        with self._operation_lock:
+            self._reload_audit_locked()
+            with self._lock:
+                raw_item = self._tracked.get(remote_id)
+                item = self._sanitize_entry(raw_item) if raw_item else None
+            if not item or item["state"] != "queued":
+                return
+
+            email = item["email"]
+            local_id = item["local_account_id"]
+            conflict_reason = ""
+            local = None
+            try:
+                remote_rows = list(self._list_remote_fn() or [])
+                local_rows = list(self._list_local_fn() or [])
+                by_remote_id, by_remote_email = self._remote_maps(remote_rows)
+                by_local_id, by_local_email = self._local_maps(local_rows)
+                local_matches = by_local_id.get(local_id, [])
+                local = local_matches[0] if len(local_matches) == 1 else None
+                if len(by_remote_id.get(remote_id, [])) != 1 or len(by_remote_email.get(email, [])) != 1:
+                    conflict_reason = "远端 ID 或邮箱映射已变化，查活已取消"
+                elif len(local_matches) != 1 or len(by_local_email.get(email, [])) != 1 or local is None or _email(local.get("email")) != email:
+                    conflict_reason = "本地账号映射已变化，查活已取消"
+                else:
+                    live_snapshot = self._normalize_snapshot(self._snapshot_fn(remote_id))
+                    if not self._snapshot_complete(live_snapshot, remote_id):
+                        conflict_reason = "远端凭证快照不完整或账号 ID 不一致"
+                    elif live_snapshot["at_sha256"] != item["old_at_sha256"]:
+                        conflict_reason = "远端旧 AT 已变化，查活已取消"
+                    elif live_snapshot["preserved_sha256"] != item["preserved_sha256"]:
+                        conflict_reason = "远端保留字段已变化，查活已取消"
+            except Exception as exc:
+                conflict_reason = _reason(exc, "查活前快照复核失败")
+
+            if conflict_reason:
+                self._set_item(remote_id, {
+                    "state": "conflict",
+                    "reason": conflict_reason,
+                    "failure_stage": "pre_liveness",
+                    "refresh_completed_at": _now(),
+                    "retryable": False,
+                    "replaceable": False,
+                })
+                return
+
+            before_local_sha = _hash_token((local or {}).get("access_token"))
+            self._set_item(remote_id, {
+                "state": "refreshing",
+                "reason": "正在执行本地账号查活并持久化新 AT",
+                "failure_stage": "",
+                "refresh_started_at": _now(),
+                "retryable": False,
+                "replaceable": False,
+            })
+
+        try:
+            liveness = self._liveness_fn(local_id)
+        except Exception as exc:
+            liveness = {"ok": False, "error": _reason(exc, "本地查活执行失败")}
+
+        local_after = None
+        local_after_by_email: dict[str, list[dict]] = {}
+        local_read_error = ""
+        try:
+            local_after_rows = list(self._list_local_fn() or [])
+            local_after_by_id, local_after_by_email = self._local_maps(local_after_rows)
+            local_after_matches = local_after_by_id.get(local_id, [])
+            local_after = local_after_matches[0] if len(local_after_matches) == 1 else None
+        except Exception as exc:
+            local_read_error = _reason(exc, "查活后本地账号读取失败")
+        returned_sha = _hash_token(
+            (liveness or {}).get("access_token") or (liveness or {}).get("accessToken")
+        ) if isinstance(liveness, dict) else ""
+        new_sha = _hash_token((local_after or {}).get("access_token"))
+        failure = local_read_error
+        if not failure and (not isinstance(liveness, dict) or liveness.get("ok") is not True):
+            failure = _reason((liveness or {}).get("error") if isinstance(liveness, dict) else "", "本地查活失败")
+        elif not failure and not returned_sha:
+            failure = "查活成功响应未返回可验证的新 AT"
+        elif not failure and (
+            len(local_after_matches) != 1
+            or local_after is None
+            or _email(local_after.get("email")) != email
+            or len(local_after_by_email.get(email, [])) != 1
+        ):
+            failure = "查活后本地账号映射发生变化"
+        elif not failure and not new_sha:
+            failure = "查活未在本地持久化可验证的新 AT"
+        elif not failure and returned_sha != new_sha:
+            failure = "查活返回的 AT 与本地持久化 AT 不一致"
+        elif not failure and returned_sha == item["old_at_sha256"]:
+            failure = "查活返回的 AT 与远端失效 AT 相同"
+        elif not failure and before_local_sha and new_sha == before_local_sha:
+            failure = "查活未生成新的本地 AT"
+
+        with self._operation_lock:
+            self._reload_audit_locked()
+            with self._lock:
+                current_raw = self._tracked.get(remote_id)
+                current = self._sanitize_entry(current_raw) if current_raw else None
+            if not current or current["state"] != "refreshing":
+                return
+            if (
+                current["email"] != item["email"]
+                or current["local_account_id"] != item["local_account_id"]
+                or current["old_at_sha256"] != item["old_at_sha256"]
+                or current["preserved_sha256"] != item["preserved_sha256"]
+            ):
+                failure = "查活期间锁定任务快照发生变化"
+                self._set_item(remote_id, {
+                    "state": "conflict",
+                    "reason": failure,
+                    "failure_stage": "liveness",
+                    "new_at_sha256": "",
+                    "refresh_completed_at": _now(),
+                    "retryable": False,
+                    "replaceable": False,
+                })
+                return
+            if failure:
+                self._set_item(remote_id, {
+                    "state": "failed",
+                    "reason": failure,
+                    "failure_stage": "liveness",
+                    "new_at_sha256": "",
+                    "refresh_completed_at": _now(),
+                    "retryable": True,
+                    "replaceable": False,
+                })
+                return
+            self._set_item(remote_id, {
+                "state": "ready",
+                "reason": "本地查活成功且新 AT 已持久化；正在自动精确写回锁定远端 ID",
+                "failure_stage": "",
+                "new_at_sha256": new_sha,
+                "refresh_completed_at": _now(),
+                "retryable": False,
+                "replaceable": True,
+            })
+
+            # Keep the transient ready state and automatic writeback under the
+            # same re-entrant gate so detection cannot replace its audit entry.
+            result = self.replace([remote_id], opt_in=True, limit=1)
+            result_items = result.get("items") if isinstance(result, dict) else None
+            if isinstance(result_items, list) and result_items:
+                return
+            self._reload_audit_locked()
+            with self._lock:
+                current = self._tracked.get(remote_id)
+                state = (current or {}).get("state")
+            if state == "ready":
+                self._set_item(remote_id, {
+                    "state": "conflict",
+                    "reason": "自动写回未返回锁定远端 ID 的验证结果",
+                    "failure_stage": "writeback",
+                    "retryable": False,
+                    "replaceable": False,
+                })
 
     def replace(self, values: object, *, opt_in: bool = False, limit: int = _MAX_ITEMS) -> dict:
         selected_ids = _selected_ids(values, limit=limit)
@@ -649,11 +895,12 @@ class ChatGPT2API401Service:
                 local_rows = list(self._list_local_fn() or [])
                 by_remote_id, by_remote_email = self._remote_maps(remote_rows)
                 by_local_id, by_local_email = self._local_maps(local_rows)
-                local = by_local_id.get(local_id)
+                local_matches = by_local_id.get(local_id, [])
+                local = local_matches[0] if len(local_matches) == 1 else None
                 failure = ""
                 if len(by_remote_id.get(remote_id, [])) != 1 or len(by_remote_email.get(email, [])) != 1:
                     failure = "PATCH 前远端 ID 或邮箱映射已变化"
-                elif local is None or _email(local.get("email")) != email or len(by_local_email.get(email, [])) != 1:
+                elif len(local_matches) != 1 or local is None or _email(local.get("email")) != email or len(by_local_email.get(email, [])) != 1:
                     failure = "PATCH 前本地账号映射已变化"
                 else:
                     try:
@@ -679,6 +926,7 @@ class ChatGPT2API401Service:
                     updated = self._set_item(remote_id, {
                         "state": "conflict",
                         "reason": failure,
+                        "failure_stage": "pre_writeback",
                         "retryable": False,
                         "replaceable": False,
                     })
@@ -705,6 +953,7 @@ class ChatGPT2API401Service:
                     updated = self._set_item(remote_id, {
                         "state": "conflict",
                         "reason": _reason(exc, "PATCH 后验证失败"),
+                        "failure_stage": "writeback",
                         "retryable": False,
                         "replaceable": False,
                     })
@@ -714,6 +963,7 @@ class ChatGPT2API401Service:
                 updated = self._set_item(remote_id, {
                     "state": "replaced",
                     "reason": "远端旧 AT 摘要已变化，锁定 ID 保持存在且保留字段未变",
+                    "failure_stage": "",
                     "replaced_at": _now(),
                     "retryable": False,
                     "replaceable": False,
@@ -727,4 +977,9 @@ class ChatGPT2API401Service:
             }
 
 
-__all__ = ["ChatGPT2API401Service"]
+__all__ = [
+    "CHATGPT2API_401_MAX_ITEMS",
+    "CHATGPT2API_401_WORKERS",
+    "ChatGPT2API401BusyError",
+    "ChatGPT2API401Service",
+]

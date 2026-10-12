@@ -1,0 +1,64 @@
+ChatGPT2API 401 queue auto-writeback verification
+Generated: 2026-10-12T19:09:21Z
+Base commit: 178590c4479a67ea4910b202e353c4d7d90cf7e8
+
+USER-VISIBLE GOAL
+- Replace synchronous /api/chatgpt2api-401/refresh with immediate HTTP 202 background queue.
+- Support select-all beyond 50 with bounded maximum 5000.
+- Reuse normal liveness, fixed concurrency 5.
+- Automatically update the exact locked ChatGPT2API remote ID after validated liveness.
+- Prove new AT hash changed and preserved RT hash did not change.
+
+CHANGED PATHS
+.trellis/spec/backend/chatgpt2api-credential-rotation.md
+core/chatgpt2api_401_service.py
+tests/test_chatgpt2api_401_service.py
+tests/test_chatgpt2api_401_templates.py
+tests/test_webui_chatgpt2api_401.py
+webui/app.py
+webui/templates/chatgpt2api_401.html
+.trellis/tasks/10-13-chatgpt2api-401-queue-writeback/prd.md
+
+ARTIFACT HASHES
+MODIFIED_FILE.tar.gz  063961ab254f1f68af3bebd4060602706bbbbdf09e9a3ef29cdba69eff3b2aab
+DIFF_FILE.patch       a9b46cc23c5af9ebd721defe501d00481745e3b55589cacba9960aaf8bb7d61e
+ROLLBACK.sh           a679676e7bc1e97f26c7ae20e38eb7cea6b1b3a0248ecaae45fc63bf0db13e34
+
+FOCUSED + RELATED REGRESSION
+Command: .venv/bin/python -m unittest -v [14 ChatGPT2API/liveness/Sub2API/Codex modules]
+Result: Ran 152 tests in 4.391s — OK
+Log: /tmp/chatgpt2api-queue-related-final.log
+
+STATIC CHECKS
+- py_compile: PASS
+- extracted inline JS node --check: PASS
+- git diff --check: PASS
+
+FULL REGRESSION
+Command: .venv/bin/python -m unittest discover -s tests -v
+Result: Ran 469 tests in 9.726s — 467 passed; 2 failed.
+Unrelated failures:
+1. tests.test_chatgpt_auth_context.ChatgptAuthContextTests.test_ensure_authorize_context_matches_20260914_capture_shape
+   Exact error: KeyError: 'ext-oai-did'
+2. tests.test_remail_client.RemailClientTests.test_restore_context_requires_exact_email_match
+   Exact failure: AssertionError: unexpectedly None
+Clean-HEAD proof: both exact tests fail identically in detached worktree at 178590c4479a67ea4910b202e353c4d7d90cf7e8.
+
+PATCH / ROLLBACK PROOF
+- Applied DIFF_FILE.patch to detached worktree at 178590c4479a67ea4910b202e353c4d7d90cf7e8: PASS.
+- SHA-256 manifest for all changed source/PRD files equals current modified manifest: PASS.
+- Executed ROLLBACK.sh against patched detached worktree: PASS.
+- Tracked paths match 178590c4479a67ea4910b202e353c4d7d90cf7e8 and task directory is absent after rollback: PASS.
+
+SECURITY / STATE CONTRACT
+- API requires literal confirm_replace=true and returns HTTP 202 before liveness completes.
+- Queue is process-shared per audit path, bounded to 5000 outstanding tasks, fixed at 5 workers.
+- Duplicate queued/refreshing IDs are skipped.
+- Each worker revalidates exact remote/local identity plus old AT/RT hashes before liveness.
+- The normal liveness runner must persist a new AT distinct from old remote/local hashes.
+- Existing exact-ID writeback verifies exact updated_ids, new AT readback, and unchanged RT hash.
+- Secrets and upstream response bodies are not persisted or returned.
+- Interrupted queued/refreshing/ready writeback states recover as bounded retryable failures.
+
+PRODUCTION
+- Not performed in this verification artifact. Deployment and a small-batch Oracle smoke test happen only after commit.

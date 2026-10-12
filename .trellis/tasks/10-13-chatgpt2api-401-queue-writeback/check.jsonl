@@ -1,0 +1,4 @@
+{"file": ".trellis/spec/backend/chatgpt2api-credential-rotation.md", "reason": "Verify queue, restart recovery, liveness evidence, exact-ID AT-only writeback, and RT preservation behavior."}
+{"file": ".trellis/spec/backend/error-handling.md", "reason": "Verify invalid input, duplicate/skipped outcomes, bounded reasons, and safe status codes."}
+{"file": ".trellis/spec/backend/quality-guidelines.md", "reason": "Verify focused and regression tests, Python compilation, template JavaScript syntax, and secret exclusion."}
+{"file": ".trellis/spec/guides/cross-layer-thinking-guide.md", "reason": "Verify API/service/template state shapes and polling lifecycle remain consistent."}

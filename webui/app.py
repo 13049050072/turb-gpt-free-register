@@ -22,7 +22,11 @@ from flask import Flask, Response, jsonify, make_response, render_template, requ
 import pyotp
 
 from core import codex_retry_service, db, plan_check_service, extract_link_service, codex_agent_service, live_check_service
-from core.chatgpt2api_401_service import ChatGPT2API401Service
+from core.chatgpt2api_401_service import (
+    CHATGPT2API_401_MAX_ITEMS,
+    ChatGPT2API401BusyError,
+    ChatGPT2API401Service,
+)
 from core.chatgpt2api_admin import ChatGPT2APIAdminError
 from core.sub2api_401_service import Sub2Api401Service, Sub2ApiSnapshotConflict
 from core.sub2api_admin import Sub2ApiAdminError
@@ -2973,6 +2977,8 @@ def create_app(auth_code: str | None = None) -> Flask:
         return response
 
     def _chatgpt2api_401_error(exc: Exception) -> tuple[str, int]:
+        if isinstance(exc, ChatGPT2API401BusyError):
+            return str(exc), 409
         if isinstance(exc, ChatGPT2APIAdminError):
             messages = {
                 "auth": "ChatGPT2API 管理接口认证失败，请检查管理密钥",
@@ -2995,9 +3001,22 @@ def create_app(auth_code: str | None = None) -> Flask:
         remote_ids = data.get("remote_ids")
         if not isinstance(remote_ids, list) or not remote_ids:
             return [], _chatgpt2api_401_response({"ok": False, "error": "remote_ids 必须是非空数组"}, 400)
-        if len(remote_ids) > 50:
-            return [], _chatgpt2api_401_response({"ok": False, "error": "单次最多选择 50 个账号"}, 400)
-        return remote_ids, None
+        if len(remote_ids) > CHATGPT2API_401_MAX_ITEMS:
+            return [], _chatgpt2api_401_response({
+                "ok": False,
+                "error": f"单次最多选择 {CHATGPT2API_401_MAX_ITEMS} 个账号",
+            }, 400)
+        if any(
+            not isinstance(value, str)
+            or not value.strip()
+            or len(value.strip()) > 160
+            for value in remote_ids
+        ):
+            return [], _chatgpt2api_401_response({
+                "ok": False,
+                "error": "remote_ids 必须只包含长度不超过 160 的非空字符串稳定 ID",
+            }, 400)
+        return [value.strip() for value in remote_ids], None
 
     @app.get("/api/chatgpt2api-401/state")
     def api_chatgpt2api_401_state():
@@ -3016,15 +3035,26 @@ def create_app(auth_code: str | None = None) -> Flask:
 
     @app.post("/api/chatgpt2api-401/refresh")
     def api_chatgpt2api_401_refresh():
-        """对用户选中的安全映射账号执行本地查活并持久化新 AT。"""
-        remote_ids, error_response = _chatgpt2api_401_ids(request.get_json(silent=True))
+        """确认后将安全映射账号加入后台查活与精确 ID 写回队列。"""
+        data = request.get_json(silent=True)
+        remote_ids, error_response = _chatgpt2api_401_ids(data)
         if error_response is not None:
             return error_response
+        if data.get("confirm_replace") is not True:
+            return _chatgpt2api_401_response({
+                "ok": False,
+                "error": "confirm_replace 必须是字面量 true",
+            }, 400)
         try:
-            return _chatgpt2api_401_response(chatgpt2api_401_service.refresh(remote_ids, limit=50))
+            result = chatgpt2api_401_service.refresh(
+                remote_ids,
+                opt_in=True,
+                limit=CHATGPT2API_401_MAX_ITEMS,
+            )
+            return _chatgpt2api_401_response(result, 202)
         except Exception as exc:
             error, status = _chatgpt2api_401_error(exc)
-            logger.warning("ChatGPT2API 401 查活失败: %s", error)
+            logger.warning("ChatGPT2API 401 后台入队失败: %s", error)
             return _chatgpt2api_401_response({"ok": False, "error": error}, status)
 
     @app.post("/api/chatgpt2api-401/replace")
@@ -3038,7 +3068,7 @@ def create_app(auth_code: str | None = None) -> Flask:
             return _chatgpt2api_401_response(chatgpt2api_401_service.replace(
                 remote_ids,
                 opt_in=data.get("confirm_replace") is True,
-                limit=50,
+                limit=CHATGPT2API_401_MAX_ITEMS,
             ))
         except Exception as exc:
             error, status = _chatgpt2api_401_error(exc)

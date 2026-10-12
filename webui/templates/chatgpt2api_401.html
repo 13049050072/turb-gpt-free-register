@@ -10,9 +10,9 @@
     .wrap{max-width:1420px;margin:0 auto;padding:28px 20px 56px}.top{display:flex;align-items:flex-start;justify-content:space-between;gap:20px;margin-bottom:18px}h1{font-size:25px;line-height:1.25;margin:0 0 5px}.muted{color:var(--muted)}a{color:var(--primary);text-decoration:none}
     .panel{background:var(--surface);border:1px solid var(--line);border-radius:8px;padding:18px;margin-bottom:16px}.toolbar{display:flex;flex-wrap:wrap;align-items:center;gap:10px}.spacer{flex:1}
     button{font:inherit;border:1px solid var(--line);border-radius:7px;padding:9px 13px;background:#fff;color:var(--text);cursor:pointer;font-weight:650}button.primary{background:var(--primary);border-color:var(--primary);color:#fff}button.danger{border-color:#f0a39c;background:#fff7f6;color:var(--danger)}button:disabled{opacity:.48;cursor:not-allowed}
-    .counts{display:grid;grid-template-columns:repeat(6,minmax(105px,1fr));gap:9px;margin-top:14px}.metric{border:1px solid var(--line);border-radius:7px;padding:10px 12px}.metric b{display:block;font-size:20px}.notice{margin-top:12px;padding:10px 12px;border-left:3px solid #e2a73b;background:#fff8e8;color:#714b00}.notice.error{border-color:#e56b61;background:#fff3f2;color:var(--danger)}.notice.ok{border-color:#54b58a;background:#edfdf4;color:var(--ok)}
+    .counts{display:grid;grid-template-columns:repeat(auto-fit,minmax(105px,1fr));gap:9px;margin-top:14px}.metric{border:1px solid var(--line);border-radius:7px;padding:10px 12px}.metric b{display:block;font-size:20px}.notice{margin-top:12px;padding:10px 12px;border-left:3px solid #e2a73b;background:#fff8e8;color:#714b00}.notice.error{border-color:#e56b61;background:#fff3f2;color:var(--danger)}.notice.ok{border-color:#54b58a;background:#edfdf4;color:var(--ok)}
     .table-wrap{overflow:auto;padding:0}table{width:100%;border-collapse:collapse;min-width:1220px}th,td{border-bottom:1px solid #e9edf2;padding:11px 10px;text-align:left;vertical-align:top}th{font-size:12px;color:var(--muted);background:#f8fafc}tbody tr:last-child td{border-bottom:0}.id{max-width:260px;word-break:break-all;font:12px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace}
-    .badge{display:inline-block;padding:3px 8px;border-radius:999px;font-size:12px;font-weight:700}.pending{background:#fff5e5;color:var(--warn)}.refreshing{background:#edf4ff;color:#175cd3}.ready{background:#eef4ff;color:#3538cd}.replaced{background:#ecfdf3;color:var(--ok)}.failed,.ambiguous,.conflict{background:#fff1f0;color:var(--danger)}
+    .badge{display:inline-block;padding:3px 8px;border-radius:999px;font-size:12px;font-weight:700}.pending{background:#fff5e5;color:var(--warn)}.queued,.refreshing{background:#edf4ff;color:#175cd3}.ready{background:#eef4ff;color:#3538cd}.replaced{background:#ecfdf3;color:var(--ok)}.failed,.ambiguous,.conflict{background:#fff1f0;color:var(--danger)}
     .preview{margin:12px 0 0;white-space:pre-wrap;word-break:break-all;background:#151b26;color:#e8edf5;border-radius:7px;padding:12px;max-height:260px;overflow:auto}.hidden{display:none}
     @media(max-width:900px){.top{flex-direction:column}.counts{grid-template-columns:repeat(2,minmax(0,1fr))}.wrap{padding:20px 12px 40px}}
   </style>
@@ -20,25 +20,27 @@
 <body>
 <div class="wrap">
   <div class="top">
-    <div><h1>ChatGPT2API 401 AT 安全替换</h1><div class="muted">锁定远端 ID 与唯一邮箱映射，查活刷新本地 AT，显式确认后原位替换并验证摘要。</div></div>
+    <div><h1>ChatGPT2API 401 AT 安全替换</h1><div class="muted">锁定远端 ID 与唯一邮箱映射，以固定 5 并发后台查活，并自动原位写回通过验证的新 AT。</div></div>
     <a href="/">返回控制台</a>
   </div>
   <section class="panel">
     <div class="toolbar">
       <button class="primary" id="detectBtn">检测失效 / 401</button>
-      <button id="refreshBtn" disabled>查活刷新（已选 0）</button>
+      <button id="refreshBtn" disabled>查活并写回（已选 0）</button>
       <button class="danger" id="replaceBtn" disabled>确认原位替换（已选 0）</button>
       <span class="spacer"></span><span class="muted" id="checkedAt">正在读取审计状态…</span>
     </div>
     <div class="counts">
       <div class="metric"><span class="muted">远端失效</span><b id="invalidCount">0</b></div>
-      <div class="metric"><span class="muted">待查活</span><b id="pendingCount">0</b></div>
-      <div class="metric"><span class="muted">待确认替换</span><b id="readyCount">0</b></div>
+      <div class="metric"><span class="muted">队列等待</span><b id="queuedCount">0</b></div>
+      <div class="metric"><span class="muted">正在查活</span><b id="activeCount">0</b></div>
+      <div class="metric"><span class="muted">待查活 / 重试</span><b id="pendingCount">0</b></div>
+      <div class="metric"><span class="muted">历史待写回</span><b id="readyCount">0</b></div>
       <div class="metric"><span class="muted">已验证替换</span><b id="replacedCount">0</b></div>
-      <div class="metric"><span class="muted">映射冲突</span><b id="ambiguousCount">0</b></div>
+      <div class="metric"><span class="muted">失败 / 冲突</span><b id="ambiguousCount">0</b></div>
       <div class="metric"><span class="muted">远端正常</span><b id="healthyCount">0</b></div>
     </div>
-    <div class="notice">仅处理状态明确为 AT 失效或 401、远端 ID 唯一、且邮箱只映射到一个本地账号的记录。替换请求只锁定原远端 ID；邮箱、密码、RT、客户端 ID 和上次刷新字段必须保持不变。</div>
+    <div class="notice">“查活并写回”会把所有选中候选加入后台队列（固定并发 5），每个账号取得并持久化可验证的新 AT 后，自动只更新检测时锁定的 ChatGPT2API 远端 ID。RT 仅作为必须保持不变的摘要证据，不会写入远端。</div>
     <div id="message"></div>
     <pre id="preview" class="preview hidden"></pre>
   </section>
@@ -54,8 +56,10 @@
   const $ = selector => document.querySelector(selector);
   const selected = new Set();
   let items = [];
+  let pollTimer = null;
+  let stateLoading = false;
   const esc = value => String(value ?? '').replace(/[&<>"']/g, ch => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch]));
-  const labels = {pending:'待查活',refreshing:'查活中',ready:'待确认替换',replaced:'已替换',failed:'查活失败',ambiguous:'映射不明确',conflict:'快照冲突'};
+  const labels = {pending:'待查活',queued:'队列等待',refreshing:'查活中',ready:'历史待写回',replaced:'已替换',failed:'查活失败',ambiguous:'映射不明确',conflict:'快照冲突'};
   async function api(path, options={}) {
     const response = await fetch(path, {...options, headers:{'Content-Type':'application/json', ...(options.headers || {})}});
     const data = await response.json().catch(() => ({ok:false,error:`HTTP ${response.status}`}));
@@ -65,13 +69,16 @@
   function showMessage(text='', kind='') { $('#message').innerHTML = text ? `<div class="notice ${kind}">${esc(text)}</div>` : ''; }
   function updateCounts(data) {
     const counts = data.counts || {};
+    const progress = data.progress || {};
     $('#invalidCount').textContent = counts.invalid || 0;
+    $('#queuedCount').textContent = progress.queued || counts.queued || 0;
+    $('#activeCount').textContent = progress.active || counts.refreshing || 0;
     $('#pendingCount').textContent = (counts.pending || 0) + (counts.failed || 0);
     $('#readyCount').textContent = counts.ready || 0;
     $('#replacedCount').textContent = counts.replaced || 0;
     $('#ambiguousCount').textContent = (counts.ambiguous || 0) + (counts.conflict || 0);
     $('#healthyCount').textContent = counts.healthy || 0;
-    $('#checkedAt').textContent = data.checked_at ? `检测时间 ${new Date(data.checked_at).toLocaleString()}` : '尚未执行远端检测';
+    $('#checkedAt').textContent = data.checked_at ? `检测时间 ${new Date(data.checked_at).toLocaleString()} · 后台并发 ${progress.workers || 5}` : `尚未执行远端检测 · 后台并发 ${progress.workers || 5}`;
   }
   function actionable(item) { return item.retryable || item.replaceable; }
   function render() {
@@ -81,22 +88,46 @@
       <td class="id">${esc(item.remote_id)}</td><td>${esc(item.email || '—')}</td><td>${esc(item.local_account_id || '—')}</td>
       <td><span class="badge ${esc(item.state)}">${esc(labels[item.state] || item.state)}</span></td><td>${esc(item.reason)}</td>
       <td class="id">${esc(item.old_at_fingerprint || '—')}</td><td class="id">${esc(item.new_at_fingerprint || '—')}</td>
-      <td>${esc(item.replaced_at || item.refresh_completed_at || item.detected_at || '—')}</td>
+      <td>${esc(item.replaced_at || item.refresh_completed_at || item.refresh_started_at || item.queued_at || item.detected_at || '—')}</td>
     </tr>`).join('') || '<tr><td colspan="9" class="muted">未发现可处理的 ChatGPT2API 失效账号。</td></tr>';
     const refreshIds = [...selected].filter(remoteId => items.some(item => item.remote_id === remoteId && item.retryable));
     const replaceIds = [...selected].filter(remoteId => items.some(item => item.remote_id === remoteId && item.replaceable));
     $('#refreshBtn').disabled = refreshIds.length === 0;
-    $('#refreshBtn').textContent = `查活刷新（已选 ${refreshIds.length}）`;
+    $('#refreshBtn').textContent = `查活并写回（已选 ${refreshIds.length}）`;
     $('#replaceBtn').disabled = replaceIds.length === 0;
     $('#replaceBtn').textContent = `确认原位替换（已选 ${replaceIds.length}）`;
     const available = items.filter(actionable);
+    const queueRunning = items.some(item => item.state === 'queued' || item.state === 'refreshing');
+    $('#detectBtn').disabled = queueRunning;
     $('#selectAll').checked = available.length > 0 && available.every(item => selected.has(item.remote_id));
     $('#selectAll').indeterminate = selected.size > 0 && !$('#selectAll').checked;
   }
-  function applyData(data) { items = data.items || []; updateCounts(data); render(); }
+  function schedulePolling(data) {
+    const progress = data.progress || {};
+    const running = Number(progress.queued || 0) + Number(progress.active || 0) > 0;
+    if (!running && pollTimer) {
+      clearTimeout(pollTimer);
+      pollTimer = null;
+    }
+    if (running && !pollTimer) {
+      pollTimer = setTimeout(async () => {
+        pollTimer = null;
+        await loadState();
+      }, 3000);
+    }
+  }
+  function applyData(data) {
+    items = data.items || [];
+    updateCounts(data);
+    render();
+    schedulePolling(data);
+  }
   async function loadState() {
+    if (stateLoading) return;
+    stateLoading = true;
     try { applyData(await api('/api/chatgpt2api-401/state')); }
     catch (error) { showMessage(error.message, 'error'); }
+    finally { stateLoading = false; }
   }
   $('#detectBtn').addEventListener('click', async () => {
     $('#detectBtn').disabled = true; $('#preview').classList.add('hidden'); showMessage('正在读取远端状态并建立锁定快照…');
@@ -105,17 +136,20 @@
       selected.clear(); applyData(data);
       showMessage(items.length ? '检测完成。仅唯一映射且摘要可验证的记录可执行查活。' : '检测完成，未发现明确失效或 401 的安全候选。', 'ok');
     } catch (error) { showMessage(error.message, 'error'); }
-    finally { $('#detectBtn').disabled = false; }
+    finally { render(); }
   });
   $('#refreshBtn').addEventListener('click', async () => {
     const remoteIds = [...selected].filter(remoteId => items.some(item => item.remote_id === remoteId && item.retryable));
-    if (!remoteIds.length || !confirm(`确认对选中的 ${remoteIds.length} 个唯一映射本地账号执行查活？\n\n新 AT 只会先持久化到本地，当前步骤不会修改远端账号。`)) return;
-    $('#refreshBtn').disabled = true; showMessage('正在执行本地查活，完成前请保持页面打开…');
+    if (!remoteIds.length || !confirm(`确认将选中的 ${remoteIds.length} 个账号加入后台队列？\n\n队列固定并发 5；每个账号查活成功并持久化新 AT 后，会自动更新检测时锁定的 ChatGPT2API 远端 ID。`)) return;
+    $('#refreshBtn').disabled = true;
+    showMessage('正在提交后台队列…');
     try {
-      const result = await api('/api/chatgpt2api-401/refresh', {method:'POST', body:JSON.stringify({remote_ids:remoteIds})});
-      await loadState(); selected.clear(); render();
-      const failed = (result.items || []).filter(item => !item.ok).length;
-      showMessage(failed ? `查活完成，${failed} 个账号未获得可验证的新 AT。` : '查活完成，新 AT 已持久化到本地并通过摘要变化检查。', failed ? 'error' : 'ok');
+      const result = await api('/api/chatgpt2api-401/refresh', {method:'POST', body:JSON.stringify({remote_ids:remoteIds, confirm_replace:true})});
+      schedulePolling(result);
+      selected.clear();
+      await loadState();
+      const skipped = (result.skipped || []).length;
+      showMessage(`已加入后台队列（并发 5）：${result.queued_count || 0} 个${skipped ? `，跳过 ${skipped} 个` : ''}。页面可关闭，进度会持续持久化。`, 'ok');
     } catch (error) { showMessage(error.message, 'error'); }
     finally { render(); }
   });

@@ -9,7 +9,8 @@ class ChatGPT2API401TemplateTests(unittest.TestCase):
         for text in (
             "ChatGPT2API 401 AT 安全替换",
             "检测失效 / 401",
-            "查活刷新",
+            "查活并写回",
+            "后台队列（固定并发 5）",
             "确认原位替换",
             "远端稳定 ID",
             "旧 AT 摘要",
@@ -20,9 +21,16 @@ class ChatGPT2API401TemplateTests(unittest.TestCase):
             "/api/chatgpt2api-401/replace",
             "confirm_replace:false",
             "confirm_replace:true",
+            "setTimeout",
+            "3000",
+            "schedulePolling(result)",
+            "queued",
+            "refreshing",
         ):
             self.assertIn(text, page)
         self.assertNotIn("/api/sub2api-401/", page)
+        self.assertNotIn("slice(0, 50)", page)
+        self.assertNotIn("完成前请保持页面打开", page)
 
     def test_runtime_audit_is_ignored_and_docker_persisted(self):
         dockerfile = Path("Dockerfile").read_text(encoding="utf-8")

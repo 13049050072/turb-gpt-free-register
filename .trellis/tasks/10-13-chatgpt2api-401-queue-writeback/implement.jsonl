@@ -1,0 +1,5 @@
+{"file": ".trellis/spec/backend/chatgpt2api-credential-rotation.md", "reason": "Owns the existing detection, liveness, exact-ID replacement, persistence, API, and test contract being extended."}
+{"file": ".trellis/spec/backend/error-handling.md", "reason": "Defines bounded batch validation, safe skip reasons, and credential-safe API errors."}
+{"file": ".trellis/spec/backend/quality-guidelines.md", "reason": "Defines cross-layer tests, secret exclusion, py_compile, inline JavaScript, and diff verification requirements."}
+{"file": ".trellis/spec/guides/cross-layer-thinking-guide.md", "reason": "The change spans service state, Flask API, persisted audit data, and two embedded WebUI templates."}
+{"file": ".trellis/spec/guides/code-reuse-thinking-guide.md", "reason": "Requires reuse of existing liveness and exact replacement helpers and a single source of truth for queue limits/workers."}

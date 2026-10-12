@@ -1,14 +1,14 @@
 # ChatGPT2API Credential Rotation
 
-> Executable contract for detecting expired ChatGPT2API Web-pool access tokens, reusing the local liveness worker, and replacing only one locked remote account ID after full evidence validation.
+> Executable contract for detecting expired ChatGPT2API Web-pool access tokens, queueing the normal local liveness flow, and automatically replacing only each locked remote account ID after full evidence validation.
 
-## Scenario: ChatGPT2API 401 access-token rotation
+## Scenario: ChatGPT2API 401 queued AT rotation
 
 ### 1. Scope / Trigger
 
-Use this workflow when a ChatGPT2API Web account has an explicitly invalid, expired, unauthorized, or HTTP 401 access token and the operator wants to refresh the matching local account, then update the same remote record. This is verification-first: detection locks a stable remote ID and credential hashes; liveness must return and persist a different AT; replacement requires explicit confirmation and verifies the remote record after update.
+Use this workflow when ChatGPT2API reports a Web account access token as explicitly invalid, expired, unauthorized, or HTTP 401. Detection locks the stable remote ID, unique email mapping, local account ID, old AT digest, and refresh-token preservation digest. A confirmed request queues liveness work in the application process and returns immediately; each successful liveness result is automatically written back to the exact locked remote ID.
 
-Sub2API account replacement/deletion, ordinary registration, ordinary queued liveness, ChatGPT2API import, CPA OAuth compatibility, pool scheduling, and quota policy are outside this contract.
+This contract assumes the deployed topology is one Gunicorn process with threaded request handling. A multi-process or distributed queue is out of scope. Sub2API rotation, ordinary registration, ordinary liveness pages, ChatGPT2API import, CPA compatibility, pool scheduling, and quota policy are unaffected.
 
 ### 2. Signatures
 
@@ -26,9 +26,16 @@ Liveness adapter and service:
 run_account_live_check(account_id: int, *, trigger: str = "chatgpt2api-401", proxy: str | None = None) -> dict
 run_liveness_check(account_id: int) -> dict
 ChatGPT2API401Service.detect() -> dict
-ChatGPT2API401Service.select_refreshable(values: object, *, limit: int = 50) -> tuple[list[dict], list[dict]]
-ChatGPT2API401Service.refresh(values: object, *, limit: int = 50) -> dict
-ChatGPT2API401Service.replace(values: object, *, opt_in: bool = False, limit: int = 50) -> dict
+ChatGPT2API401Service.select_refreshable(values: object, *, limit: int = 5000) -> tuple[list[dict], list[dict]]
+ChatGPT2API401Service.refresh(values: object, *, opt_in: bool = False, limit: int = 5000) -> dict
+ChatGPT2API401Service.replace(values: object, *, opt_in: bool = False, limit: int = 5000) -> dict
+```
+
+Queue constants:
+
+```python
+CHATGPT2API_401_MAX_ITEMS = 5000
+CHATGPT2API_401_WORKERS = 5
 ```
 
 Web API:
@@ -37,9 +44,11 @@ Web API:
 GET  /chatgpt2api-401
 GET  /api/chatgpt2api-401/state
 POST /api/chatgpt2api-401/detect
-POST /api/chatgpt2api-401/refresh  {"remote_ids": [string, ...]}
+POST /api/chatgpt2api-401/refresh  {"remote_ids": [string, ...], "confirm_replace": true}  -> HTTP 202
 POST /api/chatgpt2api-401/replace  {"remote_ids": [string, ...], "confirm_replace": boolean}
 ```
+
+The replace endpoint remains available for historical `ready` audit entries. New confirmed refresh jobs automatically call the same exact-ID replacement path.
 
 ChatGPT2API operations:
 
@@ -50,87 +59,133 @@ GET  /api/accounts/{account_id}/refresh-token
 POST /api/accounts/update  {"id": <exact remote ID>, "access_token": <new AT>}
 ```
 
-### 3. Contracts
+### 3. Queue and State Contract
 
-Reuse `config/chatgpt2api.py`: `CHATGPT2API_BASE_URL`, `CHATGPT2API_MANAGEMENT_KEY`, and `CHATGPT2API_REQUEST_TIMEOUT`. Do not introduce another management-secret configuration. Management calls use `Authorization: Bearer <key>` and never log headers or response bodies.
+`POST /api/chatgpt2api-401/refresh` accepts 1 through 5000 remote IDs and requires `confirm_replace is True`. A valid request persists all accepted entries as `queued`, submits them to a process-local `ThreadPoolExecutor(max_workers=5)`, and returns HTTP 202 without waiting for any liveness call. The in-process outstanding queue is bounded to 5000 jobs.
 
-The list adapter accepts direct rows and common nested envelopes, traverses at most 20 pages with page size capped at 500, stops on repeated pages, and preserves rows with missing IDs so they can block unsafe uniqueness assumptions. A candidate is invalid only when an explicit status or reason matches invalid, expired, unauthorized, HTTP 401, invalid access token, or token expired.
+Only `pending` and retryable `failed` entries may be queued. `queued`, `refreshing`, `ready`, `replaced`, `ambiguous`, and `conflict` entries cannot be submitted again. Duplicate and non-actionable IDs are returned in a bounded `skipped` array without credentials. Detection returns HTTP 409 while any item is `queued` or `refreshing`, so it cannot replace active audit entries.
 
-Safe mapping requires exactly one remote row for the stable remote ID, exactly one remote row for the normalized email, and exactly one local account for that email. The email is a join key only; it is never the remote mutation target.
+The persisted state machine is:
 
-`GET /api/accounts` is sanitized and never contains credential values. Detection verifies remote-ID and email uniqueness from that list, then fetches the old AT from `/access-token` and the RT from `/refresh-token`, retaining only SHA-256 evidence:
+```text
+pending -> queued -> refreshing -> ready -> replaced
+                         |           |
+                         v           v
+                       failed      conflict
+
+pending/failed -- pre-liveness snapshot drift --> conflict
+queued/refreshing -- process restart ----------> failed (retryable)
+```
+
+`ready` is normally transient and exists so automatic writeback uses the established replacement gate. The ready transition and automatic `replace()` call remain under the same re-entrant operation lock. Historical ready entries remain manually replaceable.
+
+`state()` returns only safe fields plus:
+
+```json
+{
+  "progress": {
+    "workers": 5,
+    "queued": 0,
+    "active": 0,
+    "completed": 0,
+    "failed": 0
+  }
+}
+```
+
+The UI polls every 3000 ms while `queued + active > 0`. Reloading or closing the page does not cancel jobs; reopening reads persisted progress.
+
+### 4. Evidence and Writeback Contract
+
+Reuse `config/chatgpt2api.py`: `CHATGPT2API_BASE_URL`, `CHATGPT2API_MANAGEMENT_KEY`, and `CHATGPT2API_REQUEST_TIMEOUT`. Management calls use `Authorization: Bearer <key>` and never log headers or response bodies.
+
+Safe mapping requires exactly one remote row for the stable remote ID, exactly one remote row for the normalized email, and exactly one local account for that email. Email is a join key only and is never the mutation target.
+
+Detection stores hashes only:
 
 ```text
 old_at_sha256
 preserved_sha256[refresh_token]  # hash({present: bool, value: string})
 ```
 
-A 404 from the RT endpoint is an explicit `{present:false,value:""}` state and still produces a non-empty digest. HTTP 200 without a non-empty `refresh_token` is unverifiable and blocks the workflow as a conflict. The service contract is `_PRESERVED_FIELDS = ('refresh_token',)`. `password`, `client_id`, `last_refresh`, and `id_token` are not guessed, and no ID-token preservation claim is made. The public state contains only bounded remote ID, normalized email, local account ID, state, reason, timestamps, booleans, and 12-character AT fingerprints.
+A 404 from the RT endpoint is explicit absence and still hashes to non-empty evidence. HTTP 200 without a non-empty RT is unverifiable. Password, client ID, last-refresh value, and ID token are neither guessed nor claimed as verified.
 
-`refresh()` reuses `run_account_live_check()` and the normal DB claim, routing, proxy fallback, logging, and `update_account_liveness()` behavior. Success requires the returned AT hash to equal the persisted local AT hash, differ from the locked remote AT hash, and differ from the pre-liveness local AT hash.
+Before liveness, a worker re-lists both sides and verifies the locked remote ID/email uniqueness, local ID/email uniqueness, old AT hash, and RT preservation hash. Any drift becomes `conflict` at `pre_liveness`; liveness and remote mutation are skipped.
 
-`replace()` is a preview unless `confirm_replace is True`. Immediately before update it revalidates remote ID/email uniqueness, local ID/email uniqueness, old AT hash, the RT presence/value hash, and the persisted new AT hash. `POST /api/accounts/update` sends the exact body `{id, access_token}` and is successful only when direct or enveloped `updated_ids` includes the exact locked remote ID. After acknowledgement, the adapter must re-fetch both `/access-token` and `/refresh-token` and verify their hashes; the service also re-lists and verifies the ID still exists uniquely, the AT hash equals the new hash and differs from the old hash, and the RT presence/value hash is unchanged.
+Liveness calls `run_liveness_check(local_account_id)`, which delegates to `run_account_live_check()` and therefore retains the normal DB claim, routing, proxy fallback, log, refresh, and persistence behavior. The five queue workers may run liveness concurrently. Success requires all of the following:
 
-`chatgpt2api_401_audit.json` is written with create-exclusive temporary files, `fsync`, `os.replace`, and mode `0600` where supported. For a symlink audit path, create the temporary file beside the resolved target and preserve the symlink. Operations sharing an audit path use one process-level operation lock and reload persisted state before mutations.
+- liveness returns `ok is True` and a non-empty AT;
+- returned AT hash equals the local persisted AT hash;
+- new hash differs from the locked remote old AT hash;
+- new hash differs from the pre-liveness local AT hash.
+
+Failures become retryable `failed` at stage `liveness` and never write remotely.
+
+After liveness, remote writeback is serialized by the shared audit-path operation lock. `replace()` revalidates both mappings, old AT evidence, RT evidence, and the persisted new AT. `POST /api/accounts/update` sends exactly `{id, access_token}`. The adapter accepts success only when `updated_ids` contains the exact locked ID, then re-fetches AT and RT. The service also re-lists and verifies that the same ID/email remains unique, AT equals the locked new hash and differs from old, and RT evidence is unchanged. Only then does state become `replaced`.
+
+Writeback acknowledgement mismatch, exceptions, or post-write evidence mismatch become `conflict` at stage `writeback`. The system never claims success from the mutation response alone.
+
+### 5. Persistence and Confidentiality
+
+`chatgpt2api_401_audit.json` uses create-exclusive temporary files, `fsync`, `os.replace`, and mode `0600` where supported. A symlink audit path writes beside the resolved target and preserves the symlink. Service instances sharing an audit path share one process-level `RLock` and reload persisted state before mutations.
+
+On service initialization, persisted `queued` and `refreshing` entries are atomically converted to retryable `failed` entries with failure stage `restart`. Work is not silently resumed because the in-memory executor does not survive a process restart.
+
+Public state and audit data contain bounded remote IDs, normalized emails, local IDs, states, bounded redacted reasons, failure stages, timestamps, booleans, counts, and 12-character AT fingerprints. They never contain AT, RT, management keys, passwords, OAuth codes, callback URLs, authorization headers, or complete upstream response bodies.
 
 All ChatGPT2API-401 responses set `Cache-Control: no-store, max-age=0`, `Pragma: no-cache`, and `X-Content-Type-Options: nosniff`.
 
-### 4. Validation & Error Matrix
+### 6. Validation and Error Matrix
 
 | Condition | Required result |
 | --- | --- |
-| Request body is not a JSON object | HTTP 400, bounded error, no action |
-| `remote_ids` is empty, not an array, or over 50 | HTTP 400, no action |
-| Management configuration is incomplete | HTTP 503, no remote action |
-| Management authentication fails | HTTP 502, no credential echo |
-| Management request times out | HTTP 504, preserve locked state |
-| Account/update route is unsupported | HTTP 501, no fallback mutation |
-| Invalid signal is absent | Count as healthy/non-actionable |
-| Remote ID is missing or duplicated | `ambiguous`, refresh/replace disabled |
-| Email is missing, conflicting, or maps to multiple remote/local rows | `ambiguous`, refresh/replace disabled |
-| Credential snapshot lacks old AT or RT presence/value digest | `ambiguous`, no liveness |
-| Mapping or snapshot changes before liveness | `conflict`, no liveness call |
-| Liveness fails or returned/persisted ATs disagree | `failed`, retry allowed, no remote update |
-| New AT equals old remote AT or pre-liveness local AT | `failed`, no remote update |
-| `confirm_replace` is not literal `true` | Preview only, no update request |
-| Mapping, old AT, RT presence/value, or new AT changes before update | `conflict`, no update request |
-| `updated_ids` omits the locked ID | `conflict`, update not accepted |
-| Post-update ID, email, AT, or RT evidence differs | `conflict`, retain audit evidence |
+| Request body is not a JSON object | HTTP 400, no action |
+| `remote_ids` is empty, malformed, or over 5000 | HTTP 400, no action |
+| Refresh confirmation is not literal `true` | HTTP 400, no queue or writeback |
+| Valid refresh request | HTTP 202 before liveness completes |
+| Duplicate/non-actionable ID | Bounded skipped reason, no duplicate job |
+| Detection while queue is active | HTTP 409, active audit preserved |
+| Remote ID/email or local ID/email drift before liveness | `conflict`, no liveness |
+| Old AT or RT evidence drifts before liveness | `conflict`, no liveness |
+| Liveness fails or returned/persisted hashes disagree | retryable `failed`, no writeback |
+| New AT equals old remote AT or prior local AT | retryable `failed`, no writeback |
+| Mapping or evidence changes before update | `conflict`, no update request |
+| `updated_ids` omits the locked remote ID | `conflict`, never success |
+| Post-update ID, email, AT, or RT evidence differs | `conflict`, retain safe audit evidence |
 | Post-update evidence matches | `replaced` |
+| Process starts with queued/refreshing audit rows | retryable `failed`, stage `restart` |
 
-### 5. Good/Base/Bad Cases
+### 7. Required Tests
 
-- Good: remote ID `web-42` has explicit 401 state and uniquely maps to local account `17`. Detection locks the old AT hash and RT presence/value hash; liveness returns and persists a different AT; explicit confirmation updates only `web-42`; post-update AT/RT reads and the sanitized re-list confirm the same ID and email, new AT hash, and unchanged RT evidence. State becomes `replaced`.
-- Base: healthy remote rows are counted but are not actionable. Invalid rows remain `pending` until the operator selects their exact remote IDs.
-- Bad: a duplicate email exists, a snapshot field is missing, liveness returns the old token, a second instance changes audit state, or the remote update response confirms a different ID. No remote replacement is accepted; state remains `ambiguous`, `failed`, or `conflict`.
+- Service tests prove enqueue returns while liveness is blocked, 60 candidates are accepted, exactly five liveness calls can be active, all candidates finish, duplicate enqueue is skipped, and active detection is rejected.
+- Service tests cover old AT drift, RT drift, mapping drift, liveness failure, returned/persisted mismatch, unchanged local AT, patch failure, post-write RT change, exact-ID automatic replacement, RT preservation, restart recovery, and historical ready compatibility.
+- API tests cover authentication, literal confirmation, HTTP 202, acceptance above 50, rejection above 5000, invalid element rejection, HTTP 409 while active, no-store headers, and bounded redacted errors.
+- Adapter tests cover exact `{id, access_token}`, exact `updated_ids`, dedicated AT/RT reads, missing-RT hashing, and post-update evidence.
+- Template tests cover full selection without 50-item truncation, automatic-writeback wording, fixed concurrency 5, 3000 ms polling, queued/refreshing states, and manual historical replacement.
+- Regression gates cover ChatGPT2API import/connection, normal liveness, Sub2API 401, `py_compile`, extracted inline JavaScript `node --check`, `git diff --check`, and full `unittest` discovery.
 
-### 6. Tests Required
+### 8. Good / Base / Bad Cases
 
-- Adapter tests assert direct/enveloped sanitized lists, bounded pagination, repeated-page protection, explicit invalid classification, duplicate/missing ID retention, dedicated AT/RT secret fetches, explicit missing-RT hashing, hash-only snapshots, exact `{id, access_token}` update payload, exact `updated_ids` confirmation, post-update AT/RT verification, and secret-redacted errors.
-- Service tests assert unique remote/local mapping, old and preserved hashes, pending→refreshing→ready→replaced, returned-versus-persisted AT equality, old/pre-local AT inequality, stale mapping/snapshot rejection, explicit confirmation preview, post-update verification, interrupted refresh recovery, and shared-audit-path serialization.
-- Persistence tests assert atomic writes, resolved symlink target directories, preserved symlinks, mode `0600`, and absence of AT/RT/password/key/code/callback text.
-- API tests assert authentication, 50-ID request bounds, literal boolean confirmation, no-store headers, safe HTTP category mapping, and no credential output.
-- Template tests assert modern/legacy navigation, all four endpoints, stable ID and fingerprint evidence, explicit confirmation wording, and no embedded secrets.
-- Regression gates cover ChatGPT2API import/connection, normal liveness, Sub2API 401, `py_compile`, extracted inline JavaScript `node --check`, `git diff --check`, and full `unittest` discovery with baseline-failure comparison.
+- **Good**: 500 invalid accounts are selected; the route persists accepted IDs, returns HTTP 202 immediately, five workers reuse normal liveness, and each successful account reaches `replaced` only after exact-ID AT readback and unchanged RT evidence.
+- **Base**: one account fails liveness while the remaining accounts continue; that item becomes retryable `failed`, no remote mutation occurs for it, and queue progress reaches idle without losing other results.
+- **Bad**: an implementation waits for liveness inside the HTTP request, truncates selection to 50, mutates by email, trusts `updated_ids` without readback, or writes remotely after AT/RT snapshot drift.
 
-### 7. Wrong vs Correct
+### 9. Wrong vs Correct
 
 #### Wrong
 
 ```python
-if remote_email == local_email:
-    update_all_accounts_for_email(email, new_access_token)
+# Blocks the Cloudflare request and separates refresh from writeback.
+for remote_id in remote_ids[:50]:
+    service.refresh_one(remote_id)
+return jsonify(service.state())
 ```
-
-Email is not a stable mutation identity, and liveness success alone does not prove that the returned token was persisted, changed, or belongs to the locked remote snapshot.
 
 #### Correct
 
 ```python
-state = service.detect()
-service.refresh([locked_remote_id])
-preview = service.replace([locked_remote_id], opt_in=False)
-result = service.replace([locked_remote_id], opt_in=operator_confirmed)
+# Explicit confirmation, bounded enqueue, immediate 202; workers reuse normal
+# liveness and call the exact-ID replacement gate after evidence validation.
+result = service.refresh(remote_ids, opt_in=(payload.get("confirm_replace") is True), limit=5000)
+return jsonify(result), 202
 ```
-
-The service updates only the exact locked remote ID after proving unique mappings, the old AT hash, the RT presence/value hash, a newly returned-and-persisted AT, literal confirmation, exact `updated_ids`, and matching post-update AT/RT evidence.

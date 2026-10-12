@@ -3,6 +3,10 @@ import unittest
 from unittest.mock import patch
 
 from core.chatgpt2api_admin import ChatGPT2APIAdminError
+from core.chatgpt2api_401_service import (
+    CHATGPT2API_401_MAX_ITEMS,
+    ChatGPT2API401BusyError,
+)
 from webui.app import create_app
 
 
@@ -55,17 +59,36 @@ class WebUIChatGPT2API401Tests(unittest.TestCase):
             self.assertNotIn("callback", text)
             self.assertEqual("remote-old", response.get_json()["items"][0]["remote_id"])
 
-    def test_refresh_passes_only_selected_remote_ids(self):
-        payload = {"ok": True, "items": [], "refreshed_count": 1, "skipped": []}
+    def test_refresh_requires_confirmation_returns_202_and_passes_only_locked_ids(self):
+        payload = {"ok": True, "queued_count": 1, "workers": 5, "skipped": []}
         with patch("core.chatgpt2api_401_service.ChatGPT2API401Service.refresh", return_value=payload) as refresh:
             response = self.client.post(
                 "/api/chatgpt2api-401/refresh",
                 headers=self.headers,
-                json={"remote_ids": ["remote-old"]},
+                json={"remote_ids": ["remote-old"], "confirm_replace": True},
             )
-        self.assertEqual(200, response.status_code)
+        self.assertEqual(202, response.status_code)
         self.assert_private(response)
-        refresh.assert_called_once_with(["remote-old"], limit=50)
+        refresh.assert_called_once_with(
+            ["remote-old"],
+            opt_in=True,
+            limit=CHATGPT2API_401_MAX_ITEMS,
+        )
+
+        for confirmation in (None, False, "true", 1):
+            with self.subTest(confirmation=confirmation), patch(
+                "core.chatgpt2api_401_service.ChatGPT2API401Service.refresh"
+            ) as refresh:
+                body = {"remote_ids": ["remote-old"]}
+                if confirmation is not None:
+                    body["confirm_replace"] = confirmation
+                rejected = self.client.post(
+                    "/api/chatgpt2api-401/refresh",
+                    headers=self.headers,
+                    json=body,
+                )
+            self.assertEqual(400, rejected.status_code)
+            refresh.assert_not_called()
 
     def test_replace_requires_literal_confirmation_and_passes_locked_ids(self):
         preview = {"ok": True, "replacement_performed": False, "items": []}
@@ -76,7 +99,9 @@ class WebUIChatGPT2API401Tests(unittest.TestCase):
                 json={"remote_ids": ["remote-old"], "confirm_replace": "true"},
             )
         self.assertEqual(200, response.status_code)
-        replace.assert_called_once_with(["remote-old"], opt_in=False, limit=50)
+        replace.assert_called_once_with(
+            ["remote-old"], opt_in=False, limit=CHATGPT2API_401_MAX_ITEMS
+        )
 
         with patch("core.chatgpt2api_401_service.ChatGPT2API401Service.replace", return_value=preview) as replace:
             response = self.client.post(
@@ -86,17 +111,23 @@ class WebUIChatGPT2API401Tests(unittest.TestCase):
             )
         self.assertEqual(200, response.status_code)
         self.assert_private(response)
-        replace.assert_called_once_with(["remote-old"], opt_in=True, limit=50)
+        replace.assert_called_once_with(
+            ["remote-old"], opt_in=True, limit=CHATGPT2API_401_MAX_ITEMS
+        )
 
     def test_batch_request_validation_is_bounded(self):
+        too_many = [f"remote-{index}" for index in range(CHATGPT2API_401_MAX_ITEMS + 1)]
         cases = [
             ("/api/chatgpt2api-401/refresh", None),
             ("/api/chatgpt2api-401/refresh", {}),
-            ("/api/chatgpt2api-401/refresh", {"remote_ids": []}),
-            ("/api/chatgpt2api-401/refresh", {"remote_ids": ["x"] * 51}),
+            ("/api/chatgpt2api-401/refresh", {"remote_ids": [], "confirm_replace": True}),
+            ("/api/chatgpt2api-401/refresh", {"remote_ids": too_many, "confirm_replace": True}),
+            ("/api/chatgpt2api-401/refresh", {"remote_ids": [""], "confirm_replace": True}),
+            ("/api/chatgpt2api-401/refresh", {"remote_ids": [7], "confirm_replace": True}),
+            ("/api/chatgpt2api-401/refresh", {"remote_ids": ["x" * 161], "confirm_replace": True}),
             ("/api/chatgpt2api-401/replace", None),
             ("/api/chatgpt2api-401/replace", {"remote_ids": []}),
-            ("/api/chatgpt2api-401/replace", {"remote_ids": ["x"] * 51}),
+            ("/api/chatgpt2api-401/replace", {"remote_ids": too_many}),
         ]
         for path, payload in cases:
             with self.subTest(path=path, payload=payload):
@@ -108,6 +139,36 @@ class WebUIChatGPT2API401Tests(unittest.TestCase):
                 response = self.client.post(path, **kwargs)
                 self.assertEqual(400, response.status_code)
                 self.assert_private(response)
+
+    def test_more_than_fifty_ids_are_accepted_for_queueing(self):
+        remote_ids = [f"remote-{index}" for index in range(51)]
+        payload = {"ok": True, "queued_count": 51, "workers": 5, "skipped": []}
+        with patch(
+            "core.chatgpt2api_401_service.ChatGPT2API401Service.refresh",
+            return_value=payload,
+        ) as refresh:
+            response = self.client.post(
+                "/api/chatgpt2api-401/refresh",
+                headers=self.headers,
+                json={"remote_ids": remote_ids, "confirm_replace": True},
+            )
+        self.assertEqual(202, response.status_code)
+        self.assertEqual(51, response.get_json()["queued_count"])
+        refresh.assert_called_once_with(
+            remote_ids,
+            opt_in=True,
+            limit=CHATGPT2API_401_MAX_ITEMS,
+        )
+
+    def test_detect_reports_active_queue_as_conflict(self):
+        with patch(
+            "core.chatgpt2api_401_service.ChatGPT2API401Service.detect",
+            side_effect=ChatGPT2API401BusyError("queue active"),
+        ):
+            response = self.client.post("/api/chatgpt2api-401/detect", headers=self.headers)
+        self.assertEqual(409, response.status_code)
+        self.assertEqual("queue active", response.get_json()["error"])
+        self.assert_private(response)
 
     def test_remote_errors_are_bounded_and_redacted(self):
         cases = [

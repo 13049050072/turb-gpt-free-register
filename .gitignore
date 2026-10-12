@@ -38,6 +38,7 @@ __pycache__/
 *.sqlite3
 *.sqlite3-wal
 *.sqlite3-shm
+cpa_401_audit.json
 .venv/
 *.py[cod]
 *$py.class

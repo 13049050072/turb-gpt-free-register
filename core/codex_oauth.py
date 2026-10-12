@@ -280,11 +280,17 @@ def _cpa_management_key() -> str:
     return key
 
 
-def _cpa_request_json(method: str, path: str, body: dict | None = None) -> dict:
-    """调用 CPA 管理接口，兼容 FlowPilot 的 /v0/management/* 协议。"""
+def _cpa_request_json(
+    method: str,
+    path: str,
+    body: dict | None = None,
+    *,
+    timeout: int | None = None,
+) -> dict:
+    """调用 CPA 管理接口并返回 JSON 对象。"""
     origin = _cpa_management_origin()
     key = _cpa_management_key()
-    timeout = int(getattr(_cfg, "CPA_REQUEST_TIMEOUT", 30) or 30)
+    timeout = int(timeout or getattr(_cfg, "CPA_REQUEST_TIMEOUT", 30) or 30)
     headers = {
         "Accept": "application/json",
         "Content-Type": "application/json",
@@ -529,16 +535,18 @@ def _cpa_request_raw(method: str, path: str, body: dict | None = None, *, respon
             pass
 
 
-def list_cpa_codex_auth_files() -> list[dict]:
-    """读取 CPA auth-files 列表，仅返回 type/name/email 可识别为 codex 的凭证。"""
-    payload = _cpa_request_json("GET", "/v0/management/auth-files")
-    files = payload.get("files") if isinstance(payload.get("files"), list) else []
+def _filter_cpa_codex_files(payload: dict) -> list[dict]:
+    files = payload.get("files") if isinstance(payload.get("files"), list) else None
+    if files is None:
+        files = payload.get("credentials") if isinstance(payload.get("credentials"), list) else None
+    if files is None:
+        files = payload.get("data") if isinstance(payload.get("data"), list) else []
     out = []
     for item in files:
         if not isinstance(item, dict):
             continue
         name = str(item.get("name") or "").strip()
-        ftype = str(item.get("type") or "").strip().lower()
+        ftype = str(item.get("type") or item.get("provider") or "").strip().lower()
         email = str(item.get("email") or "").strip().lower()
         if ftype == "codex" or name.lower().startswith("codex-") or "codex" in name.lower():
             copied = dict(item)
@@ -546,6 +554,22 @@ def list_cpa_codex_auth_files() -> list[dict]:
             copied["email"] = email or str(item.get("email") or "")
             out.append(copied)
     return out
+
+
+def list_cpa_codex_auth_files() -> list[dict]:
+    """读取兼容 v0 的 CPA auth-files 列表。"""
+    return _filter_cpa_codex_files(_cpa_request_json("GET", "/v0/management/auth-files"))
+
+
+def refresh_all_cpa_credentials() -> dict:
+    """刷新 CPA 中的 Codex 凭证状态；无文档化刷新接口时由 CPA 返回明确错误。"""
+    timeout = max(30, int(getattr(_cfg, "CPA_REQUEST_TIMEOUT", 30) or 30), 300)
+    return _cpa_request_json(
+        "POST",
+        "/v8/management/credentials/refresh",
+        {"all": True},
+        timeout=timeout,
+    )
 
 
 def find_cpa_codex_auth_file(*, email: str = "", local_filename: str = "") -> dict | None:
@@ -703,8 +727,8 @@ def _submit_cpa_callback(callback_url: str) -> dict:
     for attempt in range(1, max_attempts + 1):
         try:
             logger.info(
-                "[Codex][CPA] 正在提交 OAuth callback 给 CPA（第 %s/%s 次）... callback=%s",
-                attempt, max_attempts, str(callback_url or "")
+                "[Codex][CPA] 正在提交 OAuth callback 给 CPA（第 %s/%s 次；回调值不写日志）",
+                attempt, max_attempts,
             )
             payload = _cpa_request_json("POST", "/v0/management/oauth-callback", body)
             logger.info("[Codex][CPA] callback 已提交（第 %s 次成功）", attempt)

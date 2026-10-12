@@ -1,0 +1,5 @@
+1. Re-run current CPA service/API/template/OAuth tests and capture concrete failures.
+2. Fix post-OAuth verification, state transitions, audit persistence, and bounded error handling on current TARGET.
+3. Re-run Python/template/static focused checks and inspect diff for secrets/unrelated changes.
+4. Discover canonical Oracle deploy workflow; if available, deploy only through it and run bounded smoke checks.
+5. Reopen artifacts/checkpoint and record observed baseline/modified/rollback/deployment results.

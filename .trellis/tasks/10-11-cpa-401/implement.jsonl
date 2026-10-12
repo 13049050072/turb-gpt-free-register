@@ -1,0 +1,8 @@
+{"file": ".trellis/spec/backend/index.md", "reason": "Backend layer index and pre-development checklist."}
+{"file": ".trellis/spec/backend/directory-structure.md", "reason": "Route, service, storage, template, and test placement conventions."}
+{"file": ".trellis/spec/backend/database-guidelines.md", "reason": "SQLite/storage conventions; update if implementation writes rotation state."}
+{"file": ".trellis/spec/backend/error-handling.md", "reason": "Bounded API errors and sensitive export response rules."}
+{"file": ".trellis/spec/backend/logging-guidelines.md", "reason": "Logging rules for operation state without credentials."}
+{"file": ".trellis/spec/backend/quality-guidelines.md", "reason": "Required tests, template parity, and forbidden sensitive-data patterns."}
+{"file": ".trellis/spec/guides/cross-layer-thinking-guide.md", "reason": "Required API/service/storage/template data-flow review."}
+{"file": ".trellis/spec/guides/code-reuse-thinking-guide.md", "reason": "Search-before-adding CPA request/storage helpers."}

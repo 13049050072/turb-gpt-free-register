@@ -22,6 +22,7 @@ from flask import Flask, Response, jsonify, make_response, render_template, requ
 import pyotp
 
 from core import codex_retry_service, db, plan_check_service, extract_link_service, codex_agent_service, live_check_service
+from core.cpa_401_service import Cpa401Service, CpaRefreshUnsupported, CpaSnapshotConflict
 from webui.auth import init_auth, register_auth_routes
 from core import registration_service as svc
 from webui import config_editor
@@ -256,6 +257,7 @@ def _read_log_tail(path, *, max_bytes: int, default_running: bool = False, runni
 def create_app(auth_code: str | None = None) -> Flask:
     app = Flask(__name__, template_folder="templates")
     _prepared_downloads: dict[str, dict] = {}
+    cpa_401_service = Cpa401Service()
 
     @app.after_request
     def _compress_json_response(response: Response):
@@ -369,6 +371,10 @@ def create_app(auth_code: str | None = None) -> Flask:
         if requested_ui in {"legacy", "modern"}:
             resp.set_cookie("ui_mode", ui_mode, max_age=60 * 60 * 24 * 365, samesite="Lax")
         return resp
+
+    @app.get("/cpa-401")
+    def cpa_401_page():
+        return render_template("cpa_401.html")
 
     # ----------------------------------------------------------
     # 统计概览
@@ -2744,6 +2750,180 @@ def create_app(auth_code: str | None = None) -> Flask:
             "skipped": skipped,
             "batch_id": batch_id,
         })
+
+    def _cpa_401_local_statuses() -> dict[str, str]:
+        return {
+            str(row.get("email") or "").strip().lower(): str(row.get("codex_status") or "").strip().lower()
+            for row in db.list_accounts(limit=100_000)
+            if str(row.get("email") or "").strip()
+        }
+
+    def _cpa_401_response(payload: dict, status: int = 200) -> Response:
+        response = make_response(jsonify(payload), status)
+        response.headers["Cache-Control"] = "no-store, max-age=0"
+        response.headers["Pragma"] = "no-cache"
+        response.headers["X-Content-Type-Options"] = "nosniff"
+        return response
+
+    def _cpa_401_remote_error(exc: Exception) -> tuple[str, int]:
+        text = str(exc or "").lower()
+        if "status=401" in text or "status=403" in text:
+            return "CPA 管理接口认证失败，请检查管理密钥", 502
+        if "timeout" in text or "timed out" in text:
+            return "CPA 凭证验证超时，旧凭证未做任何变更", 504
+        if "status=404" in text or "not_found" in text:
+            return "当前 CPA 不支持所需的凭证管理接口", 501
+        return "CPA 凭证验证失败，旧凭证未做任何变更", 502
+
+    @app.get("/api/cpa-401/state")
+    def api_cpa_401_state():
+        """读取最近一次持久化的非敏感 CPA 401 轮换审计状态。"""
+        return _cpa_401_response(cpa_401_service.state())
+
+    @app.post("/api/cpa-401/detect")
+    def api_cpa_401_detect():
+        """刷新 CPA 状态并返回不含凭证内容的 401/轮换审核结果。"""
+        try:
+            result = cpa_401_service.detect(_cpa_401_local_statuses())
+            return _cpa_401_response(result)
+        except CpaRefreshUnsupported as exc:
+            return _cpa_401_response({"ok": False, "supported": False, "error": str(exc)}, 501)
+        except Exception as exc:
+            error, status = _cpa_401_remote_error(exc)
+            logger.warning("CPA 401 检测失败: %s", error)
+            return _cpa_401_response({"ok": False, "error": error}, status)
+
+    @app.post("/api/cpa-401/retry")
+    def api_cpa_401_retry():
+        """对最近检测出的 CPA 401 账号复用现有 Codex OAuth 补跑工作流。"""
+        data = request.get_json(silent=True)
+        if not isinstance(data, dict):
+            return _cpa_401_response({"ok": False, "error": "请求体必须是 JSON 对象"}, 400)
+        emails = data.get("emails")
+        if not isinstance(emails, list) or not emails:
+            return _cpa_401_response({"ok": False, "error": "emails 必须是非空数组"}, 400)
+        if len(emails) > 50:
+            return _cpa_401_response({"ok": False, "error": "单次最多选择 50 个账号"}, 400)
+        try:
+            workers = int(data.get("workers") or 1)
+        except (TypeError, ValueError):
+            return _cpa_401_response({"ok": False, "error": "workers 必须是整数"}, 400)
+        workers = max(1, min(8, workers))
+
+        candidates, skipped = cpa_401_service.select_retryable(emails, limit=50)
+        selected: list[dict] = []
+        for item in candidates:
+            email = str(item.get("email") or "").strip().lower()
+            account = db.get_account_by_email(email)
+            if not account:
+                skipped.append({"email": email, "reason": "本地账号不存在"})
+                continue
+            if (account.get("live_check_status") or "") == "deactivated":
+                skipped.append({"email": email, "reason": "本地账号已废号"})
+                continue
+            if not _reserve_codex_retry(email):
+                skipped.append({"email": email, "reason": "Codex 补跑已在运行"})
+                continue
+            selected.append({"email": email})
+
+        if not selected:
+            return _cpa_401_response({
+                "ok": False,
+                "error": "没有可启动的 CPA 401 账号",
+                "started_count": 0,
+                "skipped": skipped[:50],
+            }, 422)
+
+        batch_id = uuid.uuid4().hex[:12]
+        selected_emails = [item["email"] for item in selected]
+        try:
+            cpa_401_service.mark_retrying(selected_emails, batch_id=batch_id)
+            for email in selected_emails:
+                db.update_account_codex_status(email, "retrying", None)
+                log_path = codex_retry_service.log_path(email)
+                log_path.parent.mkdir(parents=True, exist_ok=True)
+                log_path.write_text(
+                    f"CPA 401 页面已启动 Codex 补跑 batch={batch_id}; 完成后将自动执行 CPA 后置验证\n",
+                    encoding="utf-8",
+                )
+        except CpaSnapshotConflict as exc:
+            for email in selected_emails:
+                _release_codex_retry(email)
+            return _cpa_401_response({
+                "ok": False,
+                "error": str(exc),
+                "conflicts": exc.emails,
+            }, 409)
+        except Exception:
+            for email in selected_emails:
+                _release_codex_retry(email)
+            cpa_401_service.mark_verification_error(selected_emails, "CPA 401 补跑任务初始化失败；旧凭证保持不变")
+            logger.exception("CPA 401 补跑任务初始化失败 batch=%s", batch_id)
+            return _cpa_401_response({"ok": False, "error": "CPA 401 补跑任务初始化失败"}, 500)
+
+        def _cpa_401_runner(items: list[dict], max_workers: int, batch: str):
+            from concurrent.futures import ThreadPoolExecutor, as_completed
+
+            with ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix=f"cpa-401-{batch}") as executor:
+                futures = [
+                    executor.submit(
+                        _run_codex_retry_worker,
+                        item["email"],
+                        batch_label=f"CPA401 {batch} #{idx}/{len(items)}",
+                        clear_log=False,
+                    )
+                    for idx, item in enumerate(items, 1)
+                ]
+                for future in as_completed(futures):
+                    try:
+                        future.result()
+                    except Exception:
+                        logger.exception("CPA 401 Codex 补跑子任务异常 batch=%s", batch)
+            try:
+                cpa_401_service.detect(_cpa_401_local_statuses())
+            except Exception as exc:
+                error, _status = _cpa_401_remote_error(exc)
+                cpa_401_service.mark_verification_error(
+                    [item["email"] for item in items],
+                    f"{error}；旧凭证保持不变",
+                )
+                logger.warning("CPA 401 后置验证失败 batch=%s: %s", batch, error)
+
+        threading.Thread(
+            target=_cpa_401_runner,
+            args=(selected, workers, batch_id),
+            name=f"cpa-401-dispatch-{batch_id}",
+            daemon=True,
+        ).start()
+        return _cpa_401_response({
+            "ok": True,
+            "message": f"已启动 {len(selected)} 个 Codex 补跑任务；完成后将自动执行 CPA 后置验证",
+            "started": selected,
+            "started_count": len(selected),
+            "skipped": skipped[:50],
+            "batch_id": batch_id,
+        })
+
+    @app.post("/api/cpa-401/cleanup")
+    def api_cpa_401_cleanup():
+        """返回精确旧文件审阅清单；未配置验证适配器时绝不调用 CPA 删除。"""
+        data = request.get_json(silent=True)
+        if not isinstance(data, dict):
+            return _cpa_401_response({"ok": False, "error": "请求体必须是 JSON 对象"}, 400)
+        emails = data.get("emails")
+        if not isinstance(emails, list) or not emails:
+            return _cpa_401_response({"ok": False, "error": "emails 必须是非空数组"}, 400)
+        if len(emails) > 50:
+            return _cpa_401_response({"ok": False, "error": "单次最多选择 50 个账号"}, 400)
+        try:
+            result = cpa_401_service.cleanup(emails, opt_in=data.get("confirm_cleanup") is True, limit=50)
+            return _cpa_401_response(result)
+        except CpaRefreshUnsupported as exc:
+            return _cpa_401_response({"ok": False, "supported": False, "error": str(exc)}, 501)
+        except Exception as exc:
+            error, status = _cpa_401_remote_error(exc)
+            logger.warning("CPA 401 清理前复核失败: %s", error)
+            return _cpa_401_response({"ok": False, "error": error}, status)
 
     @app.get("/api/codex/retry-log")
     def api_codex_retry_log():

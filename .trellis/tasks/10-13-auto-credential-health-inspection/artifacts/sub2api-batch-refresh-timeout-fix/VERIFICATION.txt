@@ -1,0 +1,58 @@
+Sub2API automatic-inspection batch-refresh timeout fix
+Generated: 2026-10-13
+Base commit: 457c96f52c66a2ae2d356b50f5f391d161eac73a
+
+PRODUCTION FAILURE EVIDENCE (SANITIZED)
+- Deployed automatic inspection ran from 2026-10-13T08:00:47.000944Z to 2026-10-13T08:01:07.213789Z and failed after approximately 20.2 seconds.
+- Persisted scheduler outcome: failed; detected=0; actionable=0; submitted=0; completed=0; failed=1.
+- Public error: `Sub2ApiAdminError: 自动巡检执行失败`.
+- Sub2API management configuration was present: HTTPS base, key present, x-api-key auth, 20-second timeout. No key value was printed or stored.
+- `list_openai_oauth_accounts()` returned 47 rows in 615 ms, proving base connectivity and authentication.
+- A direct standard batch-refresh probe for 10 exact IDs returned total=10, success=10, failed=0 in 3254 ms.
+- Root cause: `Sub2Api401Service.detect()` passed all 47 exact IDs to one native batch-refresh request; that request exceeded the existing 20-second management timeout.
+
+FIX
+- `Sub2ApiAdminClient.batch_refresh()` now chooses at most 500 unique normalized exact IDs in first-occurrence order.
+- It sends deterministic serial chunks of at most 10 IDs to the same native endpoint; chunks are not parallelized.
+- Numeric IDs keep the existing integer wire representation.
+- Responses are one logical result with total fixed to selected exact IDs.
+- Each chunk normalizes success/failed independently, clamps counts to the chunk, treats unique explicit error IDs as failures, and prevents over-reporting in one chunk from compensating for an under-reported chunk.
+- Errors are exact-ID scoped, deduplicated in first-occurrence order, redacted and capped at 500; warnings are redacted and capped at 50.
+- Any chunk exception stops later chunks and propagates the existing safe exception; no partial success is returned.
+
+CHANGED PRODUCT FILES
+- `.trellis/spec/backend/sub2api-credential-rotation.md`
+- `core/sub2api_admin.py`
+- `tests/test_sub2api_admin.py`
+
+BEHAVIOR PROOF
+- BASELINE: 25 IDs are sent as one chunk `[25]`; the simulated upstream rejects requests above 10 and the adapter returns safe timeout error status 504.
+- MODIFIED: the same 25 IDs are sent as `[10, 10, 5]`; logical result is total=25, success=25, failed=0.
+- PATCHED: applying `DIFF_FILE.patch` to the base commit produces the same `[10, 10, 5]` success behavior and the same SHA-256 manifest as the modified files.
+- ROLLBACK: executing `ROLLBACK.sh` restores the base behavior `[25]` and the safe timeout; the rollback worktree is clean.
+- Literal outputs: BASELINE.txt, MODIFIED.txt, PATCHED.txt, ROLLBACK.txt.
+
+TESTS
+- Related command: `.venv/bin/python -m unittest -v tests.test_sub2api_admin tests.test_sub2api_401_service tests.test_credential_health_scheduler tests.test_webui_credential_health_scheduler tests.test_webui_sub2api_401 tests.test_sub2api_401_templates`.
+- Related result: 103 tests, OK, status 0.
+- Full discovery: 507 tests; 505 passed; one known failure and one known error, status 1.
+- Known unrelated error: `KeyError: 'ext-oai-did'` in `tests.test_chatgpt_auth_context.ChatgptAuthContextTests.test_ensure_authorize_context_matches_20260914_capture_shape`.
+- Known unrelated failure: `AssertionError: unexpectedly None` in `tests.test_remail_client.RemailClientTests.test_restore_context_requires_exact_email_match`.
+- Clean base commit reproduced the identical two failures across the exact two modules: 8 tests, status 1.
+- Python compile for changed Python files: PASS.
+- Source diff check: PASS.
+- Independent Trellis review: 107 relevant tests passed; full 505/507 with the same two clean-head failures; no remaining blocking issue.
+
+ROLE FILES
+1. MODIFIED_FILE.tar.gz — changed product/spec/test files.
+2. DIFF_FILE.patch — reconstructs the modified files from base commit.
+3. VERIFICATION.txt — this evidence ledger.
+4. ROLLBACK.sh — executable exact-file rollback to base commit.
+
+TOOL ERROR LEDGER
+- A first configuration probe imported nonexistent `Sub2ApiConfig`; corrected to read the existing module constants from `config.sub2api`.
+- The first independent review request received upstream HTTP 524 and made no code change; after backoff, a second independent review completed successfully.
+- The first evidence script referenced unset `OLDPWD` inside a temporary worktree and exited; its cleanup trap removed temporary worktrees. The corrected script used explicit absolute paths and completed all proofs.
+
+DEPLOYMENT STATUS AT GENERATION
+- Fix is not yet committed, pushed, or deployed. Deployment must build the exact pushed commit, preserve the current image and compose.env as rollback inputs, require healthy/restart=0, then verify a real 47-ID automatic inspection completes without timeout.

@@ -1,0 +1,879 @@
+test_authorize_403_reuses_cf_cookie_and_retries (test_account_export_twofa.AccountExportTwofaTests.test_authorize_403_reuses_cf_cookie_and_retries) ... 17:21:54 [INFO] [2FA] 已清理authorize 导航产生的熔断状态：HTTP 403 from authorize
+17:21:54 [WARNING] [2FA] authorize 导航临时失败：attempt=1/3 error=RuntimeError；0.0s 后复用 CF Cookie 重试
+17:21:54 [INFO] [2FA] authorize 导航重试成功：attempt=2/3
+ok
+test_bootstrap_exception_also_clears_circuit (test_account_export_twofa.AccountExportTwofaTests.test_bootstrap_exception_also_clears_circuit) ... 17:21:54 [INFO] ============================================================
+17:21:54 [INFO] 开始设置 2FA
+17:21:54 [INFO] ============================================================
+17:21:54 [INFO] [2FA] 使用现有 accessToken 预热登录态...
+17:21:54 [WARNING] [2FA] accessToken 预热失败，继续按重认证流程执行：RuntimeError
+17:21:54 [INFO] [2FA] 已清理可选预热产生的熔断状态：HTTP 403 from optional bootstrap
+17:21:54 [INFO] [2FA] 阶段1：发起重认证
+17:21:54 [WARNING] [2FA] 重认证发起失败且不再重试：attempt=1/3 retryable=False error=RuntimeError
+ok
+test_optional_bootstrap_403_does_not_block_reauth (test_account_export_twofa.AccountExportTwofaTests.test_optional_bootstrap_403_does_not_block_reauth) ... 17:21:54 [INFO] ============================================================
+17:21:54 [INFO] 开始设置 2FA
+17:21:54 [INFO] ============================================================
+17:21:54 [INFO] [2FA] 使用现有 accessToken 预热登录态...
+17:21:54 [INFO] [2FA] accessToken 预热完成
+17:21:54 [INFO] [2FA] 已清理可选预热产生的熔断状态：HTTP 403 from https://chatgpt.com/backend-api/accounts/optimized/check
+17:21:54 [INFO] [2FA] 阶段1：发起重认证
+17:21:54 [WARNING] [2FA] 重认证发起失败且不再重试：attempt=1/3 retryable=False error=RuntimeError
+ok
+test_reauth_403_is_retried_after_circuit_reset (test_account_export_twofa.AccountExportTwofaTests.test_reauth_403_is_retried_after_circuit_reset) ... 17:21:54 [INFO] [2FA] 已清理重认证请求产生的熔断状态：HTTP 403 from csrf
+17:21:54 [WARNING] [2FA] 重认证发起临时失败：attempt=1/3 error=RuntimeError；0.0s 后重试
+17:21:54 [INFO] [2FA] 已清理重认证请求产生的熔断状态：HTTP 403 from csrf
+17:21:54 [WARNING] [2FA] 重认证发起临时失败：attempt=2/3 error=RuntimeError；0.0s 后重试
+17:21:54 [INFO] [2FA] 重认证发起重试成功：attempt=3/3
+ok
+test_reauth_business_400_is_not_retried (test_account_export_twofa.AccountExportTwofaTests.test_reauth_business_400_is_not_retried) ... 17:21:54 [WARNING] [2FA] 重认证发起失败且不再重试：attempt=1/3 retryable=False error=RuntimeError
+ok
+test_basic_format (test_account_full_export.AccountFullExportTests.test_basic_format) ... ok
+test_build_code_url_with_base (test_account_full_export.AccountFullExportTests.test_build_code_url_with_base) ... ok
+test_email_source_fallback_empty (test_account_full_export.AccountFullExportTests.test_email_source_fallback_empty) ... ok
+test_generic_api_constructs_link_when_pool_missing (test_account_full_export.AccountFullExportTests.test_generic_api_constructs_link_when_pool_missing) ... ok
+test_generic_api_resolves_to_code_url_link (test_account_full_export.AccountFullExportTests.test_generic_api_resolves_to_code_url_link) ... ok
+test_missing_registration_password_is_explicit_in_full_export (test_account_full_export.AccountFullExportTests.test_missing_registration_password_is_explicit_in_full_export) ... ok
+test_missing_totp_keeps_prefix (test_account_full_export.AccountFullExportTests.test_missing_totp_keeps_prefix) ... ok
+test_password_from_top_level_registration_password (test_account_full_export.AccountFullExportTests.test_password_from_top_level_registration_password) ... ok
+test_separators_match_spec (test_account_full_export.AccountFullExportTests.test_separators_match_spec) ... ok
+test_callback_403_retries_in_same_session_before_fetching_token (test_account_liveness.AccountLivenessTests.test_callback_403_retries_in_same_session_before_fetching_token) ... 17:21:54 [WARNING] [查活] OAuth callback 临时失败（1/3），保留当前 session/deviceId/CF Cookie，1.0s 后重试：HTTP 403 from callback/openai
+ok
+test_email_otp_completes_totp_mfa_before_session_fetch (test_account_liveness.AccountLivenessTests.test_email_otp_completes_totp_mfa_before_session_fetch) ... 17:21:54 [INFO] [查活] 邮箱 OTP 后进入 MFA challenge，继续提交 TOTP：user@example.com
+17:21:54 [INFO] [查活] 已进入 MFA challenge，开始提交 TOTP：user@example.com factor_id=factor-1
+ok
+test_existing_access_token_uses_reauth_path (test_account_liveness.AccountLivenessTests.test_existing_access_token_uses_reauth_path) ... 17:21:54 [INFO] [查活] 日志文件：/var/folders/y8/rcm4sxpn30z2vfldbs20135m0000gn/T/tmpr01_4jai/live-check-user@example.com.log
+17:21:54 [INFO] [查活] 开始重新登录：user@example.com
+17:21:54 [INFO] [查活] 流程：登录态预热 → CSRF → Reauth Signin → Authorize → 邮箱 OTP → OAuth callback → Session/AT
+17:21:54 [INFO] [查活] 会话创建完成：proxy=直连/配置随机 device_id=device-test（复用2FA稳定链路）
+17:21:54 [INFO] [查活] 指纹摘要：test-fingerprint
+17:21:54 [INFO] [查活] 正常：user@example.com user_id=user-1 plan=free
+17:21:54 [INFO] [查活] 结束：user@example.com
+ok
+test_fingerprint_identity_is_pinned_when_session_is_recreated_in_one_attempt (test_account_liveness.AccountLivenessTests.test_fingerprint_identity_is_pinned_when_session_is_recreated_in_one_attempt) ... ok
+test_preflight_preserves_explicit_direct_route_and_skips_providers (test_account_liveness.AccountLivenessTests.test_preflight_preserves_explicit_direct_route_and_skips_providers) ... 17:21:54 [INFO] [查活] 复用统一会话：proxy=配置随机/直连 device_id=device-test oai_session_id=...（网络预检第 1/1 次）
+17:21:54 [INFO] [查活] 指纹摘要：test-fingerprint
+ok
+test_preflight_retries_with_same_session_when_csrf_is_blocked (test_account_liveness.AccountLivenessTests.test_preflight_retries_with_same_session_when_csrf_is_blocked) ... 17:21:54 [INFO] [查活] 复用统一会话：proxy=配置随机/直连 device_id=device-test oai_session_id=...（网络预检第 1/2 次）
+17:21:54 [INFO] [查活] 指纹摘要：test-fingerprint
+17:21:54 [WARNING] [查活] 网络预检失败（1/2），保留当前 session/deviceId/CF Cookie 重试：HTTP Error 403
+17:21:54 [INFO] [查活] 复用统一会话：proxy=配置随机/直连 device_id=device-test oai_session_id=...（网络预检第 2/2 次）
+17:21:54 [INFO] [查活] 指纹摘要：test-fingerprint
+ok
+test_reauth_403_falls_back_to_clean_full_web_login_on_same_route (test_account_liveness.AccountLivenessTests.test_reauth_403_falls_back_to_clean_full_web_login_on_same_route) ... 17:21:54 [INFO] [查活] 日志文件：/var/folders/y8/rcm4sxpn30z2vfldbs20135m0000gn/T/tmpeph0tals/live-check-user@example.com.log
+17:21:54 [INFO] [查活] 开始重新登录：user@example.com
+17:21:54 [INFO] [查活] 流程：登录态预热 → CSRF → Reauth Signin → Authorize → 邮箱 OTP → OAuth callback → Session/AT
+17:21:54 [INFO] [查活] 会话创建完成：proxy=socks5://proxy.example:1080 device_id=device-test（复用2FA稳定链路）
+17:21:54 [INFO] [查活] 指纹摘要：test-fingerprint
+17:21:54 [WARNING] [查活] AT reauth 链临时失败，切换干净会话执行纯协议完整登录：HTTP 403 callback
+17:21:54 [INFO] [查活] 正常：user@example.com user_id=user-1 plan=free
+17:21:54 [INFO] [查活] 结束：user@example.com
+ok
+test_reauth_otp_dead_account_error_is_not_retried (test_account_liveness.AccountLivenessTests.test_reauth_otp_dead_account_error_is_not_retried) ... 17:21:54 [INFO] [查活] 等待重认证 OTP：user@example.com（第 1/3 次）
+ok
+test_service_403_fallback_really_uses_direct_connection (test_account_liveness.AccountLivenessTests.test_service_403_fallback_really_uses_direct_connection) ... ok
+test_service_tls_fallback_really_uses_direct_connection (test_account_liveness.AccountLivenessTests.test_service_tls_fallback_really_uses_direct_connection) ... ok
+test_tls_transport_error_is_retryable_for_direct_fallback (test_account_liveness.AccountLivenessTests.test_tls_transport_error_is_retryable_for_direct_fallback) ... ok
+test_update_account_note_single_and_bulk (test_account_note.AccountNoteTests.test_update_account_note_single_and_bulk) ... ok
+test_plus_trial_and_no_trial_filters_use_sql (test_account_plan_filter.AccountPlanFilterTests.test_plus_trial_and_no_trial_filters_use_sql) ... ok
+test_account_page_filters_enabled_disabled_pending_and_failed_totp (test_account_totp_filter.AccountTotpFilterTests.test_account_page_filters_enabled_disabled_pending_and_failed_totp) ... ok
+test_cdp_observer_rejects_unmatched_inspector_failure (test_browser_data_saver.BrowserDataSaverTests.test_cdp_observer_rejects_unmatched_inspector_failure) ... 17:21:59 [INFO] [test] 省流量模式已启用：按 URL 拦截资源类型=image，类型规则=11 条，URL规则=8 条（Selenium URL 规则不支持 challenge 例外）
+ok
+test_disabled_mode_does_not_install_route (test_browser_data_saver.BrowserDataSaverTests.test_disabled_mode_does_not_install_route) ... ok
+test_playwright_blocks_optional_types_but_keeps_critical_requests (test_browser_data_saver.BrowserDataSaverTests.test_playwright_blocks_optional_types_but_keeps_critical_requests) ... 17:21:59 [INFO] [test] 省流量模式已启用：拦截资源类型=image,media，URL规则=8（验证码/challenge 相关 URL 放行）
+ok
+test_playwright_url_pattern_can_block_script_independently_of_resource_type (test_browser_data_saver.BrowserDataSaverTests.test_playwright_url_pattern_can_block_script_independently_of_resource_type) ... 17:21:59 [INFO] [test] 省流量模式已启用：拦截资源类型=-，URL规则=1（验证码/challenge 相关 URL 放行）
+ok
+test_resource_type_aliases_and_invalid_values (test_browser_data_saver.BrowserDataSaverTests.test_resource_type_aliases_and_invalid_values) ... ok
+test_roxy_adds_early_image_switch_only_when_image_is_selected (test_browser_data_saver.BrowserDataSaverTests.test_roxy_adds_early_image_switch_only_when_image_is_selected) ... ok
+test_selenium_inspector_failure_is_counted (test_browser_data_saver.BrowserDataSaverTests.test_selenium_inspector_failure_is_counted) ... ok
+test_selenium_uses_configured_url_patterns_even_without_resource_types (test_browser_data_saver.BrowserDataSaverTests.test_selenium_uses_configured_url_patterns_even_without_resource_types) ... 17:21:59 [INFO] [test] 省流量模式已启用：按 URL 拦截资源类型=-，类型规则=0 条，URL规则=1 条（Selenium URL 规则不支持 challenge 例外）
+ok
+test_selenium_uses_static_resource_url_patterns (test_browser_data_saver.BrowserDataSaverTests.test_selenium_uses_static_resource_url_patterns) ... 17:21:59 [INFO] [test] 省流量模式已启用：按 URL 拦截资源类型=image,media，类型规则=24 条，URL规则=8 条（Selenium URL 规则不支持 challenge 例外）
+ok
+test_stylesheet_is_a_supported_optional_resource_type (test_browser_data_saver.BrowserDataSaverTests.test_stylesheet_is_a_supported_optional_resource_type) ... 17:21:59 [INFO] [test] 省流量模式已启用：按 URL 拦截资源类型=stylesheet，类型规则=1 条，URL规则=8 条（Selenium URL 规则不支持 challenge 例外）
+ok
+test_playwright_counts_http_and_websocket_without_payload_capture (test_browser_traffic.BrowserTrafficTests.test_playwright_counts_http_and_websocket_without_payload_capture) ... 17:21:59 [INFO] [BrowserUse] 注册浏览器网络流量：上传 0.01 KiB，下载 0.03 KiB，合计 0.05 KiB，HTTP请求 1（失败 0，未完成 0）
+ok
+test_playwright_logs_redacted_resource_detail_and_sizes (test_browser_traffic.BrowserTrafficTests.test_playwright_logs_redacted_resource_detail_and_sizes) ... ok
+test_playwright_records_coverage_for_each_page_cdp_session (test_browser_traffic.BrowserTrafficTests.test_playwright_records_coverage_for_each_page_cdp_session) ... ok
+test_playwright_requestfailed_does_not_reenter_sync_api (test_browser_traffic.BrowserTrafficTests.test_playwright_requestfailed_does_not_reenter_sync_api) ... 17:21:59 [INFO] [failed] 注册浏览器网络流量：上传 0.07 KiB，下载 0.00 KiB，合计 0.07 KiB，HTTP请求 1（失败 1，未完成 0）
+17:21:59 [INFO] [failed] 浏览器资源明细汇总：记录 1 条，按类型={"document":{"count":1,"upload_bytes":67,"download_bytes":0,"blocked":0,"failed":1}}
+17:21:59 [INFO] [failed] 浏览器资源明细开始：按单请求总字节降序，输出 1/1 条（URL 查询值已脱敏）
+17:21:59 [INFO] [failed] [资源明细] #1 document POST status=- upload=67B download=0B body=0B headers=0B failed=1 blocked=0 unfinished=0 cache=unknown mime= ws_upload=0B ws_download=0B url=https://chatgpt.com/auth/login
+17:21:59 [INFO] [failed] 浏览器资源明细结束
+ok
+test_selenium_does_not_count_cdp_blocked_request_as_network_bytes (test_browser_traffic.BrowserTrafficTests.test_selenium_does_not_count_cdp_blocked_request_as_network_bytes) ... 17:21:59 [INFO] [test] 省流量模式已启用：按 URL 拦截资源类型=image，类型规则=11 条，URL规则=8 条（Selenium URL 规则不支持 challenge 例外）
+17:21:59 [INFO] [Roxy] 注册浏览器网络流量：上传 0.00 KiB，下载 0.00 KiB，合计 0.00 KiB，HTTP请求 1（失败 0，未完成 0）
+17:21:59 [INFO] [Roxy] 省流量模式实际拦截资源：1（按类型={'image': 1}）
+ok
+test_selenium_does_not_count_local_fulfilled_asset_as_network_bytes (test_browser_traffic.BrowserTrafficTests.test_selenium_does_not_count_local_fulfilled_asset_as_network_bytes) ... 17:21:59 [INFO] [Roxy] 注册浏览器网络流量：上传 0.00 KiB，下载 0.00 KiB，合计 0.00 KiB，HTTP请求 1（失败 0，未完成 0）
+ok
+test_selenium_excludes_roxy_loopback_resources_from_all_totals (test_browser_traffic.BrowserTrafficTests.test_selenium_excludes_roxy_loopback_resources_from_all_totals) ... 17:21:59 [INFO] [Roxy] 注册浏览器网络流量：上传 0.03 KiB，下载 0.04 KiB，合计 0.07 KiB，HTTP请求 1（失败 0，未完成 0）
+17:21:59 [INFO] [Roxy] 浏览器资源明细汇总：记录 1 条，按类型={"fetch":{"count":1,"upload_bytes":34,"download_bytes":39,"blocked":0,"failed":0}}
+17:21:59 [INFO] [Roxy] 浏览器资源明细开始：按单请求总字节降序，输出 1/1 条（URL 查询值已脱敏）
+17:21:59 [INFO] [Roxy] [资源明细] #1 fetch GET status=200 upload=34B download=39B body=20B headers=19B failed=0 blocked=0 unfinished=0 cache=miss mime= ws_upload=0B ws_download=0B url=https://chatgpt.com/api/auth/session
+17:21:59 [INFO] [Roxy] 浏览器资源明细结束
+ok
+test_selenium_logs_status_cache_failure_and_unfinished_details (test_browser_traffic.BrowserTrafficTests.test_selenium_logs_status_cache_failure_and_unfinished_details) ... ok
+test_selenium_parses_network_events_and_websocket_frames (test_browser_traffic.BrowserTrafficTests.test_selenium_parses_network_events_and_websocket_frames) ... 17:21:59 [INFO] [Roxy] 注册浏览器网络流量：上传 0.06 KiB，下载 0.07 KiB，合计 0.13 KiB，HTTP请求 1（失败 0，未完成 0）
+ok
+test_selenium_records_precise_js_coverage_and_unexecuted_candidates (test_browser_traffic.BrowserTrafficTests.test_selenium_records_precise_js_coverage_and_unexecuted_candidates) ... 17:21:59 [INFO] [coverage] 已开启 JS 精确覆盖率记录（Profiler.startPreciseCoverage）
+ok
+test_admin_create_uses_name_payload_and_header (test_cf_temp_mail_client.CFTempMailClientTests.test_admin_create_uses_name_payload_and_header) ... 17:21:59 [INFO] [Cloudflare] 已创建临时邮箱: u@mail.example.com (domain=mail.example.com)
+ok
+test_admin_mode_without_key_fails (test_cf_temp_mail_client.CFTempMailClientTests.test_admin_mode_without_key_fails) ... ok
+test_created_at_without_tz_is_utc (test_cf_temp_mail_client.CFTempMailClientTests.test_created_at_without_tz_is_utc) ... ok
+test_fetch_latest_otp_reads_only_new_openai_email (test_cf_temp_mail_client.CFTempMailClientTests.test_fetch_latest_otp_reads_only_new_openai_email) ... 17:21:59 [INFO] [Cloudflare] 开始轮询邮箱 fresh@mail.example.com，最长 1s
+17:21:59 [INFO] [Cloudflare] 跳过过旧邮件 id=old ts=100 after=170 subject=Code 111111
+17:21:59 [INFO] [Cloudflare] 锁定 OTP 候选 654321，等待 settle=0s
+17:21:59 [INFO] [Cloudflare] settle 完成，返回 OTP=654321
+ok
+test_list_messages_sends_limit_offset (test_cf_temp_mail_client.CFTempMailClientTests.test_list_messages_sends_limit_offset) ... ok
+test_otp_from_cloudflare_raw_openai_mail (test_cf_temp_mail_client.CFTempMailClientTests.test_otp_from_cloudflare_raw_openai_mail) ... ok
+test_pick_account_anonymous_create (test_cf_temp_mail_client.CFTempMailClientTests.test_pick_account_anonymous_create) ... 17:21:59 [INFO] [Cloudflare] 已创建临时邮箱: abc123@mail.example.com (domain=mail.example.com)
+ok
+test_pick_account_requires_api_base (test_cf_temp_mail_client.CFTempMailClientTests.test_pick_account_requires_api_base) ... ok
+test_release_clears_context (test_cf_temp_mail_client.CFTempMailClientTests.test_release_clears_context) ... 17:21:59 [INFO] [Cloudflare] 已释放临时邮箱: a@b.com（status=used, note=）
+ok
+test_credential_snapshot_fetches_dedicated_secret_endpoints_and_hashes_only (test_chatgpt2api_401_admin.ChatGPT2APIAdminTests.test_credential_snapshot_fetches_dedicated_secret_endpoints_and_hashes_only) ... ok
+test_duplicate_remote_ids_are_preserved_for_service_conflict_detection (test_chatgpt2api_401_admin.ChatGPT2APIAdminTests.test_duplicate_remote_ids_are_preserved_for_service_conflict_detection) ... ok
+test_list_is_bounded_redacted_and_detects_only_explicit_invalid_signals (test_chatgpt2api_401_admin.ChatGPT2APIAdminTests.test_list_is_bounded_redacted_and_detects_only_explicit_invalid_signals) ... ok
+test_missing_refresh_token_is_explicitly_preserved (test_chatgpt2api_401_admin.ChatGPT2APIAdminTests.test_missing_refresh_token_is_explicitly_preserved) ... ok
+test_patch_rejects_post_update_access_token_mismatch (test_chatgpt2api_401_admin.ChatGPT2APIAdminTests.test_patch_rejects_post_update_access_token_mismatch) ... ok
+test_patch_rejects_post_update_refresh_token_change (test_chatgpt2api_401_admin.ChatGPT2APIAdminTests.test_patch_rejects_post_update_refresh_token_change) ... ok
+test_patch_rejects_unconfirmed_or_different_updated_id (test_chatgpt2api_401_admin.ChatGPT2APIAdminTests.test_patch_rejects_unconfirmed_or_different_updated_id) ... ok
+test_patch_uses_exact_update_payload_and_verifies_new_at_and_preserved_rt (test_chatgpt2api_401_admin.ChatGPT2APIAdminTests.test_patch_uses_exact_update_payload_and_verifies_new_at_and_preserved_rt) ... ok
+test_request_failures_do_not_echo_credentials (test_chatgpt2api_401_admin.ChatGPT2APIAdminTests.test_request_failures_do_not_echo_credentials) ... ok
+test_ambiguous_mapping_never_enqueues_or_mutates (test_chatgpt2api_401_service.ChatGPT2API401ServiceTests.test_ambiguous_mapping_never_enqueues_or_mutates) ... ok
+test_audit_is_atomic_private_symlink_safe_and_secret_free (test_chatgpt2api_401_service.ChatGPT2API401ServiceTests.test_audit_is_atomic_private_symlink_safe_and_secret_free) ... ok
+test_corrupt_audit_counts_are_safely_bounded (test_chatgpt2api_401_service.ChatGPT2API401ServiceTests.test_corrupt_audit_counts_are_safely_bounded) ... ok
+test_detect_rejects_active_queue_without_destroying_it (test_chatgpt2api_401_service.ChatGPT2API401ServiceTests.test_detect_rejects_active_queue_without_destroying_it) ... ok
+test_duplicate_enqueue_is_bounded_and_does_not_run_twice (test_chatgpt2api_401_service.ChatGPT2API401ServiceTests.test_duplicate_enqueue_is_bounded_and_does_not_run_twice) ... ok
+test_duplicate_local_stable_id_is_ambiguous (test_chatgpt2api_401_service.ChatGPT2API401ServiceTests.test_duplicate_local_stable_id_is_ambiguous) ... ok
+test_enqueue_returns_before_blocked_liveness_completes (test_chatgpt2api_401_service.ChatGPT2API401ServiceTests.test_enqueue_returns_before_blocked_liveness_completes) ... ok
+test_executor_submit_failure_reverts_job_to_retryable_failed (test_chatgpt2api_401_service.ChatGPT2API401ServiceTests.test_executor_submit_failure_reverts_job_to_retryable_failed) ... ok
+test_fixed_five_workers_process_more_than_fifty_candidates (test_chatgpt2api_401_service.ChatGPT2API401ServiceTests.test_fixed_five_workers_process_more_than_fifty_candidates) ... ok
+test_full_queue_flow_auto_replaces_only_locked_id_and_preserves_rt (test_chatgpt2api_401_service.ChatGPT2API401ServiceTests.test_full_queue_flow_auto_replaces_only_locked_id_and_preserves_rt) ... ok
+test_historical_ready_state_survives_restart_and_manual_replace (test_chatgpt2api_401_service.ChatGPT2API401ServiceTests.test_historical_ready_state_survives_restart_and_manual_replace) ... ok
+test_liveness_failure_is_retryable_and_never_patches (test_chatgpt2api_401_service.ChatGPT2API401ServiceTests.test_liveness_failure_is_retryable_and_never_patches) ... ok
+test_liveness_returned_token_must_equal_persisted_new_token (test_chatgpt2api_401_service.ChatGPT2API401ServiceTests.test_liveness_returned_token_must_equal_persisted_new_token) ... ok
+test_local_stable_id_drift_before_worker_blocks_liveness (test_chatgpt2api_401_service.ChatGPT2API401ServiceTests.test_local_stable_id_drift_before_worker_blocks_liveness) ... ok
+test_mapping_drift_after_liveness_blocks_writeback (test_chatgpt2api_401_service.ChatGPT2API401ServiceTests.test_mapping_drift_after_liveness_blocks_writeback) ... ok
+test_old_at_drift_after_liveness_blocks_writeback (test_chatgpt2api_401_service.ChatGPT2API401ServiceTests.test_old_at_drift_after_liveness_blocks_writeback) ... ok
+test_patch_failure_is_conflict_and_never_claims_success (test_chatgpt2api_401_service.ChatGPT2API401ServiceTests.test_patch_failure_is_conflict_and_never_claims_success) ... ok
+test_patch_post_verification_rejects_rt_change (test_chatgpt2api_401_service.ChatGPT2API401ServiceTests.test_patch_post_verification_rejects_rt_change) ... ok
+test_queued_and_refreshing_states_recover_as_retryable_failed (test_chatgpt2api_401_service.ChatGPT2API401ServiceTests.test_queued_and_refreshing_states_recover_as_retryable_failed) ... ok
+test_refresh_requires_literal_opt_in (test_chatgpt2api_401_service.ChatGPT2API401ServiceTests.test_refresh_requires_literal_opt_in) ... ok
+test_rt_drift_after_liveness_blocks_writeback (test_chatgpt2api_401_service.ChatGPT2API401ServiceTests.test_rt_drift_after_liveness_blocks_writeback) ... ok
+test_rt_drift_before_worker_blocks_liveness (test_chatgpt2api_401_service.ChatGPT2API401ServiceTests.test_rt_drift_before_worker_blocks_liveness) ... ok
+test_second_service_instance_does_not_recover_live_in_process_job (test_chatgpt2api_401_service.ChatGPT2API401ServiceTests.test_second_service_instance_does_not_recover_live_in_process_job) ... ok
+test_snapshot_drift_before_worker_blocks_liveness (test_chatgpt2api_401_service.ChatGPT2API401ServiceTests.test_snapshot_drift_before_worker_blocks_liveness) ... ok
+test_unchanged_local_token_is_rejected (test_chatgpt2api_401_service.ChatGPT2API401ServiceTests.test_unchanged_local_token_is_rejected) ... ok
+test_unknown_selected_id_is_redacted_in_skipped_response (test_chatgpt2api_401_service.ChatGPT2API401ServiceTests.test_unknown_selected_id_is_redacted_in_skipped_response) ... ok
+test_modern_and_legacy_navigation_keep_both_independent_pages (test_chatgpt2api_401_templates.ChatGPT2API401TemplateTests.test_modern_and_legacy_navigation_keep_both_independent_pages) ... ok
+test_page_has_independent_scheduler_controls (test_chatgpt2api_401_templates.ChatGPT2API401TemplateTests.test_page_has_independent_scheduler_controls) ... ok
+test_page_has_separate_safe_replacement_workflow (test_chatgpt2api_401_templates.ChatGPT2API401TemplateTests.test_page_has_separate_safe_replacement_workflow) ... ok
+test_runtime_audit_is_ignored_and_docker_persisted (test_chatgpt2api_401_templates.ChatGPT2API401TemplateTests.test_runtime_audit_is_ignored_and_docker_persisted) ... ok
+test_authorize_url_matches_chatgpt2api_pkce_contract (test_chatgpt2api_import.ChatGPT2APIImportTests.test_authorize_url_matches_chatgpt2api_pkce_contract) ... ok
+test_connection_distinguishes_missing_key_invalid_key_and_unreachable (test_chatgpt2api_import.ChatGPT2APIImportTests.test_connection_distinguishes_missing_key_invalid_key_and_unreachable) ... ok
+test_connection_reports_missing_address_without_network_request (test_chatgpt2api_import.ChatGPT2APIImportTests.test_connection_reports_missing_address_without_network_request) ... ok
+test_existing_management_id_uses_update_without_creating_duplicate (test_chatgpt2api_import.ChatGPT2APIImportTests.test_existing_management_id_uses_update_without_creating_duplicate) ... 17:21:59 [INFO] [chatgpt2api] Web account imported: account_id=9 management_id=existing-id added=0 skipped=0 synced=0
+ok
+test_invalid_json_response_is_retryable_without_persisting_body (test_chatgpt2api_import.ChatGPT2APIImportTests.test_invalid_json_response_is_retryable_without_persisting_body) ... ok
+test_non_retryable_import_failure_is_delayed_and_redacted (test_chatgpt2api_import.ChatGPT2APIImportTests.test_non_retryable_import_failure_is_delayed_and_redacted) ... 17:21:59 [WARNING] [chatgpt2api] Web account import failed: account_id=12 status=401 retryable=False
+ok
+test_oauth_worker_persists_token_set_before_import (test_chatgpt2api_import.ChatGPT2APIImportTests.test_oauth_worker_persists_token_set_before_import) ... 17:21:59 [INFO] [chatgpt2api] Web account imported: account_id=8 management_id=management-id added=1 skipped=0 synced=1
+ok
+test_outbox_status_contains_no_credentials_and_records_management_id (test_chatgpt2api_import.ChatGPT2APIImportTests.test_outbox_status_contains_no_credentials_and_records_management_id) ... 17:21:59 [INFO] [chatgpt2api] Web account imported: account_id=7 management_id=management-id added=1 skipped=0 synced=1
+ok
+test_reenqueue_during_running_preserves_new_work_and_old_management_id (test_chatgpt2api_import.ChatGPT2APIImportTests.test_reenqueue_during_running_preserves_new_work_and_old_management_id) ... 17:21:59 [INFO] [chatgpt2api] Web account imported: account_id=11 management_id=created-by-older-request added=0 skipped=0 synced=1
+ok
+test_restart_requeues_interrupted_worker_rows (test_chatgpt2api_import.ChatGPT2APIImportTests.test_restart_requeues_interrupted_worker_rows) ... ok
+test_session_json_mode_does_not_start_oauth_and_imports_metadata (test_chatgpt2api_import.ChatGPT2APIImportTests.test_session_json_mode_does_not_start_oauth_and_imports_metadata) ... 17:22:00 [INFO] [chatgpt2api] Web account imported: account_id=13 management_id=session-management-id added=1 skipped=0 synced=1
+ok
+test_session_json_payload_preserves_web_session_metadata (test_chatgpt2api_import.ChatGPT2APIImportTests.test_session_json_payload_preserves_web_session_metadata) ... ok
+test_update_request_uses_management_id_and_omits_unaccepted_fields (test_chatgpt2api_import.ChatGPT2APIImportTests.test_update_request_uses_management_id_and_omits_unaccepted_fields) ... ok
+test_web_callback_matcher_rejects_localhost_and_other_paths (test_chatgpt2api_import.ChatGPT2APIImportTests.test_web_callback_matcher_rejects_localhost_and_other_paths) ... ok
+test_web_pkce_uses_s256_and_rfc_length (test_chatgpt2api_import.ChatGPT2APIImportTests.test_web_pkce_uses_s256_and_rfc_length) ... ok
+test_web_token_exchange_uses_platform_contract (test_chatgpt2api_import.ChatGPT2APIImportTests.test_web_token_exchange_uses_platform_contract) ... ok
+test_ensure_authorize_context_matches_20260914_capture_shape (test_chatgpt_auth_context.ChatgptAuthContextTests.test_ensure_authorize_context_matches_20260914_capture_shape) ... ERROR
+test_duplicate_enqueue_is_busy_while_worker_owns_account (test_chatgpt_password.ChatgptPasswordDbTests.test_duplicate_enqueue_is_busy_while_worker_owns_account) ... ok
+test_success_persists_registration_password_and_status (test_chatgpt_password.ChatgptPasswordDbTests.test_success_persists_registration_password_and_status) ... ok
+test_add_password_page_rejects_wrong_final_path_with_safe_diagnostic (test_chatgpt_password.ChatgptPasswordProtocolTests.test_add_password_page_rejects_wrong_final_path_with_safe_diagnostic) ... ok
+test_authorize_error_rebuilds_add_password_state_once (test_chatgpt_password.ChatgptPasswordProtocolTests.test_authorize_error_rebuilds_add_password_state_once) ... 17:22:00 [WARNING] [ChatGPT密码] add-password authorize 落到 error，重建认证状态 attempt=1/2
+ok
+test_email_otp_mfa_is_completed_before_password_page (test_chatgpt_password.ChatgptPasswordProtocolTests.test_email_otp_mfa_is_completed_before_password_page) ... 17:22:00 [INFO] [ChatGPT密码] 已进入邮箱 OTP 页面，等待账号邮箱验证码
+17:22:00 [INFO] [ChatGPT密码] 邮箱 OTP 已验证，进入 add-password 页面
+17:22:00 [WARNING] [ChatGPT密码] 密码已提交，但刷新本地 session 失败：RuntimeError
+ok
+test_invalid_otp_does_not_reach_password_endpoint (test_chatgpt_password.ChatgptPasswordProtocolTests.test_invalid_otp_does_not_reach_password_endpoint) ... 17:22:00 [INFO] [ChatGPT密码] 已进入邮箱 OTP 页面，等待账号邮箱验证码
+ok
+test_mfa_continue_url_can_navigate_to_add_password_page (test_chatgpt_password.ChatgptPasswordProtocolTests.test_mfa_continue_url_can_navigate_to_add_password_page) ... ok
+test_mfa_referer_uses_factor_path (test_chatgpt_password.ChatgptPasswordProtocolTests.test_mfa_referer_uses_factor_path) ... ok
+test_password_mutation_is_after_successful_email_otp_validation (test_chatgpt_password.ChatgptPasswordProtocolTests.test_password_mutation_is_after_successful_email_otp_validation) ... 17:22:00 [INFO] [ChatGPT密码] 已进入邮箱 OTP 页面，等待账号邮箱验证码
+17:22:00 [INFO] [ChatGPT密码] 邮箱 OTP 已验证，进入 add-password 页面
+17:22:00 [WARNING] [ChatGPT密码] 密码已提交，但刷新本地 session 失败：RuntimeError
+ok
+test_signin_uses_authenticated_add_password_parameters (test_chatgpt_password.ChatgptPasswordProtocolTests.test_signin_uses_authenticated_add_password_parameters) ... ok
+test_task_error_redacts_password_and_otp_values (test_chatgpt_password.ChatgptPasswordProtocolTests.test_task_error_redacts_password_and_otp_values) ... ok
+test_403_is_retryable (test_chatgpt_plan_retry.ChatgptPlanRetryTests.test_403_is_retryable) ... ok
+test_403_retries_in_same_session_with_complete_frontend_headers (test_chatgpt_plan_retry.ChatgptPlanRetryTests.test_403_retries_in_same_session_with_complete_frontend_headers) ... 17:22:00 [INFO] [Plan] 统一会话已创建：proxy=socks5://***:***@proxy:1080 device_id=device-one... oai_session_id=session-one... lang=ja-JP tz=Asia/Tokyo
+17:22:00 [WARNING] 套餐查询临时失败，第 1/2 次，保留 session/deviceId/CF Cookie，0.0s 后重试: HTTP 403
+ok
+test_fetch_domains_reads_website_config (test_cloudmail_client.CloudMailClientTests.test_fetch_domains_reads_website_config) ... 17:22:00 [INFO] [CloudMail] 已从平台获取可用域名：example.com,mail.example.net
+ok
+test_fetch_latest_otp_reads_openai_mail (test_cloudmail_client.CloudMailClientTests.test_fetch_latest_otp_reads_openai_mail) ... 17:22:00 [INFO] [CloudMail] 开始轮询邮箱 abcdef@example.com，最长 1s
+17:22:00 [INFO] [CloudMail] 锁定 OTP 候选，等待 0s 确认
+ok
+test_gen_token_extracts_token (test_cloudmail_client.CloudMailClientTests.test_gen_token_extracts_token) ... 17:22:00 [INFO] [CloudMail] 生成 token 成功：path=/api/public/genToken
+ok
+test_pick_account_generates_random_domain_email_and_adds_user (test_cloudmail_client.CloudMailClientTests.test_pick_account_generates_random_domain_email_and_adds_user) ... 17:22:00 [INFO] [CloudMail] 已添加随机邮箱用户: abcdef@example.com
+ok
+test_pick_account_requires_domains (test_cloudmail_client.CloudMailClientTests.test_pick_account_requires_domains) ... ok
+test_email_config_declares_cloudmail_defaults (test_cloudmail_config.CloudMailConfigTests.test_email_config_declares_cloudmail_defaults) ... ok
+test_secret_registry_includes_cloudmail_token (test_cloudmail_config.CloudMailConfigTests.test_secret_registry_includes_cloudmail_token) ... ok
+test_webui_exposes_cloudmail_fields (test_cloudmail_config.CloudMailConfigTests.test_webui_exposes_cloudmail_fields) ... ok
+test_gen_token_saves_current_cloudmail_config (test_cloudmail_webui.CloudMailWebUiTests.test_gen_token_saves_current_cloudmail_config) ... 17:22:00 [INFO] 凭证自动巡检调度器已启动（进程内单实例，要求 Gunicorn workers=1）
+17:22:00 [INFO] [CloudMail] 生成 token 成功：path=/api/public/genToken
+ok
+test_browser_use_email_submit_returns_deactivated_from_response_tracker (test_codex_dead_account_detection.CodexDeadAccountDetectionTests.test_browser_use_email_submit_returns_deactivated_from_response_tracker) ... ok
+test_detect_account_unusable_response_body_uses_error_code (test_codex_dead_account_detection.CodexDeadAccountDetectionTests.test_detect_account_unusable_response_body_uses_error_code) ... ok
+test_callback_receipt_without_access_token_is_rejected (test_codex_export_formats.CodexExportFormatTests.test_callback_receipt_without_access_token_is_rejected) ... ok
+test_cpa_does_not_infer_session_token_from_refresh_token (test_codex_export_formats.CodexExportFormatTests.test_cpa_does_not_infer_session_token_from_refresh_token) ... ok
+test_cpa_matches_flat_reference_shape_and_preserves_explicit_session_token (test_codex_export_formats.CodexExportFormatTests.test_cpa_matches_flat_reference_shape_and_preserves_explicit_session_token) ... ok
+test_cpa_omits_unavailable_optional_metadata (test_codex_export_formats.CodexExportFormatTests.test_cpa_omits_unavailable_optional_metadata) ... ok
+test_cpa_synthesizes_id_token_when_local_record_has_none (test_codex_export_formats.CodexExportFormatTests.test_cpa_synthesizes_id_token_when_local_record_has_none) ... ok
+test_epoch_milliseconds_are_normalized_without_crashing (test_codex_export_formats.CodexExportFormatTests.test_epoch_milliseconds_are_normalized_without_crashing) ... ok
+test_schema_validators_accept_builder_outputs (test_codex_export_formats.CodexExportFormatTests.test_schema_validators_accept_builder_outputs) ... ok
+test_sub2api_adds_expiry_pause_for_session_without_refresh (test_codex_export_formats.CodexExportFormatTests.test_sub2api_adds_expiry_pause_for_session_without_refresh) ... ok
+test_sub2api_keeps_stored_expiry_without_fabricating_outer_access_expiry (test_codex_export_formats.CodexExportFormatTests.test_sub2api_keeps_stored_expiry_without_fabricating_outer_access_expiry) ... ok
+test_sub2api_matches_reference_oauth_shape (test_codex_export_formats.CodexExportFormatTests.test_sub2api_matches_reference_oauth_shape) ... ok
+test_sub2api_package_contains_all_accounts (test_codex_export_formats.CodexExportFormatTests.test_sub2api_package_contains_all_accounts) ... ok
+test_auth_preflight_retries_403_in_same_session (test_codex_oauth_fingerprint.CodexOauthFingerprintTests.test_auth_preflight_retries_403_in_same_session) ... 17:22:01 [INFO] [Codex][预检] Auth document（统一 session/deviceId）
+17:22:01 [WARNING] [Codex] auth document 预检 临时失败（1/3）：RuntimeError: auth document 预检 status=403, body=blocked；保留当前 session/deviceId/CF Cookie，1.0s 后重试
+ok
+test_bootstrap_authorize_uses_external_top_level_navigation_headers (test_codex_oauth_fingerprint.CodexOauthFingerprintTests.test_bootstrap_authorize_uses_external_top_level_navigation_headers) ... 17:22:01 [INFO] [Codex] 跟随 Codex authorize URL 建立会话（查询参数不写日志）...
+ok
+test_codex_result_does_not_return_callback_or_secret_message_content (test_codex_oauth_management.CodexOauthManagementTests.test_codex_result_does_not_return_callback_or_secret_message_content) ... ok
+test_existing_cpa_list_compatibility_is_preserved (test_codex_oauth_management.CodexOauthManagementTests.test_existing_cpa_list_compatibility_is_preserved) ... ok
+test_existing_cpa_refresh_compatibility_is_preserved (test_codex_oauth_management.CodexOauthManagementTests.test_existing_cpa_refresh_compatibility_is_preserved) ... ok
+test_sub2_authorize_url_is_not_written_to_logs (test_codex_oauth_management.CodexOauthManagementTests.test_sub2_authorize_url_is_not_written_to_logs) ... ok
+test_sub2_callback_and_response_secrets_are_not_written_to_logs (test_codex_oauth_management.CodexOauthManagementTests.test_sub2_callback_and_response_secrets_are_not_written_to_logs) ... ok
+test_roxy_available_continues_to_browser_driver (test_codex_roxy_preflight.CodexRoxyPreflightTests.test_roxy_available_continues_to_browser_driver) ... 17:22:01 [INFO] [Codex][Roxy] 预检通过：reachable=True status=200 reason=ok elapsed_ms=3
+ok
+test_roxy_unreachable_stops_before_browser_oauth (test_codex_roxy_preflight.CodexRoxyPreflightTests.test_roxy_unreachable_stops_before_browser_oauth) ... 17:22:01 [ERROR] [Codex][Roxy] 预检失败：Roxy API 不可达：http://127.0.0.1:50100；请先启动 RoxyBrowser
+ok
+test_codex_direct_proxy_mode_resolves_without_global_proxy_change (test_codex_sms_api_base.CodexSmsApiBaseTests.test_codex_direct_proxy_mode_resolves_without_global_proxy_change) ... ok
+test_codex_proxy_mode_reads_environment_override (test_codex_sms_api_base.CodexSmsApiBaseTests.test_codex_proxy_mode_reads_environment_override) ... ok
+test_sms_api_base_reads_environment_override (test_codex_sms_api_base.CodexSmsApiBaseTests.test_sms_api_base_reads_environment_override) ... ok
+test_webui_exposes_codex_proxy_mode_field (test_codex_sms_api_base.CodexSmsApiBaseTests.test_webui_exposes_codex_proxy_mode_field) ... ok
+test_webui_exposes_sms_api_base_field (test_codex_sms_api_base.CodexSmsApiBaseTests.test_webui_exposes_sms_api_base_field) ... ok
+test_apply_env_overrides_does_not_let_blank_values_mask_defaults (test_config_defaults.ConfigDefaultFallbackTests.test_apply_env_overrides_does_not_let_blank_values_mask_defaults) ... ok
+test_blank_env_value_uses_default_for_all_supported_types (test_config_defaults.ConfigDefaultFallbackTests.test_blank_env_value_uses_default_for_all_supported_types) ... ok
+test_browser_data_saver_defaults_block_chatgpt_rum (test_config_defaults.ConfigDefaultFallbackTests.test_browser_data_saver_defaults_block_chatgpt_rum) ... ok
+test_browser_data_saver_defaults_block_google_gsi (test_config_defaults.ConfigDefaultFallbackTests.test_browser_data_saver_defaults_block_google_gsi) ... ok
+test_browser_data_saver_defaults_do_not_block_chatgpt_core_bundles (test_config_defaults.ConfigDefaultFallbackTests.test_browser_data_saver_defaults_do_not_block_chatgpt_core_bundles) ... ok
+test_browser_transport_uses_current_chrome150_fingerprint (test_config_defaults.ConfigDefaultFallbackTests.test_browser_transport_uses_current_chrome150_fingerprint) ... ok
+test_chatgpt2api_defaults_to_session_json_mode (test_config_defaults.ConfigDefaultFallbackTests.test_chatgpt2api_defaults_to_session_json_mode) ... ok
+test_config_editor_blank_env_value_falls_back_to_source_default (test_config_defaults.ConfigDefaultFallbackTests.test_config_editor_blank_env_value_falls_back_to_source_default) ... ok
+test_config_editor_formats_empty_list_as_literal_empty_list (test_config_defaults.ConfigDefaultFallbackTests.test_config_editor_formats_empty_list_as_literal_empty_list) ... ok
+test_config_editor_parses_env_str_default_from_source (test_config_defaults.ConfigDefaultFallbackTests.test_config_editor_parses_env_str_default_from_source) ... ok
+test_proxy_pool_blank_env_value_means_empty_list (test_config_defaults.ConfigDefaultFallbackTests.test_proxy_pool_blank_env_value_means_empty_list) ... ok
+test_completion_relative_cadence_and_single_flight (test_credential_health_scheduler.CredentialHealthSchedulerTests.test_completion_relative_cadence_and_single_flight) ... ok
+test_concurrent_same_path_construction_cannot_reset_persisted_configuration (test_credential_health_scheduler.CredentialHealthSchedulerTests.test_concurrent_same_path_construction_cannot_reset_persisted_configuration) ... ok
+test_default_disabled_and_enable_runs_immediately (test_credential_health_scheduler.CredentialHealthSchedulerTests.test_default_disabled_and_enable_runs_immediately) ... ok
+test_disable_during_run_and_reenable (test_credential_health_scheduler.CredentialHealthSchedulerTests.test_disable_during_run_and_reenable) ... ok
+test_exception_is_redacted_and_other_job_can_finish (test_credential_health_scheduler.CredentialHealthSchedulerTests.test_exception_is_redacted_and_other_job_can_finish) ... ok
+test_idle_interval_update_reschedules_without_immediate_run (test_credential_health_scheduler.CredentialHealthSchedulerTests.test_idle_interval_update_reschedules_without_immediate_run) ... ok
+test_jobs_are_independent (test_credential_health_scheduler.CredentialHealthSchedulerTests.test_jobs_are_independent) ... ok
+test_malformed_and_unknown_version_fall_back_disabled (test_credential_health_scheduler.CredentialHealthSchedulerTests.test_malformed_and_unknown_version_fall_back_disabled) ... ok
+test_progress_update_requires_matching_run (test_credential_health_scheduler.CredentialHealthSchedulerTests.test_progress_update_requires_matching_run) ... ok
+test_restart_recovers_interrupted_job_as_due (test_credential_health_scheduler.CredentialHealthSchedulerTests.test_restart_recovers_interrupted_job_as_due) ... ok
+test_running_phase_is_not_rescheduled_before_future_registration (test_credential_health_scheduler.CredentialHealthSchedulerTests.test_running_phase_is_not_rescheduled_before_future_registration) ... ok
+test_same_state_path_reuses_one_process_runtime (test_credential_health_scheduler.CredentialHealthSchedulerTests.test_same_state_path_reuses_one_process_runtime) ... ok
+test_short_and_quoted_secrets_are_redacted_from_result_errors (test_credential_health_scheduler.CredentialHealthSchedulerTests.test_short_and_quoted_secrets_are_redacted_from_result_errors) ... ok
+test_start_is_idempotent_while_disabled (test_credential_health_scheduler.CredentialHealthSchedulerTests.test_start_is_idempotent_while_disabled) ... ok
+test_stop_waits_for_owned_executor_before_registry_replacement (test_credential_health_scheduler.CredentialHealthSchedulerTests.test_stop_waits_for_owned_executor_before_registry_replacement) ... ok
+test_symlink_target_is_preserved_and_mode_is_private (test_credential_health_scheduler.CredentialHealthSchedulerTests.test_symlink_target_is_preserved_and_mode_is_private) ... ok
+test_validation_preserves_previous_state (test_credential_health_scheduler.CredentialHealthSchedulerTests.test_validation_preserves_previous_state) ... ok
+test_begin_reauths_only_after_server_requires_it (test_email_change.EmailChangeTests.test_begin_reauths_only_after_server_requires_it) ... ok
+test_begin_skips_reauth_when_existing_token_is_recent (test_email_change.EmailChangeTests.test_begin_skips_reauth_when_existing_token_is_recent) ... ok
+test_bulk_api_accepts_selected_source (test_email_change.EmailChangeTests.test_bulk_api_accepts_selected_source) ... 17:22:01 [INFO] 凭证自动巡检调度器已启动（进程内单实例，要求 Gunicorn workers=1）
+ok
+test_change_email_log_api (test_email_change.EmailChangeTests.test_change_email_log_api) ... 17:22:01 [INFO] 凭证自动巡检调度器已启动（进程内单实例，要求 Gunicorn workers=1）
+ok
+test_finish_keeps_original_and_switches_current_email (test_email_change.EmailChangeTests.test_finish_keeps_original_and_switches_current_email) ... ok
+test_post_change_live_check_reuses_current_session (test_email_change.EmailChangeTests.test_post_change_live_check_reuses_current_session) ... ok
+test_protocol_uses_captured_begin_and_verify_paths (test_email_change.EmailChangeTests.test_protocol_uses_captured_begin_and_verify_paths) ... ok
+test_recent_login_callback_403_retries_full_flow_with_direct_session (test_email_change.EmailChangeTests.test_recent_login_callback_403_retries_full_flow_with_direct_session) ... ok
+test_recent_login_reuses_live_check_full_login_flow (test_email_change.EmailChangeTests.test_recent_login_reuses_live_check_full_login_flow) ... ok
+test_success_triggers_live_check_with_new_email (test_email_change.EmailChangeTests.test_success_triggers_live_check_with_new_email) ... 17:22:01 [INFO] [邮箱换绑] 已自动加入查活队列 account_id=12 email=new@example.com
+ok
+test_transport_error_switches_session_and_retries (test_email_change.EmailChangeTests.test_transport_error_switches_session_and_retries) ... 17:22:01 [WARNING] [邮箱换绑] /backend-api/accounts/change_email/begin attempt=1 failed: curl 35 reset
+ok
+test_delete_pool_supports_all_sources (test_email_pool_source.EmailPoolSourceTests.test_delete_pool_supports_all_sources) ... ok
+test_generic_api_import_keeps_source_for_all_and_filtered_lists (test_email_pool_source.EmailPoolSourceTests.test_generic_api_import_keeps_source_for_all_and_filtered_lists) ... ok
+test_generic_claim_repairs_stale_available_row_for_saved_account (test_email_pool_source.EmailPoolSourceTests.test_generic_claim_repairs_stale_available_row_for_saved_account) ... ok
+test_registered_generic_api_email_cannot_be_released_or_claimed_again (test_email_pool_source.EmailPoolSourceTests.test_registered_generic_api_email_cannot_be_released_or_claimed_again) ... ok
+test_repairs_source_for_legacy_domain_rows (test_email_pool_source.EmailPoolSourceTests.test_repairs_source_for_legacy_domain_rows) ... ok
+test_repairs_source_for_legacy_generic_rows (test_email_pool_source.EmailPoolSourceTests.test_repairs_source_for_legacy_generic_rows) ... ok
+test_parse_email_sources_includes_cloudflare (test_email_provider_cloudflare.EmailProviderCloudflareTests.test_parse_email_sources_includes_cloudflare) ... ok
+test_pick_from_source_cloudflare (test_email_provider_cloudflare.EmailProviderCloudflareTests.test_pick_from_source_cloudflare) ... ok
+test_release_routes_to_cloudflare (test_email_provider_cloudflare.EmailProviderCloudflareTests.test_release_routes_to_cloudflare) ... ok
+test_resolve_prefers_cf_context_over_domain_suffix (test_email_provider_cloudflare.EmailProviderCloudflareTests.test_resolve_prefers_cf_context_over_domain_suffix) ... ok
+test_acquire_email_uses_cloudmail_client (test_email_provider_gptmail.GPTMailProviderTests.test_acquire_email_uses_cloudmail_client) ... 17:22:01 [INFO] [EmailProvider] 使用邮箱来源: cloudmail, email=fresh@cloudmail.test
+ok
+test_acquire_email_uses_gptmail_client (test_email_provider_gptmail.GPTMailProviderTests.test_acquire_email_uses_gptmail_client) ... 17:22:01 [INFO] [EmailProvider] 使用邮箱来源: gptmail, email=fresh@gptmail.test
+ok
+test_acquire_email_uses_mailnest_client (test_email_provider_gptmail.GPTMailProviderTests.test_acquire_email_uses_mailnest_client) ... 17:22:01 [INFO] [EmailProvider] 使用邮箱来源: mailnest, email=fresh@mailnest.test
+ok
+test_parse_sources_keeps_gptmail_in_order (test_email_provider_gptmail.GPTMailProviderTests.test_parse_sources_keeps_gptmail_in_order) ... ok
+test_release_email_clears_gptmail_context (test_email_provider_gptmail.GPTMailProviderTests.test_release_email_clears_gptmail_context) ... ok
+test_resolve_email_source_recognizes_cached_gptmail_address (test_email_provider_gptmail.GPTMailProviderTests.test_resolve_email_source_recognizes_cached_gptmail_address) ... ok
+test_wait_for_otp_uses_cloudmail_client (test_email_provider_gptmail.GPTMailProviderTests.test_wait_for_otp_uses_cloudmail_client) ... ok
+test_wait_for_otp_uses_gptmail_client (test_email_provider_gptmail.GPTMailProviderTests.test_wait_for_otp_uses_gptmail_client) ... ok
+test_wait_for_otp_uses_mailnest_client (test_email_provider_gptmail.GPTMailProviderTests.test_wait_for_otp_uses_mailnest_client) ... ok
+test_acquire_email_uses_remail_client (test_email_provider_remail.RemailProviderTests.test_acquire_email_uses_remail_client) ... 17:22:01 [INFO] [EmailProvider] 使用邮箱来源: remail, email=fresh@remail.test
+ok
+test_parse_sources_keeps_remail (test_email_provider_remail.RemailProviderTests.test_parse_sources_keeps_remail) ... ok
+test_release_email_uses_remail_client (test_email_provider_remail.RemailProviderTests.test_release_email_uses_remail_client) ... ok
+test_resolve_email_source_prefers_registered_source_over_runtime_context (test_email_provider_remail.RemailProviderTests.test_resolve_email_source_prefers_registered_source_over_runtime_context) ... ok
+test_wait_for_otp_prefers_saved_source (test_email_provider_remail.RemailProviderTests.test_wait_for_otp_prefers_saved_source) ... ok
+test_wait_for_otp_uses_registered_source_without_explicit_argument (test_email_provider_remail.RemailProviderTests.test_wait_for_otp_uses_registered_source_without_explicit_argument) ... ok
+test_wait_for_otp_uses_remail_client (test_email_provider_remail.RemailProviderTests.test_wait_for_otp_uses_remail_client) ... ok
+test_write_env_values_updates_symlink_target_without_writing_next_to_link (test_env_loader_write.EnvLoaderWriteTests.test_write_env_values_updates_symlink_target_without_writing_next_to_link) ... ok
+test_direct_generic_api_proxy_setting_disables_proxy (test_generic_api_public_inbox.GenericApiPublicInboxTests.test_direct_generic_api_proxy_setting_disables_proxy) ... ok
+test_direct_latest_code_api_is_also_accepted (test_generic_api_public_inbox.GenericApiPublicInboxTests.test_direct_latest_code_api_is_also_accepted) ... ok
+test_fetch_latest_otp_applies_proxy_pool_route (test_generic_api_public_inbox.GenericApiPublicInboxTests.test_fetch_latest_otp_applies_proxy_pool_route) ... 17:22:01 [INFO] [GenericAPI] 开始轮询取码地址: inbox-0141-d678@071898.7bcb28.221wx.com，最长 2s, settle=0s
+17:22:01 [INFO] [GenericAPI] 已识别公开收件页面，使用页面 inbox API: host=mail.knm03.com email=inbox-0141-d678@071898.7bcb28.221wx.com
+17:22:01 [INFO] [GenericAPI] HTTP 路由：代理=socks5://***@127.0.0.1:7897，网络异常时回退直连
+17:22:01 [INFO] [GenericAPI] 首次锁定 OTP=739201, source=public_inbox_page mail_id=msg_01 ts=2026-09-06T12:00:00.000Z, 等 0s 看取码接口是否出现更新验证码...
+17:22:01 [INFO] [GenericAPI] settle 完成，返回 OTP=739201, 候选锁定时间=17:22:01
+ok
+test_fetch_latest_otp_uses_public_inbox_api (test_generic_api_public_inbox.GenericApiPublicInboxTests.test_fetch_latest_otp_uses_public_inbox_api) ... 17:22:01 [INFO] [GenericAPI] 开始轮询取码地址: inbox-0141-d678@071898.7bcb28.221wx.com，最长 2s, settle=0s
+17:22:01 [INFO] [GenericAPI] 已识别公开收件页面，使用页面 inbox API: host=mail.knm03.com email=inbox-0141-d678@071898.7bcb28.221wx.com
+17:22:01 [INFO] [GenericAPI] HTTP 路由：代理=http://127.0.0.1:7897，网络异常时回退直连
+17:22:01 [INFO] [GenericAPI] 首次锁定 OTP=739201, source=public_inbox_page mail_id=msg_01 ts=2026-09-06T12:00:00.000Z, 等 0s 看取码接口是否出现更新验证码...
+17:22:01 [INFO] [GenericAPI] settle 完成，返回 OTP=739201, 候选锁定时间=17:22:01
+ok
+test_mida_messages_api_returns_openai_verification_code (test_generic_api_public_inbox.GenericApiPublicInboxTests.test_mida_messages_api_returns_openai_verification_code) ... 17:22:01 [INFO] [GenericAPI] 开始轮询取码地址: slender-beaks-0y@icloud.com，最长 2s, settle=0s
+17:22:01 [INFO] [GenericAPI] 已识别 MIDA 分享页面，使用 messages API: host=icloud.mida.vip email=slender-beaks-0y@icloud.com
+17:22:01 [INFO] [GenericAPI] HTTP 路由：代理=direct，网络异常时使用直连
+17:22:01 [INFO] [GenericAPI] 首次锁定 OTP=539948, source=mida_messages_api mail_id=113421 ts=2026-09-25T12:31:07.000Z, 等 0s 看取码接口是否出现更新验证码...
+17:22:01 [INFO] [GenericAPI] settle 完成，返回 OTP=539948, 候选锁定时间=17:22:01
+ok
+test_mida_share_link_converts_to_messages_api (test_generic_api_public_inbox.GenericApiPublicInboxTests.test_mida_share_link_converts_to_messages_api) ... ok
+test_proxy_connection_error_falls_back_to_direct (test_generic_api_public_inbox.GenericApiPublicInboxTests.test_proxy_connection_error_falls_back_to_direct) ... 17:22:01 [INFO] [GenericAPI] 开始轮询取码地址: inbox-0141-d678@071898.7bcb28.221wx.com，最长 2s, settle=0s
+17:22:01 [INFO] [GenericAPI] 已识别公开收件页面，使用页面 inbox API: host=mail.knm03.com email=inbox-0141-d678@071898.7bcb28.221wx.com
+17:22:01 [INFO] [GenericAPI] HTTP 路由：代理=socks5://127.0.0.1:7897，网络异常时回退直连
+17:22:01 [WARNING] [GenericAPI] 页面/API 请求失败：route=socks5://127.0.0.1:7897 ConnectionError: proxy reset，切换直连重试
+17:22:01 [INFO] [GenericAPI] 首次锁定 OTP=739201, source=public_inbox_page mail_id=msg_01 ts=2026-09-06T12:00:00.000Z, 等 0s 看取码接口是否出现更新验证码...
+17:22:01 [INFO] [GenericAPI] settle 完成，返回 OTP=739201, 候选锁定时间=17:22:01
+ok
+test_public_link_is_converted_to_latest_code_api (test_generic_api_public_inbox.GenericApiPublicInboxTests.test_public_link_is_converted_to_latest_code_api) ... ok
+test_decode_data_uri_base64 (test_generic_api_yangyang.GenericApiYangyangTests.test_decode_data_uri_base64) ... ok
+test_fetch_inline_messages_page_without_api (test_generic_api_yangyang.GenericApiYangyangTests.test_fetch_inline_messages_page_without_api) ... 17:22:01 [INFO] [GenericAPI] inline messages 页面提取到 OTP=541409, mail_id=inline-0, ts=2026-08-02 13:18:53, subject='Your temporary ChatGPT verification code'
+ok
+test_fetch_yangyang_otp_respects_after_ts (test_generic_api_yangyang.GenericApiYangyangTests.test_fetch_yangyang_otp_respects_after_ts) ... ok
+test_fetch_yangyang_otp_uses_api_and_detail (test_generic_api_yangyang.GenericApiYangyangTests.test_fetch_yangyang_otp_uses_api_and_detail) ... 17:22:01 [INFO] [GenericAPI] yangyang 页面提取到 OTP=654321, mail_id=2, ts=2026-08-01 10:01:00, subject='Your OpenAI code is 654321'
+ok
+test_parse_yangyang_url (test_generic_api_yangyang.GenericApiYangyangTests.test_parse_yangyang_url) ... ok
+test_fetch_latest_otp_does_not_reset_settle_for_same_message (test_gptmail_client.GPTMailClientTests.test_fetch_latest_otp_does_not_reset_settle_for_same_message) ... 17:22:01 [INFO] [GPTMail] 开始轮询邮箱 fresh@gptmail.test，最长 10s
+17:22:01 [INFO] [GPTMail] 锁定 OTP 候选，等待 5s 确认
+ok
+test_fetch_latest_otp_reads_only_new_openai_email (test_gptmail_client.GPTMailClientTests.test_fetch_latest_otp_reads_only_new_openai_email) ... 17:22:01 [INFO] [GPTMail] 开始轮询邮箱 fresh@gptmail.test，最长 1s
+17:22:01 [INFO] [GPTMail] 锁定 OTP 候选，等待 0s 确认
+ok
+test_pick_account_generates_random_mailbox_with_key (test_gptmail_client.GPTMailClientTests.test_pick_account_generates_random_mailbox_with_key) ... 17:22:01 [INFO] [GPTMail] 已生成临时邮箱: fresh@gptmail.test
+ok
+test_pick_account_reports_api_error_message (test_gptmail_client.GPTMailClientTests.test_pick_account_reports_api_error_message) ... ok
+test_pick_account_requires_configured_api_key (test_gptmail_client.GPTMailClientTests.test_pick_account_requires_configured_api_key) ... ok
+test_email_config_declares_gptmail_api_key_with_empty_default (test_gptmail_config.GPTMailConfigTests.test_email_config_declares_gptmail_api_key_with_empty_default) ... ok
+test_secret_registry_includes_gptmail_api_key (test_gptmail_config.GPTMailConfigTests.test_secret_registry_includes_gptmail_api_key) ... ok
+test_webui_exposes_gptmail_key_as_secret_env_field (test_gptmail_config.GPTMailConfigTests.test_webui_exposes_gptmail_key_as_secret_env_field) ... ok
+test_connect_uses_email_as_default_username_and_supports_plain_imap (test_imap_mail_client.ImapMailClientTests.test_connect_uses_email_as_default_username_and_supports_plain_imap) ... ok
+test_fetch_latest_otp_filters_recipient_and_old_mail (test_imap_mail_client.ImapMailClientTests.test_fetch_latest_otp_filters_recipient_and_old_mail) ... 17:22:01 [INFO] [IMAP] 开始轮询 user@example.com (imap.example.com:993, SSL=True)
+17:22:01 [INFO] [IMAP] 锁定候选 OTP=654321，等待 0s settle
+ok
+test_pool_import_claim_release_and_source_resolution (test_imap_mail_client.ImapMailClientTests.test_pool_import_claim_release_and_source_resolution) ... ok
+test_webui_accepts_colon_imap_material (test_imap_mail_client.ImapMailClientTests.test_webui_accepts_colon_imap_material) ... 17:22:01 [INFO] 凭证自动巡检调度器已启动（进程内单实例，要求 Gunicorn workers=1）
+ok
+test_webui_can_import_imap_material (test_imap_mail_client.ImapMailClientTests.test_webui_can_import_imap_material) ... 17:22:01 [INFO] 凭证自动巡检调度器已启动（进程内单实例，要求 Gunicorn workers=1）
+ok
+test_run_liveness_check_reuses_normal_worker_entry_point (test_liveness_runner.LivenessRunnerTests.test_run_liveness_check_reuses_normal_worker_entry_point) ... ok
+test_sync_worker_claims_account_and_uses_normal_execution_chain (test_liveness_runner.LivenessRunnerTests.test_sync_worker_claims_account_and_uses_normal_execution_chain) ... ok
+test_sync_worker_rejects_concurrent_normal_liveness (test_liveness_runner.LivenessRunnerTests.test_sync_worker_rejects_concurrent_normal_liveness) ... ok
+test_fetch_latest_otp_reads_code_match (test_mailnest_client.MailNestClientTests.test_fetch_latest_otp_reads_code_match) ... 17:22:01 [INFO] [MailNest] 开始轮询邮箱 fresh@mailnest.test，最长 1s
+17:22:01 [INFO] [MailNest] 锁定 OTP 候选，等待 0s 确认
+ok
+test_pick_account_buys_mailbox_with_project_code (test_mailnest_client.MailNestClientTests.test_pick_account_buys_mailbox_with_project_code) ... 17:22:01 [INFO] [MailNest] 已获取临时邮箱: fresh@mailnest.test project_code=chatgpt001
+ok
+test_pick_account_requires_api_key (test_mailnest_client.MailNestClientTests.test_pick_account_requires_api_key) ... ok
+test_email_config_declares_mailnest_defaults (test_mailnest_config.MailNestConfigTests.test_email_config_declares_mailnest_defaults) ... ok
+test_secret_registry_includes_mailnest_api_key (test_mailnest_config.MailNestConfigTests.test_secret_registry_includes_mailnest_api_key) ... ok
+test_webui_exposes_mailnest_fields (test_mailnest_config.MailNestConfigTests.test_webui_exposes_mailnest_fields) ... ok
+test_403_retries_on_same_session_and_keeps_cookie_jar (test_openai_auth_authorize_retry.AuthorizeRetryTests.test_403_retries_on_same_session_and_keeps_cookie_jar) ... 17:22:01 [INFO] [步骤4] 跟随 authorize URL 重定向 (尝试 1/3)...
+17:22:01 [WARNING] [步骤4] authorize 临时失败 (RuntimeError: HTTP Error 403)，保留当前 session/deviceId/CF Cookie，1.0s 后重试...
+17:22:01 [INFO] [步骤4] 跟随 authorize URL 重定向 (尝试 2/3)...
+17:22:01 [INFO] [步骤4] 重定向完成, 最终URL: https://auth.openai.com/email-verification
+ok
+test_browser_session_keeps_document_id_until_explicit_navigation (test_openai_auth_registration_flow.OpenAIRegistrationFlowTests.test_browser_session_keeps_document_id_until_explicit_navigation) ... ok
+test_bundled_sentinel_sdk_matches_captured_20260810913b_source (test_openai_auth_registration_flow.OpenAIRegistrationFlowTests.test_bundled_sentinel_sdk_matches_captured_20260810913b_source) ... ok
+test_create_account_password_rejects_external_landing (test_openai_auth_registration_flow.OpenAIRegistrationFlowTests.test_create_account_password_rejects_external_landing) ... 17:22:01 [INFO] [步骤5] 切换到创建账号密码页...
+ok
+test_email_otp_send_accepts_relative_url_and_rotates_document_id (test_openai_auth_registration_flow.OpenAIRegistrationFlowTests.test_email_otp_send_accepts_relative_url_and_rotates_document_id) ... ok
+test_get_providers_403_is_optional_and_resets_circuit (test_openai_auth_registration_flow.OpenAIRegistrationFlowTests.test_get_providers_403_is_optional_and_resets_circuit) ... 17:22:01 [INFO] [步骤1] 获取 OAuth Providers...
+17:22:01 [WARNING] [步骤1] OAuth Providers 返回 HTTP 403；该发现接口为可选项，已清理本地熔断并继续 CSRF/signin 链路
+ok
+test_header_runner_uses_the_same_sid_as_challenge_request (test_openai_auth_registration_flow.OpenAIRegistrationFlowTests.test_header_runner_uses_the_same_sid_as_challenge_request) ... 17:22:01 [INFO] [Sentinel] 检测到 SO 字段，已构建 so-token 头
+17:22:01 [INFO] [Sentinel] 检测到 SO 字段，已构建 so-token 头
+ok
+test_navigate_create_account_password_switches_from_passwordless_page (test_openai_auth_registration_flow.OpenAIRegistrationFlowTests.test_navigate_create_account_password_switches_from_passwordless_page) ... 17:22:01 [INFO] [步骤5] 切换到创建账号密码页...
+17:22:01 [INFO] [步骤5] 已进入创建账号密码页
+ok
+test_network_preflight_retries_status_403_on_same_session (test_openai_auth_registration_flow.OpenAIRegistrationFlowTests.test_network_preflight_retries_status_403_on_same_session) ... 17:22:01 [WARNING] [预检:chatgpt-auth-login] 代理链路临时失败 (1/3): RuntimeError: HTTP 403，保留当前会话，1.0s 后重试
+17:22:01 [INFO] [预检:chatgpt-auth-login] 代理链路重试成功 (2/3)
+ok
+test_network_preflight_uses_address_bar_navigation_shape (test_openai_auth_registration_flow.OpenAIRegistrationFlowTests.test_network_preflight_uses_address_bar_navigation_shape) ... ok
+test_password_page_sentinel_bundle_reuses_same_iframe_p (test_openai_auth_registration_flow.OpenAIRegistrationFlowTests.test_password_page_sentinel_bundle_reuses_same_iframe_p) ... 17:22:01 [INFO] [Sentinel] 密码页 flow bundle 初始化完成
+ok
+test_register_user_matches_password_registration_request (test_openai_auth_registration_flow.OpenAIRegistrationFlowTests.test_register_user_matches_password_registration_request) ... 17:22:01 [INFO] [步骤7] 提交邮箱和密码：user@example.com
+ok
+test_sentinel_flow_selects_matching_sdk_context_and_sid (test_openai_auth_registration_flow.OpenAIRegistrationFlowTests.test_sentinel_flow_selects_matching_sdk_context_and_sid) ... 17:22:01 [INFO] [Sentinel] 请求 sentinel token, flow=username_password_create
+17:22:01 [INFO] [Sentinel] 获取 sentinel token 成功, persona=p
+17:22:01 [INFO] [Sentinel] 服务端要求项: 无
+17:22:01 [INFO] [Sentinel] 请求 sentinel token, flow=email_otp_validate
+17:22:01 [INFO] [Sentinel] 获取 sentinel token 成功, persona=p
+17:22:01 [INFO] [Sentinel] 服务端要求项: 无
+17:22:01 [INFO] [Sentinel] 请求 sentinel token, flow=oauth_create_account
+17:22:01 [INFO] [Sentinel] 获取 sentinel token 成功, persona=p
+17:22:01 [INFO] [Sentinel] 服务端要求项: 无
+ok
+test_sentinel_iframe_retries_socks5_proxy_failure (test_openai_auth_registration_flow.OpenAIRegistrationFlowTests.test_sentinel_iframe_retries_socks5_proxy_failure) ... 17:22:01 [WARNING] [Sentinel iframe:username_password_create] 代理链路临时失败 (1/3): ProxyError: curl: (97) cannot complete SOCKS5 connection to sentinel.openai.com，保留当前会话，1.0s 后重试
+17:22:01 [INFO] [Sentinel iframe:username_password_create] 代理链路重试成功 (2/3)
+17:22:01 [INFO] [Sentinel] 请求 sentinel token, flow=username_password_create
+17:22:01 [INFO] [Sentinel] 获取 sentinel token 成功, persona=p
+17:22:01 [INFO] [Sentinel] 服务端要求项: 无
+ok
+test_validate_email_otp_forwards_both_sentinel_headers (test_openai_auth_registration_flow.OpenAIRegistrationFlowTests.test_validate_email_otp_forwards_both_sentinel_headers) ... 17:22:01 [INFO] [步骤10] 已添加 openai-sentinel-so-token 头
+17:22:01 [INFO] [步骤10] 提交邮箱验证码
+17:22:01 [INFO] [步骤10] 验证码验证成功: None
+17:22:01 [INFO] [步骤10] 验证响应已成功，page_type=None
+ok
+test_context_cache_is_case_insensitive (test_outlook_client.OutlookClientContextTests.test_context_cache_is_case_insensitive) ... ok
+test_non_outlook_registered_source_is_not_read_from_outlook_pool (test_outlook_client.OutlookClientContextTests.test_non_outlook_registered_source_is_not_read_from_outlook_pool) ... ok
+test_registered_account_fills_incomplete_pool_context (test_outlook_client.OutlookClientContextTests.test_registered_account_fills_incomplete_pool_context) ... ok
+test_restores_context_from_registered_account_after_pool_missing (test_outlook_client.OutlookClientContextTests.test_restores_context_from_registered_account_after_pool_missing) ... ok
+test_all_campaigns_preserved_without_changing_plus_logic (test_plan_promo_details.PlanPromoDetailsTests.test_all_campaigns_preserved_without_changing_plus_logic) ... ok
+test_persistence_list_polling_and_failure_preservation (test_plan_promo_details.PlanPromoDetailsTests.test_persistence_list_polling_and_failure_preservation) ... ok
+test_password_is_submitted_before_registration_otp (test_protocol_password_registration.ProtocolPasswordRegistrationTests.test_password_is_submitted_before_registration_otp) ... 17:22:01 [INFO] [注册] 开始：user@example.com，代理=无
+17:22:01 [INFO] [注册] 本次随机生日: 2000-01-01
+17:22:01 [INFO] [OTP] 等待验证码：user@example.com（第 1/3 次）
+17:22:01 [INFO] [步骤10] 后续分支判断: page_type=about_you, has_continue_url=True
+17:22:01 [INFO] [注册] 创建接口已通过：user@example.com，继续完成 OAuth 回调
+17:22:01 [INFO] [Codex] 跳过：user@example.com，原因=None
+17:22:01 [INFO] [完成] user@example.com，账号ID=42，Token 已保存（内容不写日志）
+17:22:01 [INFO] [Flow] 跳过：user@example.com，原因=None
+ok
+test_authorize_403_restarts_the_complete_pre_otp_chain (test_protocol_preflight_session_rotation.ProtocolPreflightSessionRotationTests.test_authorize_403_restarts_the_complete_pre_otp_chain) ... 17:22:01 [WARNING] [认证] OTP 前 authorize 链路失败（1/3）：RuntimeError: HTTP Error 403；关闭当前会话并从登录页重新开始
+17:22:01 [INFO] [认证] 重建会话后 authorize 成功 (2/3)
+ok
+test_csrf_403_restarts_the_complete_pre_otp_chain (test_protocol_preflight_session_rotation.ProtocolPreflightSessionRotationTests.test_csrf_403_restarts_the_complete_pre_otp_chain) ... 17:22:01 [WARNING] [认证] OTP 前链路失败（1/3）：RuntimeError: HTTP Error 403；关闭当前会话并从登录页重新开始
+17:22:01 [INFO] [认证] 新会话前置链路重试成功 (2/3)
+ok
+test_explicit_proxy_does_not_fall_back_to_direct (test_protocol_preflight_session_rotation.ProtocolPreflightSessionRotationTests.test_explicit_proxy_does_not_fall_back_to_direct) ... ok
+test_proxy_failure_can_fall_back_to_direct_before_otp (test_protocol_preflight_session_rotation.ProtocolPreflightSessionRotationTests.test_proxy_failure_can_fall_back_to_direct_before_otp) ... 17:22:01 [WARNING] [认证] 代理前置链路失败：RuntimeError: HTTP Error 403；OTP 尚未触发，切换直连重试
+ok
+test_retryable_preflight_rebuilds_session_before_otp (test_protocol_preflight_session_rotation.ProtocolPreflightSessionRotationTests.test_retryable_preflight_rebuilds_session_before_otp) ... 17:22:01 [WARNING] [预检] 当前会话重试耗尽（1/3）：RuntimeError: HTTP Error 403；关闭会话并重新分配出口后重试
+17:22:01 [INFO] [预检] 新会话链路重试成功 (2/3)
+ok
+test_relay_counts_both_directions (test_proxy_chain_traffic.ProxyChainTrafficTests.test_relay_counts_both_directions) ... ok
+test_existing_scheme_is_preserved (test_proxy_normalization.ProxyNormalizationTests.test_existing_scheme_is_preserved) ... ok
+test_host_port_gets_default_scheme (test_proxy_normalization.ProxyNormalizationTests.test_host_port_gets_default_scheme) ... ok
+test_host_port_username_password_format_encodes_credentials (test_proxy_normalization.ProxyNormalizationTests.test_host_port_username_password_format_encodes_credentials) ... ok
+test_invalid_port_is_preserved (test_proxy_normalization.ProxyNormalizationTests.test_invalid_port_is_preserved) ... ok
+test_list_filters_blank_entries (test_proxy_normalization.ProxyNormalizationTests.test_list_filters_blank_entries) ... ok
+test_username_password_host_port_format_encodes_credentials (test_proxy_normalization.ProxyNormalizationTests.test_username_password_host_port_format_encodes_credentials) ... ok
+test_acquire_email_after_input_allocates_only_for_automatic_mode (test_registration_email_allocation.DelayedEmailAllocationTests.test_acquire_email_after_input_allocates_only_for_automatic_mode) ... 17:22:01 [INFO] [EmailProvider] 已找到邮箱输入框，开始分配邮箱: allocated@example.com
+ok
+test_acquire_email_after_input_keeps_fixed_email_without_allocating (test_registration_email_allocation.DelayedEmailAllocationTests.test_acquire_email_after_input_keeps_fixed_email_without_allocating) ... ok
+test_browser_use_finds_input_before_allocating_email (test_registration_email_allocation.DelayedEmailAllocationTests.test_browser_use_finds_input_before_allocating_email) ... 17:22:01 [INFO] [BrowserUse] 提交邮箱尝试 1/2：页面找到输入框后分配
+17:22:01 [INFO] [BrowserUse] 邮箱提交后状态：email_verification url=https://chatgpt.com/auth/login
+ok
+test_roxy_accepts_verification_page_reached_during_slow_diagnostic (test_registration_email_allocation.DelayedEmailAllocationTests.test_roxy_accepts_verification_page_reached_during_slow_diagnostic)
+复现邮箱提交超时后，读取诊断 DOM 时才完成 OTP 跳转的竞态。 ... 17:22:01 [INFO] [Roxy注册] 已填写邮箱并校验通过：slow@example.com
+17:22:01 [INFO] [Roxy注册] 已提交邮箱，等待进入密码页或验证码页（1/3）
+17:22:01 [INFO] [Roxy注册] 邮箱提交诊断期间页面已进入下一步：otp
+ok
+test_roxy_finds_input_before_allocating_email (test_registration_email_allocation.DelayedEmailAllocationTests.test_roxy_finds_input_before_allocating_email) ... 17:22:01 [INFO] [Roxy注册] 已填写邮箱并校验通过：roxy@example.com
+17:22:01 [INFO] [Roxy注册] 已提交邮箱，等待进入密码页或验证码页（1/3）
+17:22:01 [INFO] [Roxy注册] 邮箱提交后已进入下一步：otp
+ok
+test_existing_registration_password_skips_password_task_but_keeps_twofa (test_registration_password_auto.RegistrationPasswordAutoTests.test_existing_registration_password_skips_password_task_but_keeps_twofa) ... 17:22:01 [INFO] [ChatGPT密码] 注册流程已有 ChatGPT 密码，跳过自动设置: id=8
+17:22:01 [INFO] [2FA] 注册后自动设置已入队: id=8
+ok
+test_generated_password_has_required_character_classes (test_registration_password_auto.RegistrationPasswordAutoTests.test_generated_password_has_required_character_classes) ... ok
+test_password_is_queued_directly_when_twofa_is_already_complete (test_registration_password_auto.RegistrationPasswordAutoTests.test_password_is_queued_directly_when_twofa_is_already_complete) ... 17:22:01 [INFO] [ChatGPT密码] 注册后自动设置已入队: id=9
+ok
+test_password_waits_for_automatic_twofa_completion (test_registration_password_auto.RegistrationPasswordAutoTests.test_password_waits_for_automatic_twofa_completion) ... 17:22:01 [INFO] [ChatGPT密码] 等待注册后 2FA 完成后再入队: id=7
+17:22:01 [INFO] [ChatGPT密码] 注册后自动设置已入队: id=7
+ok
+test_save_account_data_calls_post_registration_password_hook (test_registration_password_auto.RegistrationPasswordAutoTests.test_save_account_data_calls_post_registration_password_hook) ... 17:22:01 [INFO] [Save] 账号及凭证已保存到 SQLite, id=11, email=user@example.com
+17:22:01 [INFO] [Plan] 注册后自动套餐查询已跳过: id=11, email=user@example.com
+ok
+test_blank_job_log_returns_a_task_summary (test_registration_task_regressions.RegistrationTaskRegressionTests.test_blank_job_log_returns_a_task_summary) ... ok
+test_finalize_registration_clears_breaker_after_retryable_callback_403 (test_registration_task_regressions.RegistrationTaskRegressionTests.test_finalize_registration_clears_breaker_after_retryable_callback_403) ... 17:22:01 [INFO] [登录态] 完成 OAuth 回调并拉取 Token：synthetic@example.com (尝试 1/5)
+17:22:01 [INFO] [登录态] 清理当前会话熔断，保留 Cookie 后重试
+17:22:01 [WARNING] [登录态] 回调或拉取 Token 失败：synthetic@example.com，HTTPError: HTTP Error 403: ，1.0s 后重试
+17:22:01 [INFO] [登录态] 完成 OAuth 回调并拉取 Token：synthetic@example.com (尝试 2/5)
+17:22:01 [INFO] [登录态] 已拿到 accessToken：synthetic@example.com
+ok
+test_job_log_context_captures_info_and_restores_root_level (test_registration_task_regressions.RegistrationTaskRegressionTests.test_job_log_context_captures_info_and_restores_root_level) ... 17:22:01 [INFO] captured info
+ok
+test_nested_job_log_context_keeps_info_enabled_until_last_exit (test_registration_task_regressions.RegistrationTaskRegressionTests.test_nested_job_log_context_keeps_info_enabled_until_last_exit) ... 17:22:01 [INFO] nested captured
+ok
+test_prepare_registration_args_prefers_retry_job_email (test_registration_task_regressions.RegistrationTaskRegressionTests.test_prepare_registration_args_prefers_retry_job_email) ... ok
+test_protocol_registration_can_start_codex_when_explicitly_enabled (test_registration_task_regressions.RegistrationTaskRegressionTests.test_protocol_registration_can_start_codex_when_explicitly_enabled) ... /opt/homebrew/Cellar/python@3.14/3.14.7/Frameworks/Python.framework/Versions/3.14/lib/python3.14/tempfile.py:484: ResourceWarning: Implicitly cleaning up <HTTPError 403: ''>
+  _warnings.warn(self.warn_message, ResourceWarning)
+ok
+test_protocol_registration_does_not_start_codex_when_disabled (test_registration_task_regressions.RegistrationTaskRegressionTests.test_protocol_registration_does_not_start_codex_when_disabled) ... ok
+test_registered_registration_job_is_success_and_not_codex_retryable (test_registration_task_regressions.RegistrationTaskRegressionTests.test_registered_registration_job_is_success_and_not_codex_retryable) ... ok
+test_registration_retry_job_inherits_source_email (test_registration_task_regressions.RegistrationTaskRegressionTests.test_registration_retry_job_inherits_source_email) ... ok
+test_run_one_job_passes_recorded_email_to_registration (test_registration_task_regressions.RegistrationTaskRegressionTests.test_run_one_job_passes_recorded_email_to_registration) ... 17:22:01 [INFO] [Job 92] 开始注册任务
+17:22:01 [INFO] [Job 92] 成功: original@example.com
+ok
+test_fetch_latest_otp_restores_saved_service_token_after_restart (test_remail_client.RemailClientTests.test_fetch_latest_otp_restores_saved_service_token_after_restart) ... 17:22:01 [INFO] [Remail] 已从账号保存信息恢复取件上下文: FRESH@OUTLOOK.TEST order=R-SAVED
+17:22:01 [INFO] [Remail] 开始轮询邮箱 FRESH@OUTLOOK.TEST，最长 1s
+17:22:01 [INFO] [Remail] 锁定 OTP 候选，等待 0s 确认
+ok
+test_fetch_latest_otp_uses_pickup_token_without_api_key (test_remail_client.RemailClientTests.test_fetch_latest_otp_uses_pickup_token_without_api_key) ... 17:22:01 [INFO] [Remail] 开始轮询邮箱 fresh@outlook.test，最长 1s
+17:22:01 [INFO] [Remail] 锁定 OTP 候选，等待 0s 确认
+ok
+test_pick_account_can_wait_for_order_credentials (test_remail_client.RemailClientTests.test_pick_account_can_wait_for_order_credentials) ... 17:22:01 [INFO] [Remail] 已创建邮箱订单: fresh@outlook.test order=R20260829123456789 project=1001
+ok
+test_pick_account_creates_code_order_and_caches_service_token (test_remail_client.RemailClientTests.test_pick_account_creates_code_order_and_caches_service_token) ... 17:22:01 [INFO] [Remail] 已创建邮箱订单: fresh@outlook.test order=R20260829123456789 project=1001
+ok
+test_pick_account_requires_project_id (test_remail_client.RemailClientTests.test_pick_account_requires_project_id) ... ok
+test_release_account_clears_cached_context (test_remail_client.RemailClientTests.test_release_account_clears_cached_context) ... 17:22:01 [INFO] [Remail] 已释放取件上下文: fresh@outlook.test order=R1 status=failed note=
+ok
+test_restore_context_requires_exact_email_match (test_remail_client.RemailClientTests.test_restore_context_requires_exact_email_match) ... FAIL
+test_email_config_declares_remail_defaults (test_remail_config.RemailConfigTests.test_email_config_declares_remail_defaults) ... ok
+test_remail_promo_is_rendered_after_section_help (test_remail_config.RemailConfigTests.test_remail_promo_is_rendered_after_section_help) ... ok
+test_secret_registry_includes_remail_api_key (test_remail_config.RemailConfigTests.test_secret_registry_includes_remail_api_key) ... ok
+test_webui_exposes_remail_fields (test_remail_config.RemailConfigTests.test_webui_exposes_remail_fields) ... ok
+test_cache_miss_continues_network_request (test_roxy_asset_cache.RoxyLocalAssetCacheTests.test_cache_miss_continues_network_request) ... ok
+test_concurrent_instances_only_count_same_url_once (test_roxy_asset_cache.RoxyLocalAssetCacheTests.test_concurrent_instances_only_count_same_url_once) ... ok
+test_data_saver_mode_automatically_enables_cache (test_roxy_asset_cache.RoxyLocalAssetCacheTests.test_data_saver_mode_automatically_enables_cache) ... ok
+test_fulfilled_url_is_fallback_when_fetch_network_id_differs (test_roxy_asset_cache.RoxyLocalAssetCacheTests.test_fulfilled_url_is_fallback_when_fetch_network_id_differs) ... ok
+test_fulfilled_url_recovers_network_id_when_fetch_event_omits_it (test_roxy_asset_cache.RoxyLocalAssetCacheTests.test_fulfilled_url_recovers_network_id_when_fetch_event_omits_it) ... ok
+test_only_allows_static_assets (test_roxy_asset_cache.RoxyLocalAssetCacheTests.test_only_allows_static_assets) ... ok
+test_record_and_replay_exact_url (test_roxy_asset_cache.RoxyLocalAssetCacheTests.test_record_and_replay_exact_url) ... ok
+test_concurrent_open_profile_calls_are_serialized (test_roxy_window_create_lock.RoxyWindowCreateLockTests.test_concurrent_open_profile_calls_are_serialized) ... ok
+test_availability_allows_unknown_read_only_endpoint_when_service_responds (test_roxybrowser_client_retry.RoxyBrowserClientRetryTests.test_availability_allows_unknown_read_only_endpoint_when_service_responds) ... ok
+test_availability_connection_failure_is_single_read_only_request (test_roxybrowser_client_retry.RoxyBrowserClientRetryTests.test_availability_connection_failure_is_single_read_only_request) ... ok
+test_availability_reports_auth_failure_without_exposing_token (test_roxybrowser_client_retry.RoxyBrowserClientRetryTests.test_availability_reports_auth_failure_without_exposing_token) ... ok
+test_create_non_transient_business_error_is_not_retried (test_roxybrowser_client_retry.RoxyBrowserClientRetryTests.test_create_non_transient_business_error_is_not_retried) ... ok
+test_create_stops_after_configured_attempts (test_roxybrowser_client_retry.RoxyBrowserClientRetryTests.test_create_stops_after_configured_attempts) ... 17:22:01 [WARNING] [Roxy] API 请求失败，将在 3.0s 后使用相同 create payload/name 重试：POST /browser/create attempt=1/3 error=connection timed out
+17:22:01 [WARNING] [Roxy] API 请求失败，将在 6.0s 后使用相同 create payload/name 重试：POST /browser/create attempt=2/3 error=connection timed out
+ok
+test_create_timeout_response_retries_with_same_payload (test_roxybrowser_client_retry.RoxyBrowserClientRetryTests.test_create_timeout_response_retries_with_same_payload) ... 17:22:01 [WARNING] [Roxy] API 请求失败，将在 3.0s 后使用相同 create payload/name 重试：POST /browser/create attempt=1/3 error=Roxy API 返回失败 POST /browser/create: timeout of 15000ms exceeded
+17:22:01 [INFO] [Roxy] API 重试成功：POST /browser/create attempt=2/3
+ok
+test_non_create_uses_normal_api_retry_count (test_roxybrowser_client_retry.RoxyBrowserClientRetryTests.test_non_create_uses_normal_api_retry_count) ... 17:22:01 [WARNING] [Roxy] API 请求失败，将在 2.0s 后使用相同请求参数重试：POST /browser/open attempt=1/2 error=Roxy API 返回失败 POST /browser/open: temporarily unavailable
+17:22:01 [INFO] [Roxy] API 重试成功：POST /browser/open attempt=2/2
+ok
+test_otp_flow_uses_versioned_sdk (test_sentinel_runner_alignment.SentinelRunnerAlignmentTests.test_otp_flow_uses_versioned_sdk) ... 17:22:01 [INFO] [SentinelRunner] 调用 Node 生成 token, flow=email_otp_validate
+17:22:01 [INFO] [SentinelRunner] token 生成成功, flow=email_otp_validate, 包含 turnstile=False, 包含 so=False, 字段: {'p': 5, 'c': 9, 'id': 9, 'flow': 18}
+ok
+test_password_flow_uses_auth_wrapper_sdk_and_real_screen_shape (test_sentinel_runner_alignment.SentinelRunnerAlignmentTests.test_password_flow_uses_auth_wrapper_sdk_and_real_screen_shape) ... 17:22:01 [INFO] [SentinelRunner] 调用 Node 生成 token, flow=username_password_create
+17:22:01 [INFO] [SentinelRunner] token 生成成功, flow=username_password_create, 包含 turnstile=False, 包含 so=False, 字段: {'p': 5, 'c': 9, 'id': 9, 'flow': 24}
+ok
+test_cross_site_auth_navigation_uses_native_document_headers (test_session_navigation_headers.SessionNavigationHeaderTests.test_cross_site_auth_navigation_uses_native_document_headers) ... ok
+test_exit_geo_detection_uses_initialized_cache_without_network (test_session_navigation_headers.SessionNavigationHeaderTests.test_exit_geo_detection_uses_initialized_cache_without_network) ... ok
+test_external_oauth_navigation_has_no_fake_referer (test_session_navigation_headers.SessionNavigationHeaderTests.test_external_oauth_navigation_has_no_fake_referer) ... ok
+test_geo_country_name_is_normalized_to_iso_code (test_session_navigation_headers.SessionNavigationHeaderTests.test_geo_country_name_is_normalized_to_iso_code) ... ok
+test_initial_chatgpt_navigation_matches_address_bar_navigation (test_session_navigation_headers.SessionNavigationHeaderTests.test_initial_chatgpt_navigation_matches_address_bar_navigation) ... ok
+test_proxy_country_without_named_profile_is_derived_from_geo (test_session_navigation_headers.SessionNavigationHeaderTests.test_proxy_country_without_named_profile_is_derived_from_geo) ... ok
+test_unknown_proxy_country_does_not_leak_fixed_local_locale (test_session_navigation_headers.SessionNavigationHeaderTests.test_unknown_proxy_country_does_not_leak_fixed_local_locale) ... ok
+test_vietnam_exit_uses_matching_locale_and_timezone (test_session_navigation_headers.SessionNavigationHeaderTests.test_vietnam_exit_uses_matching_locale_and_timezone) ... ok
+test_cdp_headers_include_api_key (test_skyvern_config.SkyvernConfigTests.test_cdp_headers_include_api_key) ... ok
+test_open_session_reads_browser_address_from_get_session (test_skyvern_config.SkyvernConfigTests.test_open_session_reads_browser_address_from_get_session) ... 17:22:01 [INFO] [Skyvern] 创建 browser session: base=https://api.example.test payload={'timeout': 60, 'browser_type': 'stealth-chromium', 'generate_browser_profile': False, 'ad_blocker': True}
+17:22:02 [INFO] [Skyvern] browser session 已创建：session_id=bs_123 browser_address=http://127.0.0.1:9222
+ok
+test_secret_registry_includes_skyvern_api_key (test_skyvern_config.SkyvernConfigTests.test_secret_registry_includes_skyvern_api_key) ... ok
+test_skyvern_normalizes_legacy_webui_values (test_skyvern_config.SkyvernConfigTests.test_skyvern_normalizes_legacy_webui_values) ... ok
+test_webui_exposes_skyvern_fields (test_skyvern_config.SkyvernConfigTests.test_webui_exposes_skyvern_fields) ... ok
+test_acquire_number_uses_h_take_phone_when_mode_new (test_sms_provider_h.HSmsProviderTests.test_acquire_number_uses_h_take_phone_when_mode_new) ... 17:22:02 [INFO] [SMS:H] 号码规范化：raw_phone='2025550456', prefix='1', normalized=+12025550456
+17:22:02 [INFO] [SMS:H] 取号成功：mode=new, api=/api/admin/h/take-phone, id=hid-2, phone=+12025550456, reused=False, duplicate=False
+ok
+test_acquire_number_uses_h_take_reusable_phone (test_sms_provider_h.HSmsProviderTests.test_acquire_number_uses_h_take_reusable_phone) ... 17:22:02 [INFO] [SMS:H] 号码规范化：raw_phone='2025550123', prefix='1', normalized=+12025550123
+17:22:02 [INFO] [SMS:H] 取号成功：mode=reusable, api=/api/admin/h/take-reusable-phone, id=hid-1, phone=+12025550123, reused=True, duplicate=False
+ok
+test_cancel_uses_h_release (test_sms_provider_h.HSmsProviderTests.test_cancel_uses_h_release) ... 17:22:02 [INFO] [SMS:H] 已释放号码 id=hid-1, released=1
+ok
+test_secret_registry_and_webui_fields_include_h (test_sms_provider_h.HSmsProviderTests.test_secret_registry_and_webui_fields_include_h) ... ok
+test_wait_for_sms_code_uses_h_fetch_code (test_sms_provider_h.HSmsProviderTests.test_wait_for_sms_code_uses_h_fetch_code) ... 17:22:02 [INFO] [SMS] 等待短信验证码 activation_id=hid-1，最长 1s...
+17:22:02 [INFO] [SMS] 第 1 轮获取验证码 activation_id=hid-1，已等 0s，剩余约 0s
+17:22:02 [INFO] [SMS:H] 第 1 轮收到验证码：123456
+ok
+test_audit_write_is_atomic_private_and_symlink_target_safe (test_sub2api_401_service.Sub2Api401ServiceTests.test_audit_write_is_atomic_private_and_symlink_target_safe) ... ok
+test_cleanup_blocks_when_same_email_snapshot_changes (test_sub2api_401_service.Sub2Api401ServiceTests.test_cleanup_blocks_when_same_email_snapshot_changes) ... ok
+test_cleanup_deactivation_failure_preserves_safe_retry_evidence (test_sub2api_401_service.Sub2Api401ServiceTests.test_cleanup_deactivation_failure_preserves_safe_retry_evidence) ... ok
+test_cleanup_delete_failure_retries_deactivation_and_preserves_evidence (test_sub2api_401_service.Sub2Api401ServiceTests.test_cleanup_delete_failure_retries_deactivation_and_preserves_evidence) ... ok
+test_cleanup_failure_preserves_retry_evidence (test_sub2api_401_service.Sub2Api401ServiceTests.test_cleanup_failure_preserves_retry_evidence) ... ok
+test_cleanup_reconciles_missing_old_id_after_relist_failure_and_restart (test_sub2api_401_service.Sub2Api401ServiceTests.test_cleanup_reconciles_missing_old_id_after_relist_failure_and_restart) ... ok
+test_cleanup_request_failure_stays_retryable_when_old_id_disappears_concurrently (test_sub2api_401_service.Sub2Api401ServiceTests.test_cleanup_request_failure_stays_retryable_when_old_id_disappears_concurrently) ... ok
+test_cleanup_requires_healthy_replacement_after_delete (test_sub2api_401_service.Sub2Api401ServiceTests.test_cleanup_requires_healthy_replacement_after_delete) ... ok
+test_cleanup_requires_opt_in_and_deletes_only_locked_old_id (test_sub2api_401_service.Sub2Api401ServiceTests.test_cleanup_requires_opt_in_and_deletes_only_locked_old_id) ... ok
+test_cleanup_waits_for_detection_state_commit_and_does_not_delete_stale_target (test_sub2api_401_service.Sub2Api401ServiceTests.test_cleanup_waits_for_detection_state_commit_and_does_not_delete_stale_target) ... ok
+test_detect_blocks_cleanup_ready_when_verified_snapshot_changes (test_sub2api_401_service.Sub2Api401ServiceTests.test_detect_blocks_cleanup_ready_when_verified_snapshot_changes) ... ok
+test_detect_classifies_healthy_unauthorized_timeout_and_unknown (test_sub2api_401_service.Sub2Api401ServiceTests.test_detect_classifies_healthy_unauthorized_timeout_and_unknown) ... ok
+test_detect_reconciles_cleanup_ready_when_locked_old_id_disappears (test_sub2api_401_service.Sub2Api401ServiceTests.test_detect_reconciles_cleanup_ready_when_locked_old_id_disappears) ... ok
+test_email_missing_or_conflicting_is_ambiguous (test_sub2api_401_service.Sub2Api401ServiceTests.test_email_missing_or_conflicting_is_ambiguous) ... ok
+test_historical_all_healthy_duplicates_keep_unique_latest_out_of_items (test_sub2api_401_service.Sub2Api401ServiceTests.test_historical_all_healthy_duplicates_keep_unique_latest_out_of_items) ... ok
+test_historical_all_unauthorized_cleanup_allows_sequential_ids_after_restart (test_sub2api_401_service.Sub2Api401ServiceTests.test_historical_all_unauthorized_cleanup_allows_sequential_ids_after_restart) ... ok
+test_historical_all_unauthorized_cleanup_deletes_exact_old_id_then_exposes_keeper_pending (test_sub2api_401_service.Sub2Api401ServiceTests.test_historical_all_unauthorized_cleanup_deletes_exact_old_id_then_exposes_keeper_pending) ... ok
+test_historical_all_unauthorized_cleanup_refuses_classification_drift (test_sub2api_401_service.Sub2Api401ServiceTests.test_historical_all_unauthorized_cleanup_refuses_classification_drift) ... ok
+test_historical_all_unauthorized_cleanup_refuses_created_at_drift_before_delete (test_sub2api_401_service.Sub2Api401ServiceTests.test_historical_all_unauthorized_cleanup_refuses_created_at_drift_before_delete) ... ok
+test_historical_all_unauthorized_cleanup_retains_post_delete_created_at_drift (test_sub2api_401_service.Sub2Api401ServiceTests.test_historical_all_unauthorized_cleanup_retains_post_delete_created_at_drift) ... ok
+test_historical_all_unauthorized_cleanup_retains_post_delete_keeper_drift (test_sub2api_401_service.Sub2Api401ServiceTests.test_historical_all_unauthorized_cleanup_retains_post_delete_keeper_drift) ... ok
+test_historical_all_unauthorized_duplicates_keep_unique_latest_out_of_items (test_sub2api_401_service.Sub2Api401ServiceTests.test_historical_all_unauthorized_duplicates_keep_unique_latest_out_of_items) ... ok
+test_historical_all_unauthorized_duplicates_require_complete_unique_timestamps (test_sub2api_401_service.Sub2Api401ServiceTests.test_historical_all_unauthorized_duplicates_require_complete_unique_timestamps) ... ok
+test_historical_cleanup_allows_sequential_exact_id_cleanup_after_restart (test_sub2api_401_service.Sub2Api401ServiceTests.test_historical_cleanup_allows_sequential_exact_id_cleanup_after_restart) ... ok
+test_historical_cleanup_deletes_only_exact_old_ids (test_sub2api_401_service.Sub2Api401ServiceTests.test_historical_cleanup_deletes_only_exact_old_ids) ... ok
+test_historical_duplicates_with_incomplete_health_remain_ambiguous (test_sub2api_401_service.Sub2Api401ServiceTests.test_historical_duplicates_with_incomplete_health_remain_ambiguous) ... ok
+test_historical_healthy_duplicates_with_tied_latest_remain_ambiguous (test_sub2api_401_service.Sub2Api401ServiceTests.test_historical_healthy_duplicates_with_tied_latest_remain_ambiguous) ... ok
+test_historical_healthy_duplicates_without_created_at_remain_ambiguous (test_sub2api_401_service.Sub2Api401ServiceTests.test_historical_healthy_duplicates_without_created_at_remain_ambiguous) ... ok
+test_historical_unique_healthy_keeper_marks_all_unauthorized_older_ids (test_sub2api_401_service.Sub2Api401ServiceTests.test_historical_unique_healthy_keeper_marks_all_unauthorized_older_ids) ... ok
+test_legacy_cleanup_ready_audit_defaults_replacement_health_to_healthy (test_sub2api_401_service.Sub2Api401ServiceTests.test_legacy_cleanup_ready_audit_defaults_replacement_health_to_healthy) ... ok
+test_local_retry_failure_preserves_old_id_and_blocks_cleanup (test_sub2api_401_service.Sub2Api401ServiceTests.test_local_retry_failure_preserves_old_id_and_blocks_cleanup) ... ok
+test_multiple_new_accounts_are_ambiguous (test_sub2api_401_service.Sub2Api401ServiceTests.test_multiple_new_accounts_are_ambiguous) ... ok
+test_no_new_account_is_ambiguous_and_not_cleanup_ready (test_sub2api_401_service.Sub2Api401ServiceTests.test_no_new_account_is_ambiguous_and_not_cleanup_ready) ... ok
+test_old_account_missing_blocks_cleanup (test_sub2api_401_service.Sub2Api401ServiceTests.test_old_account_missing_blocks_cleanup) ... ok
+test_pre_retry_snapshot_persists_across_restart (test_sub2api_401_service.Sub2Api401ServiceTests.test_pre_retry_snapshot_persists_across_restart) ... ok
+test_selection_uses_account_ids_and_rejects_untracked (test_sub2api_401_service.Sub2Api401ServiceTests.test_selection_uses_account_ids_and_rejects_untracked) ... ok
+test_snapshot_change_aborts_before_oauth (test_sub2api_401_service.Sub2Api401ServiceTests.test_snapshot_change_aborts_before_oauth) ... ok
+test_unique_new_same_email_account_becomes_cleanup_ready (test_sub2api_401_service.Sub2Api401ServiceTests.test_unique_new_same_email_account_becomes_cleanup_ready) ... ok
+test_audit_file_is_persisted_by_container_data_mount (test_sub2api_401_templates.Sub2Api401TemplateTests.test_audit_file_is_persisted_by_container_data_mount) ... ok
+test_modern_and_legacy_navigation_link_to_sub2api_page_only (test_sub2api_401_templates.Sub2Api401TemplateTests.test_modern_and_legacy_navigation_link_to_sub2api_page_only) ... ok
+test_page_has_account_id_snapshot_retry_verify_and_explicit_cleanup_controls (test_sub2api_401_templates.Sub2Api401TemplateTests.test_page_has_account_id_snapshot_retry_verify_and_explicit_cleanup_controls) ... ok
+test_page_has_independent_scheduler_controls (test_sub2api_401_templates.Sub2Api401TemplateTests.test_page_has_independent_scheduler_controls) ... ok
+test_page_polls_retrying_state_until_terminal (test_sub2api_401_templates.Sub2Api401TemplateTests.test_page_polls_retrying_state_until_terminal) ... ok
+test_batch_refresh_caps_unique_selection_after_duplicate_prefix (test_sub2api_admin.Sub2ApiAdminClientTests.test_batch_refresh_caps_unique_selection_after_duplicate_prefix) ... ok
+test_batch_refresh_chunks_deduped_ids_in_order_and_aggregates_bounded_results (test_sub2api_admin.Sub2ApiAdminClientTests.test_batch_refresh_chunks_deduped_ids_in_order_and_aggregates_bounded_results) ... ok
+test_batch_refresh_missing_counts_remain_conservative (test_sub2api_admin.Sub2ApiAdminClientTests.test_batch_refresh_missing_counts_remain_conservative) ... ok
+test_batch_refresh_normalizes_duplicate_errors_and_inconsistent_chunk_counts (test_sub2api_admin.Sub2ApiAdminClientTests.test_batch_refresh_normalizes_duplicate_errors_and_inconsistent_chunk_counts) ... ok
+test_batch_refresh_sends_ids_and_redacts_error_secrets (test_sub2api_admin.Sub2ApiAdminClientTests.test_batch_refresh_sends_ids_and_redacts_error_secrets) ... ok
+test_batch_refresh_stops_after_first_chunk_exception (test_sub2api_admin.Sub2ApiAdminClientTests.test_batch_refresh_stops_after_first_chunk_exception) ... ok
+test_delete_deactivates_then_deletes_exact_encoded_account_id_and_discards_payloads (test_sub2api_admin.Sub2ApiAdminClientTests.test_delete_deactivates_then_deletes_exact_encoded_account_id_and_discards_payloads) ... ok
+test_delete_does_not_send_delete_when_deactivation_fails (test_sub2api_admin.Sub2ApiAdminClientTests.test_delete_does_not_send_delete_when_deactivation_fails) ... ok
+test_delete_normalizes_integer_account_id_for_exact_path (test_sub2api_admin.Sub2ApiAdminClientTests.test_delete_normalizes_integer_account_id_for_exact_path) ... ok
+test_delete_propagates_sanitized_error_after_successful_deactivation (test_sub2api_admin.Sub2ApiAdminClientTests.test_delete_propagates_sanitized_error_after_successful_deactivation) ... ok
+test_list_honors_scalar_pagination_inside_standard_data_envelope (test_sub2api_admin.Sub2ApiAdminClientTests.test_list_honors_scalar_pagination_inside_standard_data_envelope) ... ok
+test_list_marks_multiple_emails_in_account_name_ambiguous (test_sub2api_admin.Sub2ApiAdminClientTests.test_list_marks_multiple_emails_in_account_name_ambiguous) ... ok
+test_list_preserves_only_valid_created_at (test_sub2api_admin.Sub2ApiAdminClientTests.test_list_preserves_only_valid_created_at) ... ok
+test_list_stops_on_repeated_page_without_unbounded_loop (test_sub2api_admin.Sub2ApiAdminClientTests.test_list_stops_on_repeated_page_without_unbounded_loop) ... ok
+test_list_traverses_bounded_pages_and_filters_openai_oauth (test_sub2api_admin.Sub2ApiAdminClientTests.test_list_traverses_bounded_pages_and_filters_openai_oauth) ... ok
+test_nonzero_standard_envelope_is_rejected_without_leaking_message_secrets (test_sub2api_admin.Sub2ApiAdminClientTests.test_nonzero_standard_envelope_is_rejected_without_leaking_message_secrets) ... ok
+test_remote_errors_are_safe_and_classified (test_sub2api_admin.Sub2ApiAdminClientTests.test_remote_errors_are_safe_and_classified) ... ok
+test_executor_uses_configured_worker_count (test_twofa_service_settings.TwofaServiceSettingsTests.test_executor_uses_configured_worker_count) ... ok
+test_integer_settings_are_bounded (test_twofa_service_settings.TwofaServiceSettingsTests.test_integer_settings_are_bounded) ... ok
+test_bulk_setup_deduplicates_and_reports_each_result (test_webui_account_totp_bulk.WebUiAccountTotpBulkTests.test_bulk_setup_deduplicates_and_reports_each_result) ... 17:22:02 [INFO] 凭证自动巡检调度器已启动（进程内单实例，要求 Gunicorn workers=1）
+ok
+test_bulk_setup_validates_empty_and_maximum (test_webui_account_totp_bulk.WebUiAccountTotpBulkTests.test_bulk_setup_validates_empty_and_maximum) ... 17:22:02 [INFO] 凭证自动巡检调度器已启动（进程内单实例，要求 Gunicorn workers=1）
+ok
+test_api_accepts_auth_header (test_webui_auth.WebUiAuthTests.test_api_accepts_auth_header) ... 17:22:02 [INFO] 凭证自动巡检调度器已启动（进程内单实例，要求 Gunicorn workers=1）
+ok
+test_api_requires_auth_code (test_webui_auth.WebUiAuthTests.test_api_requires_auth_code) ... 17:22:02 [INFO] 凭证自动巡检调度器已启动（进程内单实例，要求 Gunicorn workers=1）
+ok
+test_json_body_auth_code_is_not_accepted (test_webui_auth.WebUiAuthTests.test_json_body_auth_code_is_not_accepted) ... 17:22:02 [INFO] 凭证自动巡检调度器已启动（进程内单实例，要求 Gunicorn workers=1）
+ok
+test_login_remember_sets_persistent_session (test_webui_auth.WebUiAuthTests.test_login_remember_sets_persistent_session) ... 17:22:02 [INFO] 凭证自动巡检调度器已启动（进程内单实例，要求 Gunicorn workers=1）
+ok
+test_login_sets_session_cookie (test_webui_auth.WebUiAuthTests.test_login_sets_session_cookie) ... 17:22:02 [INFO] 凭证自动巡检调度器已启动（进程内单实例，要求 Gunicorn workers=1）
+ok
+test_query_auth_code_is_not_accepted (test_webui_auth.WebUiAuthTests.test_query_auth_code_is_not_accepted) ... 17:22:02 [INFO] 凭证自动巡检调度器已启动（进程内单实例，要求 Gunicorn workers=1）
+ok
+test_batch_request_validation_is_bounded (test_webui_chatgpt2api_401.WebUIChatGPT2API401Tests.test_batch_request_validation_is_bounded) ... 17:22:02 [INFO] 凭证自动巡检调度器已启动（进程内单实例，要求 Gunicorn workers=1）
+ok
+test_detect_reports_active_queue_as_conflict (test_webui_chatgpt2api_401.WebUIChatGPT2API401Tests.test_detect_reports_active_queue_as_conflict) ... 17:22:02 [INFO] 凭证自动巡检调度器已启动（进程内单实例，要求 Gunicorn workers=1）
+17:22:02 [WARNING] ChatGPT2API 401 检测失败: queue active
+ok
+test_more_than_fifty_ids_are_accepted_for_queueing (test_webui_chatgpt2api_401.WebUIChatGPT2API401Tests.test_more_than_fifty_ids_are_accepted_for_queueing) ... 17:22:02 [INFO] 凭证自动巡检调度器已启动（进程内单实例，要求 Gunicorn workers=1）
+ok
+test_page_and_routes_require_authentication (test_webui_chatgpt2api_401.WebUIChatGPT2API401Tests.test_page_and_routes_require_authentication) ... 17:22:02 [INFO] 凭证自动巡检调度器已启动（进程内单实例，要求 Gunicorn workers=1）
+ok
+test_refresh_requires_confirmation_returns_202_and_passes_only_locked_ids (test_webui_chatgpt2api_401.WebUIChatGPT2API401Tests.test_refresh_requires_confirmation_returns_202_and_passes_only_locked_ids) ... 17:22:02 [INFO] 凭证自动巡检调度器已启动（进程内单实例，要求 Gunicorn workers=1）
+ok
+test_remote_errors_are_bounded_and_redacted (test_webui_chatgpt2api_401.WebUIChatGPT2API401Tests.test_remote_errors_are_bounded_and_redacted) ... 17:22:02 [INFO] 凭证自动巡检调度器已启动（进程内单实例，要求 Gunicorn workers=1）
+17:22:02 [WARNING] ChatGPT2API 401 检测失败: ChatGPT2API 管理接口认证失败，请检查管理密钥
+17:22:02 [WARNING] ChatGPT2API 401 检测失败: ChatGPT2API 管理接口请求超时，远端账号未修改
+17:22:02 [WARNING] ChatGPT2API 401 检测失败: 当前 ChatGPT2API 不支持安全账号更新接口
+ok
+test_replace_requires_literal_confirmation_and_passes_locked_ids (test_webui_chatgpt2api_401.WebUIChatGPT2API401Tests.test_replace_requires_literal_confirmation_and_passes_locked_ids) ... 17:22:02 [INFO] 凭证自动巡检调度器已启动（进程内单实例，要求 Gunicorn workers=1）
+ok
+test_state_and_detect_are_private_and_never_echo_credentials (test_webui_chatgpt2api_401.WebUIChatGPT2API401Tests.test_state_and_detect_are_private_and_never_echo_credentials) ... 17:22:02 [INFO] 凭证自动巡检调度器已启动（进程内单实例，要求 Gunicorn workers=1）
+ok
+test_connection_route_requires_webui_authentication (test_webui_chatgpt2api_connection.ChatGPT2APIConnectionRouteTests.test_connection_route_requires_webui_authentication) ... 17:22:02 [INFO] 凭证自动巡检调度器已启动（进程内单实例，要求 Gunicorn workers=1）
+ok
+test_connection_route_returns_diagnostic_result (test_webui_chatgpt2api_connection.ChatGPT2APIConnectionRouteTests.test_connection_route_returns_diagnostic_result) ... 17:22:02 [INFO] 凭证自动巡检调度器已启动（进程内单实例，要求 Gunicorn workers=1）
+ok
+test_modern_config_contains_connection_test_control (test_webui_chatgpt2api_connection.ChatGPT2APIConnectionRouteTests.test_modern_config_contains_connection_test_control) ... 17:22:02 [INFO] 凭证自动巡检调度器已启动（进程内单实例，要求 Gunicorn workers=1）
+ok
+test_endpoint_rejects_existing_chatgpt_password (test_webui_chatgpt_password.WebUiChatgptPasswordTests.test_endpoint_rejects_existing_chatgpt_password) ... 17:22:02 [INFO] 凭证自动巡检调度器已启动（进程内单实例，要求 Gunicorn workers=1）
+ok
+test_endpoint_rejects_mismatched_confirmation_before_queue (test_webui_chatgpt_password.WebUiChatgptPasswordTests.test_endpoint_rejects_mismatched_confirmation_before_queue) ... 17:22:02 [INFO] 凭证自动巡检调度器已启动（进程内单实例，要求 Gunicorn workers=1）
+ok
+test_lightweight_status_does_not_return_registration_password (test_webui_chatgpt_password.WebUiChatgptPasswordTests.test_lightweight_status_does_not_return_registration_password) ... 17:22:02 [INFO] 凭证自动巡检调度器已启动（进程内单实例，要求 Gunicorn workers=1）
+ok
+test_single_account_endpoint_queues_without_returning_password (test_webui_chatgpt_password.WebUiChatgptPasswordTests.test_single_account_endpoint_queues_without_returning_password) ... 17:22:02 [INFO] 凭证自动巡检调度器已启动（进程内单实例，要求 Gunicorn workers=1）
+ok
+test_jobs_rejects_admin_mode_without_key (test_webui_cloudflare.CloudflareWebUiTests.test_jobs_rejects_admin_mode_without_key) ... 17:22:02 [INFO] 凭证自动巡检调度器已启动（进程内单实例，要求 Gunicorn workers=1）
+ok
+test_jobs_rejects_cloudflare_without_api_base (test_webui_cloudflare.CloudflareWebUiTests.test_jobs_rejects_cloudflare_without_api_base) ... 17:22:02 [INFO] 凭证自动巡检调度器已启动（进程内单实例，要求 Gunicorn workers=1）
+ok
+test_jobs_with_cloudflare_skips_outlook_pool (test_webui_cloudflare.CloudflareWebUiTests.test_jobs_with_cloudflare_skips_outlook_pool) ... 17:22:02 [INFO] 凭证自动巡检调度器已启动（进程内单实例，要求 Gunicorn workers=1）
+ok
+test_both_webui_templates_expose_local_and_login_credential_controls (test_webui_codex_export.WebUiCodexExportTests.test_both_webui_templates_expose_local_and_login_credential_controls) ... ok
+test_callback_receipt_is_rejected_for_sub2_export (test_webui_codex_export.WebUiCodexExportTests.test_callback_receipt_is_rejected_for_sub2_export) ... 17:22:02 [INFO] 凭证自动巡检调度器已启动（进程内单实例，要求 Gunicorn workers=1）
+ok
+test_codex_list_does_not_return_password_or_totp_fields (test_webui_codex_export.WebUiCodexExportTests.test_codex_list_does_not_return_password_or_totp_fields) ... 17:22:03 [INFO] 凭证自动巡检调度器已启动（进程内单实例，要求 Gunicorn workers=1）
+ok
+test_local_cpa_bulk_export_is_individual_files_zip (test_webui_codex_export.WebUiCodexExportTests.test_local_cpa_bulk_export_is_individual_files_zip) ... 17:22:03 [INFO] 凭证自动巡检调度器已启动（进程内单实例，要求 Gunicorn workers=1）
+ok
+test_local_cpa_export_returns_converted_single_file_without_cpa (test_webui_codex_export.WebUiCodexExportTests.test_local_cpa_export_returns_converted_single_file_without_cpa) ... 17:22:03 [INFO] 凭证自动巡检调度器已启动（进程内单实例，要求 Gunicorn workers=1）
+ok
+test_local_sub2_export_returns_accounts_package (test_webui_codex_export.WebUiCodexExportTests.test_local_sub2_export_returns_accounts_package) ... 17:22:03 [INFO] 凭证自动巡检调度器已启动（进程内单实例，要求 Gunicorn workers=1）
+ok
+test_login_credentials_export_matches_accounts_and_sets_sensitive_headers (test_webui_codex_export.WebUiCodexExportTests.test_login_credentials_export_matches_accounts_and_sets_sensitive_headers) ... 17:22:03 [INFO] 凭证自动巡检调度器已启动（进程内单实例，要求 Gunicorn workers=1）
+ok
+test_login_credentials_export_reports_non_matching_records_without_download (test_webui_codex_export.WebUiCodexExportTests.test_login_credentials_export_reports_non_matching_records_without_download) ... 17:22:03 [INFO] 凭证自动巡检调度器已启动（进程内单实例，要求 Gunicorn workers=1）
+ok
+test_login_credentials_export_requires_existing_webui_auth (test_webui_codex_export.WebUiCodexExportTests.test_login_credentials_export_requires_existing_webui_auth) ... 17:22:03 [INFO] 凭证自动巡检调度器已启动（进程内单实例，要求 Gunicorn workers=1）
+ok
+test_login_credentials_export_returns_structured_4xx_when_no_record_matches (test_webui_codex_export.WebUiCodexExportTests.test_login_credentials_export_returns_structured_4xx_when_no_record_matches) ... 17:22:03 [INFO] 凭证自动巡检调度器已启动（进程内单实例，要求 Gunicorn workers=1）
+ok
+test_raw_download_keeps_original_local_payload_shape (test_webui_codex_export.WebUiCodexExportTests.test_raw_download_keeps_original_local_payload_shape) ... 17:22:03 [INFO] 凭证自动巡检调度器已启动（进程内单实例，要求 Gunicorn workers=1）
+ok
+test_chatgpt2api_automatic_job_observes_only_ids_accepted_by_this_round (test_webui_credential_health_scheduler.WebUICredentialHealthSchedulerTests.test_chatgpt2api_automatic_job_observes_only_ids_accepted_by_this_round) ... 17:22:03 [INFO] 凭证自动巡检调度器已启动（进程内单实例，要求 Gunicorn workers=1）
+ok
+test_chatgpt2api_automatic_job_reuses_queue_and_exact_writeback (test_webui_credential_health_scheduler.WebUICredentialHealthSchedulerTests.test_chatgpt2api_automatic_job_reuses_queue_and_exact_writeback) ... 17:22:03 [INFO] 凭证自动巡检调度器已启动（进程内单实例，要求 Gunicorn workers=1）
+ok
+test_chatgpt2api_automatic_job_skips_while_manual_queue_is_active (test_webui_credential_health_scheduler.WebUICredentialHealthSchedulerTests.test_chatgpt2api_automatic_job_skips_while_manual_queue_is_active) ... 17:22:03 [INFO] 凭证自动巡检调度器已启动（进程内单实例，要求 Gunicorn workers=1）
+ok
+test_chatgpt2api_missing_queued_audit_item_is_failure_not_success (test_webui_credential_health_scheduler.WebUICredentialHealthSchedulerTests.test_chatgpt2api_missing_queued_audit_item_is_failure_not_success) ... 17:22:03 [INFO] 凭证自动巡检调度器已启动（进程内单实例，要求 Gunicorn workers=1）
+ok
+test_independent_scheduler_state_and_configuration (test_webui_credential_health_scheduler.WebUICredentialHealthSchedulerTests.test_independent_scheduler_state_and_configuration) ... 17:22:03 [INFO] 凭证自动巡检调度器已启动（进程内单实例，要求 Gunicorn workers=1）
+ok
+test_scheduler_configuration_persists_across_new_app_instance (test_webui_credential_health_scheduler.WebUICredentialHealthSchedulerTests.test_scheduler_configuration_persists_across_new_app_instance) ... 17:22:03 [INFO] 凭证自动巡检调度器已启动（进程内单实例，要求 Gunicorn workers=1）
+17:22:03 [INFO] 凭证自动巡检调度器已启动（进程内单实例，要求 Gunicorn workers=1）
+17:22:03 [INFO] 凭证自动巡检调度器已启动（进程内单实例，要求 Gunicorn workers=1）
+ok
+test_scheduler_configuration_validation_is_bounded (test_webui_credential_health_scheduler.WebUICredentialHealthSchedulerTests.test_scheduler_configuration_validation_is_bounded) ... 17:22:03 [INFO] 凭证自动巡检调度器已启动（进程内单实例，要求 Gunicorn workers=1）
+ok
+test_scheduler_routes_require_authentication (test_webui_credential_health_scheduler.WebUICredentialHealthSchedulerTests.test_scheduler_routes_require_authentication) ... 17:22:03 [INFO] 凭证自动巡检调度器已启动（进程内单实例，要求 Gunicorn workers=1）
+ok
+test_state_responses_include_scheduler_projection (test_webui_credential_health_scheduler.WebUICredentialHealthSchedulerTests.test_state_responses_include_scheduler_projection) ... 17:22:03 [INFO] 凭证自动巡检调度器已启动（进程内单实例，要求 Gunicorn workers=1）
+ok
+test_sub2api_automatic_job_counts_unverified_retry_as_failed (test_webui_credential_health_scheduler.WebUICredentialHealthSchedulerTests.test_sub2api_automatic_job_counts_unverified_retry_as_failed) ... 17:22:03 [INFO] 凭证自动巡检调度器已启动（进程内单实例，要求 Gunicorn workers=1）
+ok
+test_sub2api_automatic_job_reuses_retry_and_exact_cleanup (test_webui_credential_health_scheduler.WebUICredentialHealthSchedulerTests.test_sub2api_automatic_job_reuses_retry_and_exact_cleanup) ... 17:22:03 [INFO] 凭证自动巡检调度器已启动（进程内单实例，要求 Gunicorn workers=1）
+ok
+test_sub2api_automatic_job_skips_while_manual_retry_is_active (test_webui_credential_health_scheduler.WebUICredentialHealthSchedulerTests.test_sub2api_automatic_job_skips_while_manual_retry_is_active) ... 17:22:03 [INFO] 凭证自动巡检调度器已启动（进程内单实例，要求 Gunicorn workers=1）
+ok
+test_sub2api_restart_reconciles_stale_retrying_instead_of_blocking_forever (test_webui_credential_health_scheduler.WebUICredentialHealthSchedulerTests.test_sub2api_restart_reconciles_stale_retrying_instead_of_blocking_forever) ... 17:22:03 [INFO] 凭证自动巡检调度器已启动（进程内单实例，要求 Gunicorn workers=1）
+ok
+test_bulk_delete_uses_each_item_source (test_webui_email_pool_delete.WebUiEmailPoolDeleteTests.test_bulk_delete_uses_each_item_source) ... 17:22:03 [INFO] 凭证自动巡检调度器已启动（进程内单实例，要求 Gunicorn workers=1）
+ok
+test_delete_reports_not_found_instead_of_fake_success (test_webui_email_pool_delete.WebUiEmailPoolDeleteTests.test_delete_reports_not_found_instead_of_fake_success) ... 17:22:03 [INFO] 凭证自动巡检调度器已启动（进程内单实例，要求 Gunicorn workers=1）
+ok
+test_single_delete_all_does_not_fall_back_to_outlook (test_webui_email_pool_delete.WebUiEmailPoolDeleteTests.test_single_delete_all_does_not_fall_back_to_outlook) ... 17:22:03 [INFO] 凭证自动巡检调度器已启动（进程内单实例，要求 Gunicorn workers=1）
+ok
+test_jobs_allows_cloudmail_without_manual_domains (test_webui_gptmail.GPTMailWebUiTests.test_jobs_allows_cloudmail_without_manual_domains) ... 17:22:03 [INFO] 凭证自动巡检调度器已启动（进程内单实例，要求 Gunicorn workers=1）
+ok
+test_jobs_rejects_gptmail_without_api_key_before_creating_tasks (test_webui_gptmail.GPTMailWebUiTests.test_jobs_rejects_gptmail_without_api_key_before_creating_tasks) ... 17:22:03 [INFO] 凭证自动巡检调度器已启动（进程内单实例，要求 Gunicorn workers=1）
+ok
+test_jobs_rejects_mailnest_without_api_key_before_creating_tasks (test_webui_gptmail.GPTMailWebUiTests.test_jobs_rejects_mailnest_without_api_key_before_creating_tasks) ... 17:22:03 [INFO] 凭证自动巡检调度器已启动（进程内单实例，要求 Gunicorn workers=1）
+ok
+test_jobs_with_cloudmail_config_does_not_check_outlook_pool (test_webui_gptmail.GPTMailWebUiTests.test_jobs_with_cloudmail_config_does_not_check_outlook_pool) ... 17:22:03 [INFO] 凭证自动巡检调度器已启动（进程内单实例，要求 Gunicorn workers=1）
+ok
+test_jobs_with_gptmail_key_does_not_check_outlook_pool (test_webui_gptmail.GPTMailWebUiTests.test_jobs_with_gptmail_key_does_not_check_outlook_pool) ... 17:22:03 [INFO] 凭证自动巡检调度器已启动（进程内单实例，要求 Gunicorn workers=1）
+ok
+test_jobs_with_mailnest_key_does_not_check_outlook_pool (test_webui_gptmail.GPTMailWebUiTests.test_jobs_with_mailnest_key_does_not_check_outlook_pool) ... 17:22:03 [INFO] 凭证自动巡检调度器已启动（进程内单实例，要求 Gunicorn workers=1）
+ok
+test_summary_does_not_count_gptmail_as_outlook_pool (test_webui_gptmail.GPTMailWebUiTests.test_summary_does_not_count_gptmail_as_outlook_pool) ... 17:22:03 [INFO] 凭证自动巡检调度器已启动（进程内单实例，要求 Gunicorn workers=1）
+ok
+test_secret_endpoint_marks_missing_password_explicitly (test_webui_login_credentials_copy.WebUiLoginCredentialsCopyTests.test_secret_endpoint_marks_missing_password_explicitly) ... 17:22:03 [INFO] 凭证自动巡检调度器已启动（进程内单实例，要求 Gunicorn workers=1）
+ok
+test_secret_endpoint_returns_email_registration_password_and_totp (test_webui_login_credentials_copy.WebUiLoginCredentialsCopyTests.test_secret_endpoint_returns_email_registration_password_and_totp) ... 17:22:03 [INFO] 凭证自动巡检调度器已启动（进程内单实例，要求 Gunicorn workers=1）
+ok
+test_modern_config_contains_proxy_test_control (test_webui_proxy_diagnostic.ProxyDiagnosticRouteTests.test_modern_config_contains_proxy_test_control) ... 17:22:03 [INFO] 凭证自动巡检调度器已启动（进程内单实例，要求 Gunicorn workers=1）
+ok
+test_route_requires_webui_authentication (test_webui_proxy_diagnostic.ProxyDiagnosticRouteTests.test_route_requires_webui_authentication) ... 17:22:03 [INFO] 凭证自动巡检调度器已启动（进程内单实例，要求 Gunicorn workers=1）
+ok
+test_route_returns_diagnostic_result (test_webui_proxy_diagnostic.ProxyDiagnosticRouteTests.test_route_returns_diagnostic_result) ... 17:22:03 [INFO] 凭证自动巡检调度器已启动（进程内单实例，要求 Gunicorn workers=1）
+ok
+test_http_403_still_reports_reachable_and_exit_geo (test_webui_proxy_diagnostic.ProxyDiagnosticTests.test_http_403_still_reports_reachable_and_exit_geo) ... ok
+test_invalid_target_is_rejected (test_webui_proxy_diagnostic.ProxyDiagnosticTests.test_invalid_target_is_rejected) ... ok
+test_jobs_rejects_remail_without_project_id (test_webui_remail.RemailWebUiTests.test_jobs_rejects_remail_without_project_id) ... 17:22:03 [INFO] 凭证自动巡检调度器已启动（进程内单实例，要求 Gunicorn workers=1）
+ok
+test_jobs_with_remail_config_does_not_check_local_pool (test_webui_remail.RemailWebUiTests.test_jobs_with_remail_config_does_not_check_local_pool) ... 17:22:03 [INFO] 凭证自动巡检调度器已启动（进程内单实例，要求 Gunicorn workers=1）
+ok
+test_batch_request_validation_is_bounded (test_webui_sub2api_401.WebuiSub2Api401Tests.test_batch_request_validation_is_bounded) ... 17:22:03 [INFO] 凭证自动巡检调度器已启动（进程内单实例，要求 Gunicorn workers=1）
+ok
+test_cleanup_errors_are_bounded_and_do_not_echo_secrets (test_webui_sub2api_401.WebuiSub2Api401Tests.test_cleanup_errors_are_bounded_and_do_not_echo_secrets) ... 17:22:03 [INFO] 凭证自动巡检调度器已启动（进程内单实例，要求 Gunicorn workers=1）
+17:22:03 [WARNING] Sub2API 401 清理前复核失败: Sub2API 账号验证失败，旧账号未做任何变更
+ok
+test_cleanup_passes_explicit_confirmation_and_account_ids (test_webui_sub2api_401.WebuiSub2Api401Tests.test_cleanup_passes_explicit_confirmation_and_account_ids) ... 17:22:03 [INFO] 凭证自动巡检调度器已启动（进程内单实例，要求 Gunicorn workers=1）
+ok
+test_detect_provider_errors_are_bounded_and_do_not_echo_secrets (test_webui_sub2api_401.WebuiSub2Api401Tests.test_detect_provider_errors_are_bounded_and_do_not_echo_secrets) ... 17:22:03 [INFO] 凭证自动巡检调度器已启动（进程内单实例，要求 Gunicorn workers=1）
+17:22:03 [WARNING] Sub2API 401 检测失败: Sub2API 管理接口认证失败，请检查管理密钥
+17:22:03 [WARNING] Sub2API 401 检测失败: Sub2API 账号验证超时，旧账号未做任何变更
+17:22:03 [WARNING] Sub2API 401 检测失败: 当前 Sub2API 不支持所需的账号管理接口
+ok
+test_page_and_all_routes_require_auth_and_old_routes_are_removed (test_webui_sub2api_401.WebuiSub2Api401Tests.test_page_and_all_routes_require_auth_and_old_routes_are_removed) ... 17:22:03 [INFO] 凭证自动巡检调度器已启动（进程内单实例，要求 Gunicorn workers=1）
+ok
+test_retry_all_skipped_is_422_with_sensitive_headers (test_webui_sub2api_401.WebuiSub2Api401Tests.test_retry_all_skipped_is_422_with_sensitive_headers) ... 17:22:03 [INFO] 凭证自动巡检调度器已启动（进程内单实例，要求 Gunicorn workers=1）
+ok
+test_retry_defaults_workers_to_three (test_webui_sub2api_401.WebuiSub2Api401Tests.test_retry_defaults_workers_to_three) ... 17:22:03 [INFO] 凭证自动巡检调度器已启动（进程内单实例，要求 Gunicorn workers=1）
+ok
+test_retry_rejects_non_integer_workers (test_webui_sub2api_401.WebuiSub2Api401Tests.test_retry_rejects_non_integer_workers) ... 17:22:03 [INFO] 凭证自动巡检调度器已启动（进程内单实例，要求 Gunicorn workers=1）
+ok
+test_retry_reuses_existing_worker_and_persists_account_id_snapshot (test_webui_sub2api_401.WebuiSub2Api401Tests.test_retry_reuses_existing_worker_and_persists_account_id_snapshot) ... 17:22:03 [INFO] 凭证自动巡检调度器已启动（进程内单实例，要求 Gunicorn workers=1）
+ok
+test_retry_runner_detects_after_workers_and_cleans_only_selected_ready_ids (test_webui_sub2api_401.WebuiSub2Api401Tests.test_retry_runner_detects_after_workers_and_cleans_only_selected_ready_ids) ... 17:22:03 [INFO] 凭证自动巡检调度器已启动（进程内单实例，要求 Gunicorn workers=1）
+17:22:03 [WARNING] Sub2API 401 自动清理失败 batch=83ba51235167 count=1
+ok
+test_retry_snapshot_conflict_releases_reservation_and_returns_409 (test_webui_sub2api_401.WebuiSub2Api401Tests.test_retry_snapshot_conflict_releases_reservation_and_returns_409) ... 17:22:03 [INFO] 凭证自动巡检调度器已启动（进程内单实例，要求 Gunicorn workers=1）
+ok
+test_retry_thread_start_failure_releases_reservation_and_returns_safe_error (test_webui_sub2api_401.WebuiSub2Api401Tests.test_retry_thread_start_failure_releases_reservation_and_returns_safe_error) ... 17:22:03 [INFO] 凭证自动巡检调度器已启动（进程内单实例，要求 Gunicorn workers=1）
+17:22:03 [WARNING] Sub2API 401 补跑调度失败 batch=f98650dbad80 error=RuntimeError
+ok
+test_state_and_detect_return_non_secret_account_id_json_with_headers (test_webui_sub2api_401.WebuiSub2Api401Tests.test_state_and_detect_return_non_secret_account_id_json_with_headers) ... 17:22:03 [INFO] 凭证自动巡检调度器已启动（进程内单实例，要求 Gunicorn workers=1）
+ok
+
+======================================================================
+ERROR: test_ensure_authorize_context_matches_20260914_capture_shape (test_chatgpt_auth_context.ChatgptAuthContextTests.test_ensure_authorize_context_matches_20260914_capture_shape)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/jiangdk/code/personal/turb-gpt-free-register/tests/test_chatgpt_auth_context.py", line 18, in test_ensure_authorize_context_matches_20260914_capture_shape
+    self.assertEqual(qs["ext-oai-did"], ["did-123"])
+                     ~~^^^^^^^^^^^^^^^
+KeyError: 'ext-oai-did'
+
+======================================================================
+FAIL: test_restore_context_requires_exact_email_match (test_remail_client.RemailClientTests.test_restore_context_requires_exact_email_match)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/opt/homebrew/Cellar/python@3.14/3.14.7/Frameworks/Python.framework/Versions/3.14/lib/python3.14/unittest/mock.py", line 1439, in patched
+    return func(*newargs, **newkeywargs)
+  File "/Users/jiangdk/code/personal/turb-gpt-free-register/tests/test_remail_client.py", line 184, in test_restore_context_requires_exact_email_match
+    self.assertIsNotNone(account)
+    ~~~~~~~~~~~~~~~~~~~~^^^^^^^^^
+AssertionError: unexpectedly None
+
+----------------------------------------------------------------------
+Ran 507 tests in 9.523s
+
+FAILED (failures=1, errors=1)

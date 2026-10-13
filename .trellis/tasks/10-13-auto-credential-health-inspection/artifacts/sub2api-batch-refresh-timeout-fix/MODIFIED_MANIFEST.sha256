@@ -1,0 +1,3 @@
+97162d760dc1f343cf17471947e07aff4c7e829123106c8db23a566e03c2b27c  .trellis/spec/backend/sub2api-credential-rotation.md
+70fb35693da633ecc9778898ef5b8b22477088322e75bf109ac4164bba0ba5d2  core/sub2api_admin.py
+046c8ed0b683cd2452ab92a1e86c0ba9eb6e20f3fc9adbd0448233c00217eb6f  tests/test_sub2api_admin.py

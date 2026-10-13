@@ -1,0 +1,255 @@
+diff --git a/.trellis/spec/backend/sub2api-credential-rotation.md b/.trellis/spec/backend/sub2api-credential-rotation.md
+index 9d92c2e..890f87f 100644
+--- a/.trellis/spec/backend/sub2api-credential-rotation.md
++++ b/.trellis/spec/backend/sub2api-credential-rotation.md
+@@ -56,4 +56,6 @@ Environment is reused from `config/sub2api.py`: `SUB2API_API_BASE`, `SUB2API_API
+ The list adapter accepts direct payloads and standard `{code, data}` envelopes, traverses bounded pagination, deduplicates by normalized `account_id`, and retains only `platform=openai` plus `type=oauth`. Numeric IDs remain strings in audit/UI state but are sent as integers on batch-refresh requests. Email candidates are normalized; missing or conflicting candidates set `email_ambiguous` and are ineligible for retry and cleanup.
+
++`batch_refresh()` scans the input in order, normalizes and deduplicates exact IDs, and selects at most 500 unique IDs (duplicate raw values do not consume the cap). It then sends consecutive chunks of at most 10 IDs serially to the same native batch-refresh endpoint. The chunk size bounds each request's latency under the existing Sub2API management timeout; chunks are intentionally not parallelized. Numeric IDs retain the existing integer wire representation. The logical `total` is exactly the number of selected IDs. For each chunk, reported `success` and `failed` values are independently clamped to the chunk size; explicit unique in-scope error IDs always count as failures, and success is reduced so that chunk success plus failure never exceeds that chunk's size. Missing success remains zero/conservative. The normalized counts are then summed, so `success` and `failed` remain within `0..total` and cannot exceed the selected population. In-scope errors are deduplicated by exact account ID in first-occurrence order and capped at 500; warnings retain chunk order and are capped at 50. If any chunk raises, processing stops immediately and the overall call raises without returning a partial result, preserving the service's existing snapshot and mutation safety behavior.
++
+ The `/sub2api-401` page must poll `GET /api/sub2api-401/state` every 3000 ms while any persisted item is `retrying`. The initial state load must start the same poll when the page is reopened during an in-flight retry, and a successful state response with no `retrying` items must cancel the pending timer. There must be at most one in-flight state request; polling only reads `state` and never invokes the expensive `/detect` endpoint. A transient poll error exposes only a bounded message and schedules a later retry while retrying work remains. The page applies server rows/counts/reasons on each successful response so background progress is visible without a manual reload.
+
+@@ -123,5 +125,5 @@ All Sub2API-401 responses set `Cache-Control: no-store, max-age=0`, `Pragma: no-
+ ### 6. Tests Required
+
+-- Adapter tests assert direct and enveloped responses, bounded pagination, repeated-page protection, OpenAI OAuth filtering, numeric wire IDs, exact encoded account paths, PUT `inactive` then DELETE call order/body, deactivation failure short-circuiting, safe error categories, discarded response payloads, and redaction.
++- Adapter tests assert direct and enveloped responses, bounded pagination, repeated-page protection, OpenAI OAuth filtering, deterministic serial batch-refresh chunking (`10/10/5` for 25 IDs), duplicate-error deduplication and first-occurrence order, unique-ID cap behavior, independently normalized over-reported/missing success and failed counts, global `success`/`failed` bounds, aggregate warnings, numeric wire IDs, chunk-exception short-circuiting, exact encoded account paths, PUT `inactive` then DELETE call order/body, deactivation failure short-circuiting, safe error categories, discarded response payloads, and redaction.
+ - Service tests assert health classification, persisted snapshots, unique replacement, zero/multiple candidates, missing old IDs, local retry failure, email ambiguity, stale-snapshot conflict, concurrent detect/cleanup serialization, explicit cleanup opt-in, delete verification, safe deactivation/delete failure evidence retention, repeated deactivation on retry, and historical all-unauthorized unique-latest selection/refusal, classification drift, post-delete keeper drift, exact-ID deletion, and next-detect singleton retryability.
+ - Persistence tests assert atomic writes, resolved symlink target directories, preserved symlinks, mode `0600`, and no secret text.
+diff --git a/core/sub2api_admin.py b/core/sub2api_admin.py
+index 161ecab..699f5b0 100644
+--- a/core/sub2api_admin.py
++++ b/core/sub2api_admin.py
+@@ -14,4 +14,8 @@ _MAX_REASON = 180
+ _MAX_PAGE_SIZE = 100
+ _MAX_PAGES = 20
++_MAX_BATCH_REFRESH_IDS = 500
++_BATCH_REFRESH_CHUNK_SIZE = 10
++_MAX_REFRESH_ERRORS = 500
++_MAX_REFRESH_WARNINGS = 50
+ _EMAIL_RE = re.compile(r"^[^\s@]+@[^\s@]+\.[^\s@]+$")
+ _EMAIL_SCAN_RE = re.compile(r"[A-Za-z0-9.!#$%&'*+/=?^_`{|}~-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
+@@ -264,34 +268,69 @@ class Sub2ApiAdminClient:
+         selected = []
+         seen: set[str] = set()
+-        for raw in account_ids[:500]:
++        for raw in account_ids:
+             account_id = _account_id(raw)
+             if account_id and account_id not in seen:
+                 seen.add(account_id)
+                 selected.append(account_id)
++                if len(selected) >= _MAX_BATCH_REFRESH_IDS:
++                    break
+         if not selected:
+             return {"total": 0, "success": 0, "failed": 0, "errors": [], "warnings": []}
+
+-        payload = self._request(
+-            "POST",
+-            "/api/v1/admin/accounts/batch-refresh",
+-            {"account_ids": [_wire_account_id(account_id) for account_id in selected]},
+-        )
+-        data = _unwrap_dict(payload)
+-        raw_errors = data.get("errors") if isinstance(data.get("errors"), list) else []
+-        errors = []
+-        for row in raw_errors:
+-            if not isinstance(row, dict):
+-                continue
+-            account_id = _dict_account_id(row)
+-            if account_id not in seen:
+-                continue
+-            errors.append({"account_id": account_id, "error": _safe_reason(row.get("error") or row.get("message"))})
+-        raw_warnings = data.get("warnings") if isinstance(data.get("warnings"), list) else []
+-        warnings = [_safe_reason(value, "Sub2API 刷新警告") for value in raw_warnings[:50]]
++        total = len(selected)
++        success = 0
++        failed = 0
++        errors: list[dict] = []
++        error_ids: set[str] = set()
++        warnings: list[str] = []
++        for start in range(0, len(selected), _BATCH_REFRESH_CHUNK_SIZE):
++            chunk = selected[start : start + _BATCH_REFRESH_CHUNK_SIZE]
++            chunk_ids = set(chunk)
++            payload = self._request(
++                "POST",
++                "/api/v1/admin/accounts/batch-refresh",
++                {"account_ids": [_wire_account_id(account_id) for account_id in chunk]},
++            )
++            data = _unwrap_dict(payload)
++            raw_errors = data.get("errors") if isinstance(data.get("errors"), list) else []
++            chunk_error_ids: set[str] = set()
++            for row in raw_errors:
++                if not isinstance(row, dict):
++                    continue
++                account_id = _dict_account_id(row)
++                if account_id not in chunk_ids:
++                    continue
++                if account_id not in chunk_error_ids:
++                    chunk_error_ids.add(account_id)
++                    if account_id not in error_ids and len(errors) < _MAX_REFRESH_ERRORS:
++                        errors.append({"account_id": account_id, "error": _safe_reason(row.get("error") or row.get("message"))})
++            new_error_ids = chunk_error_ids - error_ids
++            error_ids.update(chunk_error_ids)
++
++            raw_warnings = data.get("warnings") if isinstance(data.get("warnings"), list) else []
++            remaining_warnings = _MAX_REFRESH_WARNINGS - len(warnings)
++            if remaining_warnings > 0:
++                warnings.extend(
++                    _safe_reason(value, "Sub2API 刷新警告")
++                    for value in raw_warnings[:remaining_warnings]
++                )
++
++            # Normalize every chunk independently. Upstream counts are advisory:
++            # explicit unique errors always consume capacity, missing success is
++            # conservative, and an over-reported chunk cannot make another chunk
++            # appear healthy when the service consumes the aggregate success count.
++            chunk_size = len(chunk)
++            reported_failed = max(0, min(chunk_size, _int(data.get("failed"), len(new_error_ids))))
++            normalized_failed = max(len(new_error_ids), reported_failed)
++            reported_success = max(0, min(chunk_size, _int(data.get("success"))))
++            normalized_success = min(reported_success, chunk_size - normalized_failed)
++            success += normalized_success
++            failed += normalized_failed
++
+         return {
+-            "total": _int(data.get("total"), len(selected)),
+-            "success": _int(data.get("success")),
+-            "failed": _int(data.get("failed"), len(errors)),
+-            "errors": errors[:500],
++            "total": total,
++            "success": min(total, success),
++            "failed": min(total, failed),
++            "errors": errors[:_MAX_REFRESH_ERRORS],
+             "warnings": warnings,
+         }
+diff --git a/tests/test_sub2api_admin.py b/tests/test_sub2api_admin.py
+index 0409bed..530b2c2 100644
+--- a/tests/test_sub2api_admin.py
++++ b/tests/test_sub2api_admin.py
+@@ -143,4 +143,127 @@ class Sub2ApiAdminClientTests(unittest.TestCase):
+         self.assertEqual("202", result["errors"][0]["account_id"])
+
++    def test_batch_refresh_chunks_deduped_ids_in_order_and_aggregates_bounded_results(self):
++        calls = []
++        error_ids = (2, 12, 25)
++
++        def request(method, path, body):
++            calls.append((method, path, body))
++            call_index = len(calls) - 1
++            chunk_ids = body["account_ids"]
++            return {
++                "data": {
++                    "total": len(chunk_ids),
++                    "success": len(chunk_ids) - 1,
++                    "failed": 1,
++                    "errors": [
++                        {"account_id": error_ids[call_index], "error": f"chunk-{call_index + 1}-error"},
++                        {"account_id": 999, "error": "unselected error"},
++                    ],
++                    "warnings": [f"chunk-{call_index + 1}-warning-{value}" for value in range(30)],
++                }
++            }
++
++        account_ids = [str(value) for value in range(1, 21)] + ["5"] + [str(value) for value in range(21, 26)]
++        result = Sub2ApiAdminClient(request).batch_refresh(account_ids)
++
++        self.assertEqual([
++            ("POST", "/api/v1/admin/accounts/batch-refresh", {"account_ids": list(range(1, 11))}),
++            ("POST", "/api/v1/admin/accounts/batch-refresh", {"account_ids": list(range(11, 21))}),
++            ("POST", "/api/v1/admin/accounts/batch-refresh", {"account_ids": list(range(21, 26))}),
++        ], calls)
++        self.assertEqual(25, result["total"])
++        self.assertEqual(22, result["success"])
++        self.assertEqual(3, result["failed"])
++        self.assertEqual(["2", "12", "25"], [row["account_id"] for row in result["errors"]])
++        self.assertEqual(50, len(result["warnings"]))
++        self.assertEqual("chunk-1-warning-0", result["warnings"][0])
++        self.assertEqual("chunk-2-warning-19", result["warnings"][-1])
++        self.assertNotIn("999", str(result["errors"]))
++
++    def test_batch_refresh_normalizes_duplicate_errors_and_inconsistent_chunk_counts(self):
++        def request(method, path, body):
++            first_id = body["account_ids"][0]
++            if first_id == 1:
++                return {
++                    "data": {
++                        "success": 999,
++                        "failed": -3,
++                        "errors": [
++                            {"account_id": first_id, "error": f"first-error-{value}"}
++                            for value in range(300)
++                        ],
++                        "warnings": [f"warning-{value}" for value in range(30)],
++                    }
++                }
++            return {
++                "data": {
++                    "success": 999,
++                    "failed": 999,
++                    "errors": [
++                        {"account_id": first_id, "error": f"second-error-{value}"}
++                        for value in range(300)
++                    ],
++                    "warnings": [f"second-warning-{value}" for value in range(30)],
++                }
++            }
++
++        result = Sub2ApiAdminClient(request).batch_refresh([str(value) for value in range(1, 21)])
++
++        self.assertEqual(20, result["total"])
++        self.assertEqual(9, result["success"])
++        self.assertEqual(11, result["failed"])
++        self.assertEqual(["1", "11"], [row["account_id"] for row in result["errors"]])
++        self.assertEqual(2, len(result["errors"]))
++        self.assertEqual(50, len(result["warnings"]))
++        self.assertLessEqual(result["success"], result["total"])
++        self.assertLessEqual(result["failed"], result["total"])
++        self.assertLessEqual(result["success"] + result["failed"], result["total"])
++
++    def test_batch_refresh_missing_counts_remain_conservative(self):
++        def request(method, path, body):
++            if body["account_ids"][0] == 1:
++                return {"data": {}}
++            return {"data": {"errors": [{"account_id": 11, "error": "401"}]}}
++
++        result = Sub2ApiAdminClient(request).batch_refresh([str(value) for value in range(1, 21)])
++
++        self.assertEqual(20, result["total"])
++        self.assertEqual(0, result["success"])
++        self.assertEqual(1, result["failed"])
++        self.assertEqual(["11"], [row["account_id"] for row in result["errors"]])
++
++    def test_batch_refresh_caps_unique_selection_after_duplicate_prefix(self):
++        calls = []
++
++        def request(method, path, body):
++            calls.append(body["account_ids"])
++            return {"data": {"success": len(body["account_ids"]), "failed": 0}}
++
++        account_ids = ["same"] * 600 + [str(value) for value in range(1, 501)]
++        result = Sub2ApiAdminClient(request).batch_refresh(account_ids)
++
++        self.assertEqual(500, result["total"])
++        self.assertEqual(50, len(calls))
++        self.assertEqual(["same", 1, 2, 3, 4, 5, 6, 7, 8, 9], calls[0])
++        self.assertEqual([490, 491, 492, 493, 494, 495, 496, 497, 498, 499], calls[-1])
++
++    def test_batch_refresh_stops_after_first_chunk_exception(self):
++        calls = []
++
++        def request(method, path, body):
++            calls.append((method, path, body))
++            if len(calls) == 2:
++                raise Sub2ApiAdminError("second chunk timed out", status_code=504, category="timeout")
++            return {"data": {"total": 10, "success": 10, "failed": 0}}
++
++        with self.assertRaises(Sub2ApiAdminError) as captured:
++            Sub2ApiAdminClient(request).batch_refresh([str(value) for value in range(1, 26)])
++
++        self.assertEqual("timeout", captured.exception.category)
++        self.assertEqual([
++            ("POST", "/api/v1/admin/accounts/batch-refresh", {"account_ids": list(range(1, 11))}),
++            ("POST", "/api/v1/admin/accounts/batch-refresh", {"account_ids": list(range(11, 21))}),
++        ], calls)
++
+     def test_delete_deactivates_then_deletes_exact_encoded_account_id_and_discards_payloads(self):
+         calls = []

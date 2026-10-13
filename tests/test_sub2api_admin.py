@@ -142,6 +142,129 @@ class Sub2ApiAdminClientTests(unittest.TestCase):
         self.assertNotIn("secret.example", serialized)
         self.assertEqual("202", result["errors"][0]["account_id"])
 
+    def test_batch_refresh_chunks_deduped_ids_in_order_and_aggregates_bounded_results(self):
+        calls = []
+        error_ids = (2, 12, 25)
+
+        def request(method, path, body):
+            calls.append((method, path, body))
+            call_index = len(calls) - 1
+            chunk_ids = body["account_ids"]
+            return {
+                "data": {
+                    "total": len(chunk_ids),
+                    "success": len(chunk_ids) - 1,
+                    "failed": 1,
+                    "errors": [
+                        {"account_id": error_ids[call_index], "error": f"chunk-{call_index + 1}-error"},
+                        {"account_id": 999, "error": "unselected error"},
+                    ],
+                    "warnings": [f"chunk-{call_index + 1}-warning-{value}" for value in range(30)],
+                }
+            }
+
+        account_ids = [str(value) for value in range(1, 21)] + ["5"] + [str(value) for value in range(21, 26)]
+        result = Sub2ApiAdminClient(request).batch_refresh(account_ids)
+
+        self.assertEqual([
+            ("POST", "/api/v1/admin/accounts/batch-refresh", {"account_ids": list(range(1, 11))}),
+            ("POST", "/api/v1/admin/accounts/batch-refresh", {"account_ids": list(range(11, 21))}),
+            ("POST", "/api/v1/admin/accounts/batch-refresh", {"account_ids": list(range(21, 26))}),
+        ], calls)
+        self.assertEqual(25, result["total"])
+        self.assertEqual(22, result["success"])
+        self.assertEqual(3, result["failed"])
+        self.assertEqual(["2", "12", "25"], [row["account_id"] for row in result["errors"]])
+        self.assertEqual(50, len(result["warnings"]))
+        self.assertEqual("chunk-1-warning-0", result["warnings"][0])
+        self.assertEqual("chunk-2-warning-19", result["warnings"][-1])
+        self.assertNotIn("999", str(result["errors"]))
+
+    def test_batch_refresh_normalizes_duplicate_errors_and_inconsistent_chunk_counts(self):
+        def request(method, path, body):
+            first_id = body["account_ids"][0]
+            if first_id == 1:
+                return {
+                    "data": {
+                        "success": 999,
+                        "failed": -3,
+                        "errors": [
+                            {"account_id": first_id, "error": f"first-error-{value}"}
+                            for value in range(300)
+                        ],
+                        "warnings": [f"warning-{value}" for value in range(30)],
+                    }
+                }
+            return {
+                "data": {
+                    "success": 999,
+                    "failed": 999,
+                    "errors": [
+                        {"account_id": first_id, "error": f"second-error-{value}"}
+                        for value in range(300)
+                    ],
+                    "warnings": [f"second-warning-{value}" for value in range(30)],
+                }
+            }
+
+        result = Sub2ApiAdminClient(request).batch_refresh([str(value) for value in range(1, 21)])
+
+        self.assertEqual(20, result["total"])
+        self.assertEqual(9, result["success"])
+        self.assertEqual(11, result["failed"])
+        self.assertEqual(["1", "11"], [row["account_id"] for row in result["errors"]])
+        self.assertEqual(2, len(result["errors"]))
+        self.assertEqual(50, len(result["warnings"]))
+        self.assertLessEqual(result["success"], result["total"])
+        self.assertLessEqual(result["failed"], result["total"])
+        self.assertLessEqual(result["success"] + result["failed"], result["total"])
+
+    def test_batch_refresh_missing_counts_remain_conservative(self):
+        def request(method, path, body):
+            if body["account_ids"][0] == 1:
+                return {"data": {}}
+            return {"data": {"errors": [{"account_id": 11, "error": "401"}]}}
+
+        result = Sub2ApiAdminClient(request).batch_refresh([str(value) for value in range(1, 21)])
+
+        self.assertEqual(20, result["total"])
+        self.assertEqual(0, result["success"])
+        self.assertEqual(1, result["failed"])
+        self.assertEqual(["11"], [row["account_id"] for row in result["errors"]])
+
+    def test_batch_refresh_caps_unique_selection_after_duplicate_prefix(self):
+        calls = []
+
+        def request(method, path, body):
+            calls.append(body["account_ids"])
+            return {"data": {"success": len(body["account_ids"]), "failed": 0}}
+
+        account_ids = ["same"] * 600 + [str(value) for value in range(1, 501)]
+        result = Sub2ApiAdminClient(request).batch_refresh(account_ids)
+
+        self.assertEqual(500, result["total"])
+        self.assertEqual(50, len(calls))
+        self.assertEqual(["same", 1, 2, 3, 4, 5, 6, 7, 8, 9], calls[0])
+        self.assertEqual([490, 491, 492, 493, 494, 495, 496, 497, 498, 499], calls[-1])
+
+    def test_batch_refresh_stops_after_first_chunk_exception(self):
+        calls = []
+
+        def request(method, path, body):
+            calls.append((method, path, body))
+            if len(calls) == 2:
+                raise Sub2ApiAdminError("second chunk timed out", status_code=504, category="timeout")
+            return {"data": {"total": 10, "success": 10, "failed": 0}}
+
+        with self.assertRaises(Sub2ApiAdminError) as captured:
+            Sub2ApiAdminClient(request).batch_refresh([str(value) for value in range(1, 26)])
+
+        self.assertEqual("timeout", captured.exception.category)
+        self.assertEqual([
+            ("POST", "/api/v1/admin/accounts/batch-refresh", {"account_ids": list(range(1, 11))}),
+            ("POST", "/api/v1/admin/accounts/batch-refresh", {"account_ids": list(range(11, 21))}),
+        ], calls)
+
     def test_delete_deactivates_then_deletes_exact_encoded_account_id_and_discards_payloads(self):
         calls = []
 

@@ -13,6 +13,10 @@ _MAX_NAME = 240
 _MAX_REASON = 180
 _MAX_PAGE_SIZE = 100
 _MAX_PAGES = 20
+_MAX_BATCH_REFRESH_IDS = 500
+_BATCH_REFRESH_CHUNK_SIZE = 10
+_MAX_REFRESH_ERRORS = 500
+_MAX_REFRESH_WARNINGS = 50
 _EMAIL_RE = re.compile(r"^[^\s@]+@[^\s@]+\.[^\s@]+$")
 _EMAIL_SCAN_RE = re.compile(r"[A-Za-z0-9.!#$%&'*+/=?^_`{|}~-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
 _SECRET_RE = re.compile(
@@ -263,36 +267,71 @@ class Sub2ApiAdminClient:
     def batch_refresh(self, account_ids: list[str]) -> dict:
         selected = []
         seen: set[str] = set()
-        for raw in account_ids[:500]:
+        for raw in account_ids:
             account_id = _account_id(raw)
             if account_id and account_id not in seen:
                 seen.add(account_id)
                 selected.append(account_id)
+                if len(selected) >= _MAX_BATCH_REFRESH_IDS:
+                    break
         if not selected:
             return {"total": 0, "success": 0, "failed": 0, "errors": [], "warnings": []}
 
-        payload = self._request(
-            "POST",
-            "/api/v1/admin/accounts/batch-refresh",
-            {"account_ids": [_wire_account_id(account_id) for account_id in selected]},
-        )
-        data = _unwrap_dict(payload)
-        raw_errors = data.get("errors") if isinstance(data.get("errors"), list) else []
-        errors = []
-        for row in raw_errors:
-            if not isinstance(row, dict):
-                continue
-            account_id = _dict_account_id(row)
-            if account_id not in seen:
-                continue
-            errors.append({"account_id": account_id, "error": _safe_reason(row.get("error") or row.get("message"))})
-        raw_warnings = data.get("warnings") if isinstance(data.get("warnings"), list) else []
-        warnings = [_safe_reason(value, "Sub2API 刷新警告") for value in raw_warnings[:50]]
+        total = len(selected)
+        success = 0
+        failed = 0
+        errors: list[dict] = []
+        error_ids: set[str] = set()
+        warnings: list[str] = []
+        for start in range(0, len(selected), _BATCH_REFRESH_CHUNK_SIZE):
+            chunk = selected[start : start + _BATCH_REFRESH_CHUNK_SIZE]
+            chunk_ids = set(chunk)
+            payload = self._request(
+                "POST",
+                "/api/v1/admin/accounts/batch-refresh",
+                {"account_ids": [_wire_account_id(account_id) for account_id in chunk]},
+            )
+            data = _unwrap_dict(payload)
+            raw_errors = data.get("errors") if isinstance(data.get("errors"), list) else []
+            chunk_error_ids: set[str] = set()
+            for row in raw_errors:
+                if not isinstance(row, dict):
+                    continue
+                account_id = _dict_account_id(row)
+                if account_id not in chunk_ids:
+                    continue
+                if account_id not in chunk_error_ids:
+                    chunk_error_ids.add(account_id)
+                    if account_id not in error_ids and len(errors) < _MAX_REFRESH_ERRORS:
+                        errors.append({"account_id": account_id, "error": _safe_reason(row.get("error") or row.get("message"))})
+            new_error_ids = chunk_error_ids - error_ids
+            error_ids.update(chunk_error_ids)
+
+            raw_warnings = data.get("warnings") if isinstance(data.get("warnings"), list) else []
+            remaining_warnings = _MAX_REFRESH_WARNINGS - len(warnings)
+            if remaining_warnings > 0:
+                warnings.extend(
+                    _safe_reason(value, "Sub2API 刷新警告")
+                    for value in raw_warnings[:remaining_warnings]
+                )
+
+            # Normalize every chunk independently. Upstream counts are advisory:
+            # explicit unique errors always consume capacity, missing success is
+            # conservative, and an over-reported chunk cannot make another chunk
+            # appear healthy when the service consumes the aggregate success count.
+            chunk_size = len(chunk)
+            reported_failed = max(0, min(chunk_size, _int(data.get("failed"), len(new_error_ids))))
+            normalized_failed = max(len(new_error_ids), reported_failed)
+            reported_success = max(0, min(chunk_size, _int(data.get("success"))))
+            normalized_success = min(reported_success, chunk_size - normalized_failed)
+            success += normalized_success
+            failed += normalized_failed
+
         return {
-            "total": _int(data.get("total"), len(selected)),
-            "success": _int(data.get("success")),
-            "failed": _int(data.get("failed"), len(errors)),
-            "errors": errors[:500],
+            "total": total,
+            "success": min(total, success),
+            "failed": min(total, failed),
+            "errors": errors[:_MAX_REFRESH_ERRORS],
             "warnings": warnings,
         }
 

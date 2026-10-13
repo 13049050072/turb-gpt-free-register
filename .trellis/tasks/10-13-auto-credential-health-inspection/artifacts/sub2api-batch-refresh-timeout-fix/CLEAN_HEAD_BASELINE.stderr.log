@@ -1,0 +1,33 @@
+test_ensure_authorize_context_matches_20260914_capture_shape (tests.test_chatgpt_auth_context.ChatgptAuthContextTests.test_ensure_authorize_context_matches_20260914_capture_shape) ... ERROR
+test_fetch_latest_otp_restores_saved_service_token_after_restart (tests.test_remail_client.RemailClientTests.test_fetch_latest_otp_restores_saved_service_token_after_restart) ... ok
+test_fetch_latest_otp_uses_pickup_token_without_api_key (tests.test_remail_client.RemailClientTests.test_fetch_latest_otp_uses_pickup_token_without_api_key) ... ok
+test_pick_account_can_wait_for_order_credentials (tests.test_remail_client.RemailClientTests.test_pick_account_can_wait_for_order_credentials) ... ok
+test_pick_account_creates_code_order_and_caches_service_token (tests.test_remail_client.RemailClientTests.test_pick_account_creates_code_order_and_caches_service_token) ... ok
+test_pick_account_requires_project_id (tests.test_remail_client.RemailClientTests.test_pick_account_requires_project_id) ... ok
+test_release_account_clears_cached_context (tests.test_remail_client.RemailClientTests.test_release_account_clears_cached_context) ... ok
+test_restore_context_requires_exact_email_match (tests.test_remail_client.RemailClientTests.test_restore_context_requires_exact_email_match) ... FAIL
+
+======================================================================
+ERROR: test_ensure_authorize_context_matches_20260914_capture_shape (tests.test_chatgpt_auth_context.ChatgptAuthContextTests.test_ensure_authorize_context_matches_20260914_capture_shape)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/private/var/folders/y8/rcm4sxpn30z2vfldbs20135m0000gn/T/tmp.YlGgD4GGkt/base/tests/test_chatgpt_auth_context.py", line 18, in test_ensure_authorize_context_matches_20260914_capture_shape
+    self.assertEqual(qs["ext-oai-did"], ["did-123"])
+                     ~~^^^^^^^^^^^^^^^
+KeyError: 'ext-oai-did'
+
+======================================================================
+FAIL: test_restore_context_requires_exact_email_match (tests.test_remail_client.RemailClientTests.test_restore_context_requires_exact_email_match)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/opt/homebrew/Cellar/python@3.14/3.14.7/Frameworks/Python.framework/Versions/3.14/lib/python3.14/unittest/mock.py", line 1439, in patched
+    return func(*newargs, **newkeywargs)
+  File "/private/var/folders/y8/rcm4sxpn30z2vfldbs20135m0000gn/T/tmp.YlGgD4GGkt/base/tests/test_remail_client.py", line 184, in test_restore_context_requires_exact_email_match
+    self.assertIsNotNone(account)
+    ~~~~~~~~~~~~~~~~~~~~^^^^^^^^^
+AssertionError: unexpectedly None
+
+----------------------------------------------------------------------
+Ran 8 tests in 0.002s
+
+FAILED (failures=1, errors=1)

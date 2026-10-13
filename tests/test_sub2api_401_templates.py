@@ -49,19 +49,39 @@ class Sub2Api401TemplateTests(unittest.TestCase):
             "let pollTimer = null;",
             "let stateLoading = false;",
             "const retrying = items.some(item => item.state === 'retrying');",
-            "if (!retrying) {",
+            "const schedulerRunning = scheduler.phase === 'running' || scheduler.phase === 'waiting_for_queue';",
+            "const schedulerDue = scheduler.enabled === true && Number.isFinite(nextRunAt) && nextRunAt <= Date.now() + 3000;",
+            "const delay = retrying || schedulerRunning || schedulerDue ? 3000 : (scheduler.enabled ? 30000 : 0);",
+            "if (pollTimer && pollDelay !== delay) {",
             "clearTimeout(pollTimer);",
+            "pollDelay = 0;",
+            "if (!delay) return;",
             "pollTimer = setTimeout(async () => {",
             "await loadState();",
-            "}, 3000);",
+            "}, delay);",
             "String(error?.message || '状态读取失败').slice(0, 160)",
             "schedulePolling();",
             "if (stateLoading) return;",
-            "function applyData(data) { items = data.items || []; cleanupSupported = data.cleanup_supported !== false; updateCounts(data); render(); schedulePolling(); }",
+            "function applyData(data) { items = data.items || []; cleanupSupported = data.cleanup_supported !== false; applyScheduler(data.scheduler || scheduler); updateCounts(data); render(); schedulePolling(); }",
             "  loadState();\n})();",
         ):
             self.assertIn(text, page)
         self.assertEqual(page.count("/api/sub2api-401/detect"), 1)
+
+    def test_page_has_independent_scheduler_controls(self):
+        page = Path("webui/templates/sub2api_401.html").read_text(encoding="utf-8")
+        for text in (
+            "开启 Sub2API 自动巡检",
+            "30 分钟",
+            "1 小时",
+            'min="5" max="1440"',
+            "/api/sub2api-401/scheduler",
+            "enabled:$('#autoEnabled').checked",
+            "interval_minutes:interval",
+            "关闭页面不会停止巡检",
+            "精确旧 ID 清理流程",
+        ):
+            self.assertIn(text, page)
 
 
 if __name__ == "__main__":

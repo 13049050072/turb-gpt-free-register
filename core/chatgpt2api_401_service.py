@@ -604,6 +604,7 @@ class ChatGPT2API401Service:
                 "ok": False,
                 "error": "confirm_replace 必须是字面量 true",
                 "queued_count": 0,
+                "submitted_ids": [],
                 "workers": _WORKERS,
                 "skipped": [],
             }
@@ -676,6 +677,7 @@ class ChatGPT2API401Service:
             return {
                 "ok": True,
                 "queued_count": len(submitted),
+                "submitted_ids": [_public_remote_id(remote_id) for remote_id in submitted],
                 "workers": _WORKERS,
                 "skipped": skipped,
                 "progress": progress,

@@ -97,7 +97,11 @@ def _wants_json() -> bool:
 
 def _unauthorized_response():
     if _wants_json():
-        return jsonify({"ok": False, "error": "未授权：请先登录或提供授权码"}), 401
+        response = jsonify({"ok": False, "error": "未授权：请先登录或提供授权码"})
+        response.headers["Cache-Control"] = "no-store, max-age=0"
+        response.headers["Pragma"] = "no-cache"
+        response.headers["X-Content-Type-Options"] = "nosniff"
+        return response, 401
     return redirect(url_for("auth_login", next=request.path))
 
 

@@ -32,6 +32,31 @@ class ChatGPT2API401TemplateTests(unittest.TestCase):
         self.assertNotIn("slice(0, 50)", page)
         self.assertNotIn("完成前请保持页面打开", page)
 
+    def test_page_has_independent_scheduler_controls(self):
+        page = Path("webui/templates/chatgpt2api_401.html").read_text(encoding="utf-8")
+        for text in (
+            "开启 ChatGPT2API 自动巡检",
+            "30 分钟",
+            "1 小时",
+            'min="5" max="1440"',
+            "/api/chatgpt2api-401/scheduler",
+            "enabled:$('#autoEnabled').checked",
+            "interval_minutes:interval",
+            "关闭页面不会停止巡检",
+            "固定并发 5",
+            "精确远端 ID AT 写回",
+            "const queueRunning = Number(progress.queued || 0) + Number(progress.active || 0) > 0",
+            "items.some(item => item.state === 'queued' || item.state === 'refreshing')",
+            "scheduler.phase === 'running' || scheduler.phase === 'waiting_for_queue'",
+            "const schedulerDue = scheduler.enabled === true && Number.isFinite(nextRunAt) && nextRunAt <= Date.now() + 3000;",
+            "queueRunning || schedulerRunning || schedulerDue ? 3000",
+            "scheduler.enabled ? 30000 : 0",
+            "pollDelay !== delay",
+            "pollDelay = 0",
+            "showMessage(error.message, 'error'); schedulePolling();",
+        ):
+            self.assertIn(text, page)
+
     def test_runtime_audit_is_ignored_and_docker_persisted(self):
         dockerfile = Path("Dockerfile").read_text(encoding="utf-8")
         gitignore = Path(".gitignore").read_text(encoding="utf-8")

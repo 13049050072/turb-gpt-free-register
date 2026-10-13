@@ -1,0 +1,1 @@
+.venv/bin/python -m unittest -v tests.test_credential_health_scheduler tests.test_webui_credential_health_scheduler tests.test_sub2api_401_service tests.test_chatgpt2api_401_service tests.test_webui_sub2api_401 tests.test_webui_chatgpt2api_401 tests.test_sub2api_401_templates tests.test_chatgpt2api_401_templates

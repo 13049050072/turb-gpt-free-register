@@ -9,18 +9,34 @@
     *{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font:14px/1.5 system-ui,-apple-system,"Segoe UI",sans-serif}
     .wrap{max-width:1450px;margin:0 auto;padding:28px 20px 60px}.top{display:flex;align-items:center;justify-content:space-between;gap:16px;margin-bottom:18px}
     h1{font-size:25px;margin:0}.muted{color:var(--muted)}a{color:var(--primary);text-decoration:none}.card{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:18px;box-shadow:0 8px 24px rgba(15,23,42,.04);margin-bottom:16px}
-    .toolbar{display:flex;flex-wrap:wrap;align-items:center;gap:10px}.spacer{flex:1}button,select{font:inherit;border:1px solid var(--line);border-radius:9px;padding:9px 13px;background:#fff;color:var(--text)}button{cursor:pointer;font-weight:650}button.primary{background:var(--primary);color:#fff;border-color:var(--primary)}button.danger{background:#fff1f0;color:var(--danger);border-color:#fda29b}button:disabled{opacity:.5;cursor:not-allowed}
+    .toolbar{display:flex;flex-wrap:wrap;align-items:center;gap:10px}.spacer{flex:1}button,select,input{font:inherit;border:1px solid var(--line);border-radius:9px;padding:9px 13px;background:#fff;color:var(--text)}button{cursor:pointer;font-weight:650}button.primary{background:var(--primary);color:#fff;border-color:var(--primary)}button.danger{background:#fff1f0;color:var(--danger);border-color:#fda29b}button:disabled{opacity:.5;cursor:not-allowed}
+    .scheduler-grid{display:grid;grid-template-columns:minmax(180px,1fr) repeat(3,minmax(140px,auto));gap:12px;align-items:end}.scheduler-grid label{display:grid;gap:5px}.scheduler-meta{margin-top:12px;display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:10px}.scheduler-meta>div{border:1px solid var(--line);border-radius:9px;padding:9px 11px}.switch{display:flex!important;align-items:center;gap:9px;padding:9px 0}.switch input{width:18px;height:18px;padding:0}
     .counts{display:grid;grid-template-columns:repeat(6,minmax(105px,1fr));gap:10px;margin-top:14px}.metric{border:1px solid var(--line);border-radius:10px;padding:10px 12px}.metric b{display:block;font-size:20px}
     .notice{margin-top:12px;padding:10px 12px;border-radius:9px;background:#fff7ed;color:#9a3412}.notice.error{background:#fef2f2;color:var(--danger)}.notice.ok{background:#ecfdf3;color:var(--ok)}
     .table-wrap{overflow:auto}table{width:100%;border-collapse:collapse;min-width:1450px}th,td{border-bottom:1px solid #edf1f7;padding:11px 9px;text-align:left;vertical-align:top}th{font-size:12px;text-transform:uppercase;letter-spacing:.03em;color:var(--muted);background:#f8fafc}.ids{max-width:280px;word-break:break-all;color:var(--muted);font-size:12px}
     .badge{display:inline-block;padding:3px 8px;border-radius:999px;font-size:12px;font-weight:700}.pending{background:#fff7ed;color:var(--warn)}.retrying{background:#eff6ff;color:#1d4ed8}.verified,.cleaned{background:#ecfdf3;color:var(--ok)}.cleanup_ready{background:#eef2ff;color:#4338ca}.failed,.ambiguous{background:#fef2f2;color:var(--danger)}
     .queue{margin:12px 0 0;white-space:pre-wrap;word-break:break-all;background:#0f172a;color:#e2e8f0;border-radius:9px;padding:12px;max-height:280px;overflow:auto}.hidden{display:none}
-    @media(max-width:900px){.counts{grid-template-columns:repeat(2,1fr)}.top{align-items:flex-start;flex-direction:column}}
+    @media(max-width:900px){.counts{grid-template-columns:repeat(2,1fr)}.top{align-items:flex-start;flex-direction:column}.scheduler-grid,.scheduler-meta{grid-template-columns:1fr}}
   </style>
 </head>
 <body>
 <div class="wrap">
   <div class="top"><div><h1>Sub2API 401 凭证轮换</h1><div class="muted">批量刷新 OpenAI OAuth 账号 → 补跑 unauthorized → 验证同邮箱新 account_id → 自动清理锁定旧 ID（历史重复项或失败时可手动重试）。</div></div><a href="/">← 返回控制台</a></div>
+  <section class="card" id="schedulerCard">
+    <div class="scheduler-grid">
+      <label class="switch"><input type="checkbox" id="autoEnabled"> 开启 Sub2API 自动巡检</label>
+      <label>巡检周期<select id="intervalPreset"><option value="30">30 分钟</option><option value="60">1 小时</option><option value="custom">自定义</option></select></label>
+      <label id="customIntervalLabel" class="hidden">自定义分钟<input type="number" id="customInterval" min="5" max="1440" step="1" value="30"></label>
+      <button class="primary" id="saveSchedulerBtn">保存自动巡检</button>
+    </div>
+    <div class="scheduler-meta">
+      <div><span class="muted">运行状态</span><b id="schedulerStatus">读取中…</b></div>
+      <div><span class="muted">最近 / 下次</span><div id="schedulerTimes">—</div></div>
+      <div><span class="muted">本轮进度</span><div id="schedulerProgress">—</div></div>
+    </div>
+    <div id="schedulerError"></div>
+    <div class="notice">启用后服务端立即执行一次，之后按完成时间计算下个周期。关闭页面不会停止巡检；发现 unauthorized/401 后复用现有 Codex 补跑、替代 ID 验证和精确旧 ID 清理流程。</div>
+  </section>
   <section class="card">
     <div class="toolbar">
       <button class="primary" id="detectBtn">检测 Sub2API 401</button>
@@ -54,7 +70,9 @@
   const selected = new Set();
   let items = [];
   let cleanupSupported = true;
+  let scheduler = {};
   let pollTimer = null;
+  let pollDelay = 0;
   let stateLoading = false;
   const esc = value => String(value ?? '').replace(/[&<>"']/g, ch => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch]));
   const stateText = {pending:'待补跑',retrying:'补跑中',verified:'已验证',cleanup_ready:'待清理/可重试',cleaned:'已清理',failed:'补跑失败',ambiguous:'状态不明确'};
@@ -66,6 +84,22 @@
   }
   function message(text='', kind='') { $('#message').innerHTML = text ? `<div class="notice ${kind}">${esc(text)}</div>` : ''; }
   function idLines(values) { return (values || []).map(esc).join('<br>') || '—'; }
+  function timeText(value) { return value ? new Date(value).toLocaleString() : '—'; }
+  function applyScheduler(value) {
+    scheduler = value || {};
+    $('#autoEnabled').checked = scheduler.enabled === true;
+    const interval = Number(scheduler.interval_minutes || 30);
+    const preset = interval === 30 || interval === 60 ? String(interval) : 'custom';
+    $('#intervalPreset').value = preset;
+    $('#customInterval').value = String(interval);
+    $('#customIntervalLabel').classList.toggle('hidden', preset !== 'custom');
+    const phaseLabels = {disabled:'已关闭',idle:'等待下次巡检',running:'正在检测/补跑',waiting_for_queue:'等待后台任务',interrupted:'上次运行中断'};
+    $('#schedulerStatus').textContent = `${phaseLabels[scheduler.phase] || scheduler.phase || '未知'}${scheduler.last_outcome ? ` · ${scheduler.last_outcome}` : ''}`;
+    $('#schedulerTimes').textContent = `最近 ${timeText(scheduler.last_finished_at || scheduler.last_started_at)} · 下次 ${timeText(scheduler.next_run_at)}`;
+    const progress = scheduler.progress || {};
+    $('#schedulerProgress').textContent = `检测 ${progress.detected || 0} / 可处理 ${progress.actionable || 0} / 提交 ${progress.submitted || 0} / 完成 ${progress.completed || 0} / 失败 ${progress.failed || 0} / 跳过 ${progress.skipped || 0}`;
+    $('#schedulerError').innerHTML = scheduler.error ? `<div class="notice error">${esc(scheduler.error)}</div>` : '';
+  }
   function updateCounts(data) {
     const counts = data.counts || {};
     $('#unauthorizedCount').textContent = counts.unauthorized || 0;
@@ -98,21 +132,26 @@
   }
   function schedulePolling() {
     const retrying = items.some(item => item.state === 'retrying');
-    if (!retrying) {
-      if (pollTimer) {
-        clearTimeout(pollTimer);
-        pollTimer = null;
-      }
-      return;
+    const schedulerRunning = scheduler.phase === 'running' || scheduler.phase === 'waiting_for_queue';
+    const nextRunAt = Date.parse(scheduler.next_run_at || '');
+    const schedulerDue = scheduler.enabled === true && Number.isFinite(nextRunAt) && nextRunAt <= Date.now() + 3000;
+    const delay = retrying || schedulerRunning || schedulerDue ? 3000 : (scheduler.enabled ? 30000 : 0);
+    if (pollTimer && pollDelay !== delay) {
+      clearTimeout(pollTimer);
+      pollTimer = null;
+      pollDelay = 0;
     }
+    if (!delay) return;
     if (!pollTimer) {
+      pollDelay = delay;
       pollTimer = setTimeout(async () => {
         pollTimer = null;
+        pollDelay = 0;
         await loadState();
-      }, 3000);
+      }, delay);
     }
   }
-  function applyData(data) { items = data.items || []; cleanupSupported = data.cleanup_supported !== false; updateCounts(data); render(); schedulePolling(); }
+  function applyData(data) { items = data.items || []; cleanupSupported = data.cleanup_supported !== false; applyScheduler(data.scheduler || scheduler); updateCounts(data); render(); schedulePolling(); }
   async function loadState() {
     if (stateLoading) return;
     stateLoading = true;
@@ -133,6 +172,21 @@
     } catch (error) { message(error.message, 'error'); }
     finally { $('#detectBtn').disabled = false; }
   }
+  $('#intervalPreset').addEventListener('change', event => {
+    $('#customIntervalLabel').classList.toggle('hidden', event.target.value !== 'custom');
+    if (event.target.value !== 'custom') $('#customInterval').value = event.target.value;
+  });
+  $('#saveSchedulerBtn').addEventListener('click', async () => {
+    const preset = $('#intervalPreset').value;
+    const interval = Number(preset === 'custom' ? $('#customInterval').value : preset);
+    if (!Number.isInteger(interval) || interval < 5 || interval > 1440) { message('自动巡检周期必须是 5–1440 分钟的整数', 'error'); return; }
+    $('#saveSchedulerBtn').disabled = true;
+    try {
+      const data = await api('/api/sub2api-401/scheduler', {method:'PUT', body:JSON.stringify({enabled:$('#autoEnabled').checked, interval_minutes:interval})});
+      applyScheduler(data.scheduler || data); schedulePolling(); message('自动巡检配置已保存。', 'ok');
+    } catch (error) { message(error.message, 'error'); }
+    finally { $('#saveSchedulerBtn').disabled = false; }
+  });
   $('#detectBtn').addEventListener('click', detect);
   $('#retryBtn').addEventListener('click', async () => {
     const accountIds = [...selected].filter(accountId => items.some(item => item.account_id === accountId && item.retryable));

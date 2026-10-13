@@ -1,0 +1,2733 @@
+diff --git a/.gitignore b/.gitignore
+index be8eb2f..be4485c 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -41,6 +41,7 @@ __pycache__/
+ cpa_401_audit.json
+ sub2api_401_audit.json
+ chatgpt2api_401_audit.json
++credential_health_scheduler.json
+ .venv/
+ *.py[cod]
+ *$py.class
+diff --git a/.trellis/spec/backend/credential-health-scheduler.md b/.trellis/spec/backend/credential-health-scheduler.md
+new file mode 100644
+index 0000000..1ea7021
+--- /dev/null
++++ b/.trellis/spec/backend/credential-health-scheduler.md
+@@ -0,0 +1,89 @@
++# Credential Health Scheduler
++
++> Executable contract for periodic Sub2API401 and ChatGPT2API401 inspection.
++
++## Scope
++
++The scheduler runs inside the Flask/Gunicorn process and supports exactly two independent jobs: `sub2api_401` and `chatgpt2api_401`. It is valid only while production uses one Gunicorn worker process. Browser pages configure and observe jobs but never trigger periodic mutation endpoints.
++
++## Public Signatures
++
++```python
++CredentialHealthScheduler.state(job_name: str) -> dict
++CredentialHealthScheduler.configure(job_name: str, *, enabled: bool, interval_minutes: int) -> dict
++CredentialHealthScheduler.run_due(now: datetime | None = None) -> list[str]
++CredentialHealthScheduler.update_progress(job_name: str, run_id: str, *, phase: str | None = None, **counts: int) -> bool
++CredentialHealthScheduler.start() -> None
++CredentialHealthScheduler.stop() -> None
++```
++
++```text
++GET /api/sub2api-401/scheduler
++PUT /api/sub2api-401/scheduler       {"enabled": boolean, "interval_minutes": integer}
++GET /api/chatgpt2api-401/scheduler
++PUT /api/chatgpt2api-401/scheduler   {"enabled": boolean, "interval_minutes": integer}
++```
++
++Each existing product `state` response also includes its sanitized `scheduler` projection.
++
++## Configuration and Cadence
++
++- Default: disabled, 30 minutes.
++- Valid interval: literal integer `5..1440`; booleans, floats, strings, and out-of-range values are rejected.
++- Enabling a disabled job persists `next_run_at=now` and wakes the coordinator for one immediate run.
++- Disabling does not abort an already-running exact-ID transaction; it prevents the next run.
++- Changing an enabled idle interval schedules `now + interval`; changing a running interval applies after completion.
++- Cadence is completion-relative: `next_run_at = last_finished_at + interval`.
++- A job is single-flight; overdue time does not create catch-up runs.
++- Scheduler construction is process-singleton by resolved state path. Repeated Flask app factories in one process reuse one state snapshot, lock, executor, coordinator, and active-future map instead of clobbering settings or duplicating a job.
++- The two products use separate executor slots, so one long run does not block the other.
++
++## Persistence and Recovery
++
++`credential_health_scheduler.json` is versioned and contains only config, timestamps, phase, run ID, bounded counts, outcome, and redacted bounded error. Writes use create-exclusive temporary files, flush/`fsync`, `os.replace`, and mode `0600`; symlink targets remain on the data volume. Docker maps this filename to `/data`. `CREDENTIAL_HEALTH_SCHEDULER_PATH` may override the state path for tests or an explicit deployment volume.
++
++Persisted `running` or `waiting_for_queue` state is reconciled to `last_outcome=interrupted`. If still enabled, one replacement run is immediately due. Product services remain authoritative for account-level recovery and evidence.
++
++## Workflow Adapters
++
++### Sub2API401
++
++1. Refuse an automatic round while a matching Codex retry thread is actually alive. After process restart, persisted `retrying` rows whose local status is also stale are reconciled as failed evidence before detection so they cannot block forever.
++2. Call the existing `Sub2Api401Service.detect()` once.
++3. Select only fresh rows where `state=pending`, `health=unauthorized`, and `retryable=true`, capped by the existing 50-ID limit.
++4. Call the same shared retry coordinator used by `POST /api/sub2api-401/retry` in synchronous completion mode.
++5. Preserve Codex reservation, `mark_retrying`, post-run detection, batch evidence, replacement verification, and `cleanup(..., opt_in=True)` for only same-batch locked exact old IDs.
++
++No email-wide remote mutation is permitted.
++
++### ChatGPT2API401
++
++1. Call the existing `ChatGPT2API401Service.detect()` once; an active queue becomes `skipped_busy`.
++2. Select only fresh `pending` and retryable stable remote IDs, capped at 5000.
++3. Call existing `refresh(remote_ids, opt_in=True, limit=5000)` and use its sanitized `submitted_ids` as the exact ownership set accepted by this round.
++4. Keep scheduler phase `waiting_for_queue` until only those submitted IDs reach terminal audit states; a submitted ID missing from the audit is counted as failed, never completed, while skipped or manually queued IDs cannot hold or influence this round.
++5. Existing queue workers remain the only path to liveness, exact-ID AT writeback, AT readback, and unchanged RT evidence.
++
++The scheduler never implements token refresh or remote PATCH logic itself.
++
++## State and Security
++
++Public phases: `disabled`, `idle`, `running`, `waiting_for_queue`, `interrupted`.
++
++Public outcomes: `success`, `partial`, `failed`, `skipped_busy`, `interrupted`.
++
++Progress fields: `detected`, `actionable`, `submitted`, `completed`, `failed`, `skipped`.
++
++Scheduler/API/audit data must never contain AT, RT, management keys, passwords, OAuth codes, callback URLs, authorization headers, or upstream credential bodies. Errors are whitespace-normalized, secret-pattern redacted, URL redacted, token-pattern redacted, and capped at 500 characters. Scheduler endpoints use the existing authentication and `no-store`, `Pragma: no-cache`, and `nosniff` headers.
++
++## UI Contract
++
++Both pages expose independent enable controls, 30-minute and 1-hour presets, custom 5–1440 minute input, save state, phase, recent/next timestamps, progress, and bounded error. Pages poll product state every 3 seconds while manual or automatic work is active, every 30 seconds while automatic inspection is enabled but idle, and stop polling when disabled and terminal. Closing the page does not stop server work.
++
++## Required Tests
++
++- Default disabled, immediate enable, completion-relative cadence, interval update, disable/re-enable, single-flight, independent jobs, interrupted restart recovery, exception isolation, persistence, symlink/mode, redaction, and malformed/version fallback.
++- API authentication, validation, independent settings, no-store headers, and scheduler projection in product state.
++- Sub2API automatic adapter uses fresh unauthorized exact IDs and existing retry/post-detect/exact-cleanup gates.
++- ChatGPT2API automatic adapter uses fresh pending exact IDs and existing fixed-five-worker queue/writeback gates.
++- Templates contain presets/custom controls, progress/error display, scheduler endpoints, and single-flight polling.
+diff --git a/.trellis/tasks/10-13-auto-credential-health-inspection/check.jsonl b/.trellis/tasks/10-13-auto-credential-health-inspection/check.jsonl
+new file mode 100644
+index 0000000..9dd3234
+--- /dev/null
++++ b/.trellis/tasks/10-13-auto-credential-health-inspection/check.jsonl
+@@ -0,0 +1 @@
++{"_example": "Fill with {\"file\": \"<path>\", \"reason\": \"<why>\"}. Put spec/research files only — no code paths. Run `python3 .trellis/scripts/get_context.py --mode packages` to list available specs. Delete this line once real entries are added."}
+diff --git a/.trellis/tasks/10-13-auto-credential-health-inspection/implement.jsonl b/.trellis/tasks/10-13-auto-credential-health-inspection/implement.jsonl
+new file mode 100644
+index 0000000..c8d8136
+--- /dev/null
++++ b/.trellis/tasks/10-13-auto-credential-health-inspection/implement.jsonl
+@@ -0,0 +1,9 @@
++{"file":".trellis/spec/backend/sub2api-credential-rotation.md","reason":"Preserve Sub2API exact account-ID retry, snapshot, replacement verification, cleanup, redaction, and route contracts while adding automatic orchestration."}
++{"file":".trellis/spec/backend/chatgpt2api-credential-rotation.md","reason":"Preserve ChatGPT2API queued liveness, fixed concurrency 5, exact remote-ID writeback, evidence validation, persistence, and API contracts."}
++{"file":".trellis/spec/backend/directory-structure.md","reason":"Follow project boundaries between Flask routes, core services, templates, and tests."}
++{"file":".trellis/spec/backend/error-handling.md","reason":"Apply bounded non-sensitive API errors, validation, and cache/security response headers."}
++{"file":".trellis/spec/backend/quality-guidelines.md","reason":"Apply cross-layer testing, secret-handling, template parity, and validation requirements."}
++{"file":".trellis/spec/guides/cross-layer-thinking-guide.md","reason":"Trace scheduler state from persistence through service/API/template boundaries."}
++{"file":".trellis/spec/guides/code-reuse-thinking-guide.md","reason":"Reuse existing retry/liveness workflows instead of duplicating credential mutation logic."}
++{"file":".trellis/tasks/10-13-auto-credential-health-inspection/prd.md","reason":"Feature scope, assumptions, acceptance criteria, and selected technical approach."}
++{"file":".trellis/tasks/10-13-auto-credential-health-inspection/research/scheduler-pattern.md","reason":"Repository-backed scheduler design, lifecycle, persistence, single-flight, adapter, and deterministic test guidance."}
+diff --git a/.trellis/tasks/10-13-auto-credential-health-inspection/prd.md b/.trellis/tasks/10-13-auto-credential-health-inspection/prd.md
+new file mode 100644
+index 0000000..4ee2083
+--- /dev/null
++++ b/.trellis/tasks/10-13-auto-credential-health-inspection/prd.md
+@@ -0,0 +1,94 @@
++# Sub2API 与 ChatGPT2API 自动巡检
++
++## Goal
++
++为现有 Sub2API-401 与 ChatGPT2API-401 页面增加可开启、可调整周期的后台自动巡检。开启后，服务端每隔配置的周期（用户提出 30 分钟或 1 小时，并希望可调整）检查对应账号状态；发现 401/unauthorized 时，Sub2API 自动进入现有 Codex OAuth 补跑与精确旧 ID 清理流程，ChatGPT2API 自动进入现有查活（liveness）与精确远端 ID AT 写回流程。页面能够查看启用状态、周期、最近一次运行、当前进度和错误，但关闭页面不应停止后台任务。
++
++## What I already know
++
++* 用户要求同时覆盖 Sub2API401 和 ChatGPT2API401，逻辑复用刚完成的手动检测/补跑/查活流程，而不是再造一套凭证处理逻辑。
++* 当前项目已经有 `core/sub2api_401_service.py`、`core/chatgpt2api_401_service.py` 两套持久化审计与后台队列；两个页面分别是 `webui/templates/sub2api_401.html` 与 `webui/templates/chatgpt2api_401.html`。
++* `webui/app.py:create_app(auth_code: str | None = None) -> Flask` 当前构造两个 401 service，并注册各自的 state/detect/retry/refresh/cleanup/replace API。
++* Sub2API 手动路径：`detect()` 调用 Sub2API batch-refresh；选中的 unauthorized ID 进入现有 Codex OAuth 补跑；成功后验证同邮箱唯一健康替代 ID，再对精确旧 ID 做自动清理。
++* ChatGPT2API 手动路径：`detect()` 定位明确失效 AT；`refresh()` 以 HTTP 202 将选中远端 ID 加入固定并发 5 的后台查活/写回队列；worker 调用 `run_liveness_check()`，验证新 AT 与 RT 证据后仅 PATCH 锁定远端 ID。
++* 当前页面状态轮询只服务于已手动启动的任务：两个模板都使用 3000ms state 轮询，不等同于服务端周期巡检。
++* `core/live_check_service.py` 已有可复用的并发查活服务；`core/chatgpt2api_import_service.py` 有持久化队列 worker 的实现模式；没有发现现成的通用周期调度器。
++* 现有安全边界必须保持：Sub2API 只对精确 account_id 操作且不能按邮箱批量删除；ChatGPT2API 只对锁定的精确远端 ID 写 AT；不把 AT/RT/管理密钥写入日志、审计或 API 响应。
++
++## Assumptions (temporary)
++
++* 自动巡检默认关闭，必须由页面明确开启；保存开启后立即执行一次，服务重启后启用状态与周期从持久化配置恢复。
++* Sub2API 与 ChatGPT2API 各自保存 enabled/interval/last-run/progress/error，不共享开关或周期；任一巡检器故障不阻塞另一类。
++* 自动巡检运行在单个 Web 进程内，但配置和最近运行状态必须持久化，避免重启后丢失设置；同一巡检器不能并发重入。
++* 自动巡检复用两个现有 `detect()` 及后续队列，不直接调用页面 API，不通过浏览器触发，不调用不必要的昂贵路径两次。
++* 一次巡检产生的可处理账号应受现有队列上限、精确 ID 快照、幂等状态和并发门禁约束；上一轮未结束时不启动下一轮。
++
++## Open Questions
++
++* （已决定）周期控件提供 30 分钟、1 小时和自定义分钟数；默认 30 分钟，自定义范围 5–1440 分钟。
++* （已决定）启用后立即执行一次，之后按配置周期运行。
++* （已决定）Sub2API 与 ChatGPT2API 分别独立开启和配置。
++
++## Requirements (evolving)
++
++* [x] 为 Sub2API401 和 ChatGPT2API401 分别提供独立自动巡检开关。
++* [x] 两类巡检周期均可独立调整，提供 30 分钟、1 小时和自定义 5–1440 分钟，默认 30 分钟。
++* [x] Sub2API 自动巡检发现 unauthorized/401 后，复用现有补跑、替代 ID 验证、精确旧 ID 清理流程。
++* [x] ChatGPT2API 自动巡检发现明确失效/401 后，复用现有查活、AT 写回、RT 保留验证流程。
++* [x] 巡检运行在服务端后台，关闭页面不影响任务；页面可读取配置、最近运行与进度。
++* [x] 自动巡检不可与手动检测/补跑/查活产生重复任务或破坏现有审计状态。
++* [x] 失败可重试，记录有界非敏感错误；不得持久化或输出凭证、密钥、授权头。
++* [x] 保持现有 API 安全门禁、精确 ID 操作和缓存安全响应头。
++
++## Acceptance Criteria (evolving)
++
++* [x] 模板/API 测试覆盖两个页面的独立开关、独立周期读取/保存、状态展示和自动动作入口。
++* [x] 测试证明禁用时不运行，启用后按周期触发，服务重启能恢复配置，上一轮未完成时不会重入。
++* [x] 测试证明 Sub2API 自动路径只处理检测到的 unauthorized 项，并最终复用现有补跑/精确清理门禁。
++* [x] 测试证明 ChatGPT2API 自动路径只处理检测到的失效项，并最终复用现有查活/精确远端 ID 写回门禁。
++* [x] 测试覆盖手动操作与自动操作并发、网络错误、队列满、进程重启和状态持久化。
++* [x] Sub2API、ChatGPT2API 相关测试、全量 Python 编译、内联 JavaScript `node --check`、`git diff --check` 通过；全量测试中的非相关失败需在 clean HEAD 原样复现。
++* [ ] 生成部署前可复核的修改、验证、回滚证据；部署后验证 Oracle 容器健康与两个巡检 API/页面。
++
++## Definition of Done (team quality bar)
++
++* Tests added/updated for scheduler persistence, cadence, single-flight, both adapters/services, API validation, and templates.
++* `py_compile`, focused/related/full tests, inline JavaScript syntax check, and `git diff --check` run with literal results recorded.
++* Backend spec updated with public signatures, state machine, persistence, concurrency and security contracts.
++* No production secret is copied into source, logs, task artifacts, or HTML.
++* Commit pushed and Oracle deployment/smoke verification completed only after local evidence passes.
++
++## Out of Scope (explicit)
++
++* 不改变现有 Sub2API/ChatGPT2API 账号导入、注册、普通查活、CPA 兼容或 quota 策略。
++* 不新增按邮箱删除、按邮箱更新或批量无证据替换逻辑。
++* 不把自动巡检实现成浏览器端 `setInterval`，不依赖页面保持打开。
++* 不在本任务中扩大为分布式调度/多实例 leader election；若线上拓扑变化需另立任务。
++* 不自动处理无法唯一映射、状态不明确、证据漂移或队列冲突的账号；这些继续保留为人工复核状态。
++
++## Technical Approach
++
++* Add `core/credential_health_scheduler.py`: one versioned, atomic JSON state file with two independent job records, one coordinator daemon, one two-slot executor, per-job active-future single-flight, event-driven waits, and an injectable `run_due(now)` seam for deterministic tests.
++* Add reusable workflow adapters/coordinators so the scheduler calls existing business gates rather than Flask routes or duplicated credential logic. Sub2API uses `detect -> select retryable exact IDs -> existing Codex retry/post-detect/cleanup`; ChatGPT2API uses `detect -> select pending retryable IDs -> existing refresh queue -> terminal observation`.
++* Add independent scheduler GET/PUT API endpoints and include a sanitized scheduler projection in each existing 401 state response. Validate literal booleans and integer intervals in `5..1440`; default disabled and 30 minutes; enabling persists `next_run_at=now` for immediate execution.
++* Add a scheduler card to both templates with independent toggle/presets/custom interval, recent lifecycle/progress/error, and existing single-flight state polling. The browser never calls periodic mutation/detect endpoints.
++* Persist the scheduler JSON under the existing writable data-volume mapping with atomic `fsync`/`os.replace`, mode `0600`, bounded redacted errors, and restart recovery for interrupted runs. Current deployment is one Gunicorn worker; multi-process leadership is explicitly out of scope.
++
++## Decision (ADR-lite)
++
++**Context**: Two existing 401 workflows already implement exact-ID safety, evidence validation, queueing, and redaction. A periodic feature must survive page closure and restart without creating a second mutation path or duplicate work.
++
++**Decision**: Use one process-local persistence-backed scheduler with two independently configurable jobs. Each job runs immediately when enabled, uses completion-relative cadence, and is single-flight. Both automatic paths reuse extracted shared orchestration from the existing manual workflows.
++
++**Consequences**: The implementation has no new scheduler dependency and is deterministic to test, but it remains valid only for the current one-Gunicorn-worker topology. A future multi-process deployment requires a leader lease or external scheduler before enabling this feature.
++
++## Research References
++
++* [`research/scheduler-pattern.md`](research/scheduler-pattern.md) — repository-backed recommendation for event-driven persistence, restart recovery, single-flight, and shared workflow coordinators.
++
++## Technical Notes
++
++* Existing Sub2API contract: `.trellis/spec/backend/sub2api-credential-rotation.md`.
++* Existing ChatGPT2API contract: `.trellis/spec/backend/chatgpt2api-credential-rotation.md`.
++* Key source boundaries: `webui/app.py`, `core/sub2api_401_service.py`, `core/chatgpt2api_401_service.py`, `core/live_check_service.py`, `core/chatgpt2api_import_service.py`, `webui/templates/sub2api_401.html`, and `webui/templates/chatgpt2api_401.html`.
++* The scheduler stores only config, timestamps, phases, counts, and bounded errors; product audit files remain the source of per-account sanitized evidence.
+diff --git a/.trellis/tasks/10-13-auto-credential-health-inspection/research/scheduler-pattern.md b/.trellis/tasks/10-13-auto-credential-health-inspection/research/scheduler-pattern.md
+new file mode 100644
+index 0000000..cac47d0
+--- /dev/null
++++ b/.trellis/tasks/10-13-auto-credential-health-inspection/research/scheduler-pattern.md
+@@ -0,0 +1,282 @@
++# Persistent interval scheduler pattern
++
++## Recommendation
++
++Use one small, process-local `CredentialHealthScheduler` with one versioned JSON state file and two independent job records: `sub2api_401` and `chatgpt2api_401`. Each record has its own `enabled`, `interval_minutes`, due time, run state, progress, and bounded error. A coordinator thread owns timing and dispatches due jobs to a bounded executor with at most one active future per job and at most two jobs overall.
++
++This is a good fit for the deployed topology because `Dockerfile:76` starts Gunicorn as one `gthread` worker with 16 request threads. It is not a distributed scheduler. If Gunicorn is changed to multiple workers or the application is replicated, each process would otherwise create its own scheduler; that topology needs a leader lease, database-backed queue, or an external scheduler before this feature may be enabled.
++
++Store both job records in one file rather than two unrelated scheduler files. The lifecycle and persistence mechanism are shared, while each product remains independently configurable and fault-isolated. A failure or long run in one product must not prevent the other product's future from starting.
++
++## Repository evidence
++
++| Concern | Existing pattern | Consequence |
++| --- | --- | --- |
++| Production topology | `Dockerfile:76` uses `gunicorn --worker-class gthread --workers 1 --threads 16 ... webui.app:create_app()` | A daemon thread is valid under the current single-process contract. Thread locks do not become cross-process locks. |
++| App startup | `webui/app.py:264-268` constructs both 401 services inside `create_app()`; `webui/app.py:335-362` performs restart recovery and starts the existing import worker | Construct the scheduler after both services/coordinators exist, and start it beside `start_import_worker()`, after recovery. Do not start it at module import time. |
++| Existing daemon | `core/chatgpt2api_import_service.py:427-454` uses a module lock, `threading.Event`, idempotent daemon startup, and `Event.wait(timeout)` | Reuse the lock/event/idempotent-start shape. Use an event so config changes and shutdown can interrupt a long wait. Do not use `time.sleep()` in the scheduler loop. |
++| Atomic JSON | `core/sub2api_401_service.py:146-199` resolves symlink targets and writes beside the target with mode `0600` and `os.replace()`; the ChatGPT2API audit additionally uses process-shared path locks and create-exclusive temporary files | Persist a sanitized versioned scheduler document by create-exclusive temp file, flush/`fsync`, mode `0600`, then `os.replace()` beside the resolved target. Serialize all reads/writes with a path-keyed process lock. |
++| Data volume | `Dockerfile:52-66` maps named state files from `/app` to `/data`, including both current 401 audit files | Add the scheduler state filename, for example `credential_health_scheduler.json`, to the same symlink list during implementation or use an explicitly configured `/data/...` path. Otherwise settings disappear on container replacement. |
++| Sub2API service gate | `core/sub2api_401_service.py:614-640` exposes `select_retryable()` and `mark_retrying()`; detection persists exact-ID evidence; cleanup revalidates the locked old and replacement IDs | Automatic work must select only IDs returned as retryable by the just-completed `detect()`, then use the same retry and cleanup coordinator as the manual route. |
++| Sub2API route workflow | `webui/app.py:2809-2947` currently contains reservation, Codex retry dispatch, post-run `detect()`, and exact-ID `cleanup()` in a nested route runner | Extract this orchestration into a reusable application service. Both the manual endpoint and scheduler should call it; the scheduler must not call Flask routes or copy this nested runner. |
++| ChatGPT2API queue gate | `core/chatgpt2api_401_service.py:42-87` shares operation locks and queue ownership by audit path; `state()` reports queue progress; `detect()` rejects while queued/refreshing at `core/chatgpt2api_401_service.py:475-487` | Let the scheduler call the service directly. Existing state and exact-ID guards remain authoritative, but a scheduler-level per-job flight gate is still needed for one complete inspection round. |
++| ChatGPT2API reuse | `webui/app.py:3026-3058` maps detect and refresh to `ChatGPT2API401Service.detect()` and `.refresh()`; `core/chatgpt2api_401_service.py:707-970` performs pre-liveness evidence checks and exact-ID writeback verification | Automatic work is `detect -> collect retryable pending IDs -> refresh(..., opt_in=True) -> observe queue completion`. Never implement a second liveness or PATCH path. |
++| Existing tests | `tests/test_sub2api_401_service.py`, `tests/test_chatgpt2api_401_service.py`, `tests/test_webui_sub2api_401.py`, `tests/test_webui_chatgpt2api_401.py`, and both template tests inject functions, use temporary audit paths, patch service methods, and inspect static HTML/JS | Keep scheduler timing, executor, persistence path, and job adapters injectable. Test state transitions by calling a deterministic `run_due()` seam, not by sleeping. |
++
++## Proposed component boundaries
++
++A suitable module is `core/credential_health_scheduler.py`. Keep scheduling policy separate from credential business logic.
++
++```python
++@dataclass(frozen=True)
++class InspectionResult:
++    outcome: str                 # success | partial | failed | skipped_busy
++    detected: int = 0
++    actionable: int = 0
++    submitted: int = 0
++    completed: int = 0
++    failed: int = 0
++    skipped: int = 0
++    error: str = ""             # bounded and redacted
++
++class InspectionJob(Protocol):
++    def run(self, run_id: str) -> InspectionResult: ...
++
++class CredentialHealthScheduler:
++    def start(self) -> None: ...
++    def stop(self) -> None: ...             # test/process hygiene, not correctness
++    def state(self, job_name: str) -> dict: ...
++    def configure(self, job_name: str, *, enabled: bool,
++                  interval_minutes: int) -> dict: ...
++    def run_due(self, now: datetime | None = None) -> list[str]: ...
++```
++
++`run_due()` is the key deterministic seam. It examines persisted due state and submits eligible work without waiting for real time. The production coordinator loop computes the nearest due time, calls `wake_event.wait(timeout)`, then invokes `run_due()`. Tests call `run_due(fake_now)` directly and use an inline or manually controlled executor.
++
++Use a module-level registry keyed by the resolved persistence path, similar to the ChatGPT2API path-keyed runtime. `start()` must be idempotent in a process because app factories, tests, and development reloaders can construct more than one app. Expose the scheduler through `app.extensions["credential_health_scheduler"]` so tests and shutdown hooks can access it without importing a second singleton.
++
++The scheduler should have one coordinator thread and a two-slot executor. Keep `active_future[job_name]`; submit only when it is absent or done. A done callback persists the terminal result and next due time, then wakes the coordinator. Never hold the JSON state lock while performing network calls, OAuth, liveness, or waiting for a product queue.
++
++## Persistent state contract
++
++Recommended shape:
++
++```json
++{
++  "version": 1,
++  "updated_at": "2026-10-13T12:00:00+00:00",
++  "jobs": {
++    "sub2api_401": {
++      "enabled": false,
++      "interval_minutes": 30,
++      "phase": "disabled",
++      "run_id": "",
++      "last_started_at": "",
++      "last_finished_at": "",
++      "next_run_at": "",
++      "last_outcome": "",
++      "progress": {
++        "detected": 0,
++        "actionable": 0,
++        "submitted": 0,
++        "completed": 0,
++        "failed": 0,
++        "skipped": 0
++      },
++      "error": ""
++    },
++    "chatgpt2api_401": {}
++  }
++}
++```
++
++Allowed public phases should be small and explicit: `disabled`, `idle`, `running`, `waiting_for_queue`, and `interrupted`. `last_outcome` should be one of `success`, `partial`, `failed`, `skipped_busy`, or `interrupted`.
++
++Persist configuration and lifecycle transitions, not credentials or per-account payloads. Do not store AT, RT, management keys, authorization headers, OAuth codes, callback URLs, upstream bodies, or exception representations that may contain them. Reuse the existing bounded redaction rules before storing/logging `error`; cap public errors, for example at 500 characters. Counts and timestamps are sufficient for scheduler progress because the existing product state endpoints already expose sanitized per-account evidence.
++
++Use aware UTC timestamps for durable wall-clock fields. A monotonic clock may measure an in-process wait or duration, but it cannot be persisted across restarts. Validate loaded data defensively: unknown versions/fields, invalid timestamps, booleans passed as integers, and intervals outside `5..1440` must not activate work.
++
++## Lifecycle and cadence
++
++### Start and stop
++
++1. `create_app()` constructs both 401 services and reusable workflow coordinators.
++2. Existing interrupted DB/queue recovery runs.
++3. The scheduler loads and sanitizes its JSON file, reconciles interrupted scheduler state, and starts exactly one daemon coordinator in that process.
++4. `stop()` sets a stop event and wakes the loop. It exists for tests and orderly teardown; daemon-thread shutdown is not the durability mechanism.
++
++Do not use Flask `before_request` or browser traffic to start or advance the scheduler. That would make startup nondeterministic and could create races under request concurrency. Do not rely on `atexit` to write the final state; persist `running` before work starts and every terminal transition as it occurs.
++
++### Enable, disable, and interval changes
++
++- Default is disabled with `interval_minutes=30`.
++- `false -> true`: atomically persist `enabled=true`, set `next_run_at=now`, then signal the wake event. This gives the required immediate first run.
++- `true -> false`: persist disabled and clear `next_run_at`. Do not kill an already-running OAuth/liveness/writeback transaction; let it reach a verified terminal state, but do not schedule another run.
++- Interval updates require a real integer, excluding `bool`, in `5..1440`.
++- Updating an enabled idle job should set `next_run_at=now + new_interval`; it should not cause an unrequested immediate run.
++- Updating a running job changes the interval used after that run finishes; it must not create a second flight.
++
++After a terminal result, schedule `next_run_at=finished_at + interval`. Completion-relative cadence avoids catch-up storms and guarantees spacing when a run takes longer than its interval. If strict wall-clock cadence is later required, that is a separate policy and needs explicit missed-run semantics.
++
++### Restart recovery
++
++On load:
++
++- Disabled jobs remain disabled.
++- An enabled idle job with a future `next_run_at` resumes waiting for that time.
++- An enabled job whose `next_run_at` is missing or due runs once promptly.
++- A persisted `running` or `waiting_for_queue` phase means the process died. Record the previous run as `interrupted`, clear its in-memory ownership, and make one run due immediately if still enabled. Do not replay every missed interval.
++- Product recovery remains authoritative: ChatGPT2API already converts persisted queued/refreshing work into retryable failure on service construction; Sub2API reconciliation must re-detect and pass the same exact-ID snapshot gates before any retry or cleanup.
++
++Persist-before-execute ordering is important: write the new `run_id`, `phase=running`, and `last_started_at` before invoking the job. On recovery, never infer that an external mutation succeeded merely because the scheduler had reached `running`; the product services must re-read and verify their own evidence.
++
++## Single-flight and manual-operation interaction
++
++There are two distinct gates:
++
++1. The scheduler keeps one active future per product, preventing timer reentry.
++2. A shared product workflow coordinator arbitrates manual and automatic starts.
++
++The second gate is essential. The current Sub2API manual orchestration is nested in the Flask route and uses `_reserve_codex_retry(email)` plus service snapshot gates. Move that orchestration behind one coordinator API that accepts selected exact IDs, worker count, origin, and an optional completion callback/future. The route and automatic adapter must both call it. The future should represent the full `retry -> post-detect -> exact-ID cleanup` round, not merely thread submission.
++
++For Sub2API automatic work:
++
++1. Call `Sub2Api401Service.detect(current_local_statuses)` once.
++2. Extract only rows from that result with `retryable=true`, `state=pending`, and health `unauthorized`; pass their exact `account_id` values back through `select_retryable(..., limit=50)`.
++3. Submit those selected IDs through the shared Codex retry coordinator, preserving `_reserve_codex_retry(email)`, `mark_retrying()`, the existing post-run `detect()`, and `cleanup(..., opt_in=True)` only for the locked selected IDs that become `cleanup_ready` in the same batch.
++4. Treat the coordinator's full completion as the scheduler run completion. Record over-limit, already reserved, stale, ambiguous, and failed-cleanup rows only as bounded counts/errors.
++
++For ChatGPT2API automatic work:
++
++1. Call `ChatGPT2API401Service.detect()` once. If the existing queue is active, classify the automatic attempt as `skipped_busy`; do not overwrite audit state.
++2. Select only rows from that fresh result with `retryable=true` and `state=pending`; call `refresh(remote_ids, opt_in=True, limit=CHATGPT2API_401_MAX_ITEMS)`.
++3. Regard the scheduler run as `waiting_for_queue` until that submitted set reaches terminal states, or provide a completion future from the existing queue runtime. Do not mark the run successful just because `refresh()` returned HTTP-style acceptance data.
++4. Let `_refresh_and_replace()` and `replace()` remain the only liveness/writeback path; they already revalidate old AT/RT hashes, stable remote ID, email uniqueness, exact PATCH acknowledgement, and post-write evidence.
++
++When a manual operation already owns the product coordinator, the automatic run should return `skipped_busy` and schedule the next normal cadence. It should not spin, block request threads, duplicate work, or reset product audit data. The other product remains independently runnable.
++
++## Gunicorn caveat
++
++The current contract is exactly one Gunicorn worker process. `threading.Lock`, path-keyed `RLock`, active-future maps, and module globals coordinate threads only within that process. Atomic `os.replace()` prevents torn JSON but does not provide cross-process single-flight.
++
++Therefore:
++
++- Document one worker as a deployment precondition for the in-process scheduler.
++- Emit a clear startup log stating that the scheduler is process-local.
++- Do not claim multi-worker correctness from the JSON file.
++- If topology changes, disable this in-process scheduler until a single elected owner is provided. Viable upgrades are a database advisory/lease row with expiry and owner ID, a durable queue worker, or an external cron/system scheduler calling an authenticated internal command. Merely adding a file lock does not solve multi-host failover.
++
++Gunicorn graceful restart also creates a short overlap between old and new processes. Under the current one-worker assumption, product exact-ID/evidence gates reduce unsafe mutation risk but do not constitute scheduler leadership. Deployment should stop accepting new scheduler work before intentional rolling multi-process overlap, or the future leader mechanism must cover it.
++
++## API and UI contract
++
++Use independent endpoints so each page manages only its own job while the backend still shares one scheduler:
++
++```text
++GET /api/sub2api-401/scheduler
++PUT /api/sub2api-401/scheduler       {"enabled": true, "interval_minutes": 30}
++GET /api/chatgpt2api-401/scheduler
++PUT /api/chatgpt2api-401/scheduler   {"enabled": true, "interval_minutes": 60}
++```
++
++Alternatively, embed the same sanitized scheduler projection in the existing product `state` response. The most useful arrangement is: config endpoints for validation/update, plus a `scheduler` member in each existing `/state` response so one page poll updates both product and scheduler progress.
++
++The public scheduler projection should contain only:
++
++```json
++{
++  "enabled": true,
++  "interval_minutes": 30,
++  "phase": "running",
++  "run_id": "bounded-random-id",
++  "last_started_at": "...",
++  "last_finished_at": "...",
++  "next_run_at": "...",
++  "last_outcome": "partial",
++  "progress": {
++    "detected": 12,
++    "actionable": 3,
++    "submitted": 3,
++    "completed": 2,
++    "failed": 1,
++    "skipped": 0
++  },
++  "error": "bounded redacted message"
++}
++```
++
++Validation rules:
++
++- Body must be a JSON object.
++- `enabled` must be a literal boolean.
++- `interval_minutes` must be an integer but not `bool`, in `5..1440`.
++- Reject unknown product/job names; clients never choose arbitrary persistence keys.
++- Return `400` for invalid input and preserve the previous configuration.
++- Apply the same authentication and `Cache-Control: no-store, max-age=0`, `Pragma: no-cache`, and `X-Content-Type-Options: nosniff` headers already used by both 401 APIs.
++
++Each page should use a compact operational row/card with:
++
++- a real enable switch;
++- a segmented `30 分钟` / `1 小时` / `自定义` selector;
++- a numeric custom input with `min=5`, `max=1440`, and integer validation;
++- save command and saving/error state;
++- phase, last start/finish/result, next run, progress counts, and bounded error.
++
++The server remains authoritative. A page close changes nothing. On load, fetch state once. While either the manual workflow or automatic phase is active, keep the existing one-request-at-a-time 3000 ms poll. While enabled but idle, use `next_run_at` to schedule a refresh near the due time (or a low-frequency 30-second status refresh), rather than running expensive detection from the browser. The browser must never trigger periodic `/detect`, `/retry`, or `/refresh` calls.
++
++## Deterministic tests without sleeping
++
++Build tests around injected dependencies:
++
++- `now_fn() -> aware UTC datetime`;
++- executor interface (`submit`) with an inline executor and a manually completable future;
++- persistence path under `TemporaryDirectory`;
++- `InspectionJob` fakes recording run IDs and returning controlled results;
++- wake/wait abstraction only for the small lifecycle-loop test.
++
++Core scheduler tests should call `configure()` and `run_due(fake_now)` directly:
++
++1. Default disabled: advancing fake time submits nothing.
++2. Enable: persists state and one `run_due(now)` submits immediately.
++3. Cadence: before due submits nothing; at due submits once; next due is based on finish time.
++4. Interval validation: reject `True`, `4`, `1441`, float, string, and missing fields without changing state; accept `5`, `30`, `60`, and `1440`.
++5. Single-flight: hold a manual future incomplete, advance beyond several intervals, and prove no second submit occurs.
++6. Independent jobs: block Sub2API and prove ChatGPT2API can start and finish.
++7. Disable during run: current future may finish, but no next run is scheduled.
++8. Re-enable: creates exactly one immediate run.
++9. Restart: instantiate a second scheduler from the same file; future due time is preserved, overdue runs once, and persisted running becomes interrupted then due once.
++10. Failure: an adapter exception becomes bounded `failed` state and does not kill the coordinator or prevent the other job.
++11. Persistence: atomic replace, symlink preservation, mode `0600`, malformed-file fallback, version handling, and no seeded secret text in file/API/log output.
++12. Idempotent startup: repeated `start()` for the same resolved path creates one coordinator thread.
++
++Adapter/coordinator tests should reuse existing fake services and assert call order:
++
++- Sub2API: one detect; only fresh unauthorized/retryable exact IDs selected; shared reservation; mark retrying; Codex completion; post-detect; cleanup only same-batch `cleanup_ready` old IDs; no email-wide mutation.
++- ChatGPT2API: one detect; only fresh pending/retryable stable IDs passed to `refresh(..., opt_in=True)`; scheduler remains active until submitted queue work is terminal; busy queue is skipped; no direct liveness or patch implementation in scheduler.
++- Manual/automatic contention: whichever acquires the shared product coordinator first wins; the other receives busy/skipped without duplicate account work.
++
++API tests should patch the scheduler through `app.extensions`, verify independent settings, validation, immediate wake, persistence across a new app/scheduler instance, authentication, no-store headers, and redacted errors. Template tests should assert controls, preset/custom behavior, the configuration endpoints, scheduler rendering, and 3000 ms single-flight polling only while work is active. Extract both inline scripts and run `node --check` as required by the task definition.
++
++No test needs `time.sleep()`. A single lifecycle test can give a fake `wait(timeout)` implementation that records the computed timeout and returns on demand; all policy tests remain synchronous.
++
++## Patterns to avoid
++
++- APScheduler or Celery solely for two interval jobs: they add dependency and operational surface without solving this repository's process ownership unless a shared job store/broker is also deployed.
++- Flask request hooks or browser `setInterval` calling mutation endpoints: lifecycle would depend on traffic/page presence and could duplicate work.
++- Calling the application's own HTTP endpoints from the scheduler: this duplicates authentication/error mapping and obscures transaction ownership.
++- Copying the nested Sub2API route runner or ChatGPT2API liveness/writeback logic into the scheduler: fixes would drift and exact-ID/evidence gates could be bypassed.
++- Holding scheduler locks during network/OAuth work: config and state reads would block for minutes.
++- Fixed-rate catch-up loops: a long run could immediately launch repeated overdue rounds.
++- Treating enqueue acceptance as run completion: ChatGPT2API failures happen asynchronously after acceptance.
++- Assuming atomic JSON is a distributed mutex: it prevents torn writes, not duplicate execution.
++
++## Implementation decision summary
++
++- One scheduler service and one versioned JSON file; two independent records and flights.
++- One daemon coordinator plus a two-slot executor under the current one-worker Gunicorn topology.
++- Event-driven waits, completion-relative cadence, immediate first run, and no catch-up replay.
++- Persist-before-execute and explicit interrupted-run recovery.
++- Shared orchestration coordinators for both manual and automatic paths; the scheduler contains no credential business logic.
++- Existing Sub2API exact-ID retry/verification/cleanup and ChatGPT2API liveness/exact-ID writeback services remain authoritative.
++- Deterministic `run_due(fake_now)` tests; no real sleeping.
++- Multi-process scheduling remains explicitly unsupported until leadership is added.
+diff --git a/.trellis/tasks/10-13-auto-credential-health-inspection/task.json b/.trellis/tasks/10-13-auto-credential-health-inspection/task.json
+new file mode 100644
+index 0000000..5e13fca
+--- /dev/null
++++ b/.trellis/tasks/10-13-auto-credential-health-inspection/task.json
+@@ -0,0 +1,26 @@
++{
++  "id": "auto-credential-health-inspection",
++  "name": "auto-credential-health-inspection",
++  "title": "brainstorm: Sub2API 与 ChatGPT2API 自动巡检",
++  "description": "",
++  "status": "in_progress",
++  "dev_type": null,
++  "scope": null,
++  "package": null,
++  "priority": "P2",
++  "creator": "jiangdk",
++  "assignee": "jiangdk",
++  "createdAt": "2026-10-13",
++  "completedAt": null,
++  "branch": null,
++  "base_branch": "main",
++  "worktree_path": null,
++  "commit": null,
++  "pr_url": null,
++  "subtasks": [],
++  "children": [],
++  "parent": null,
++  "relatedFiles": [],
++  "notes": "",
++  "meta": {}
++}
+\ No newline at end of file
+diff --git a/Dockerfile b/Dockerfile
+index 948ef78..cdbc315 100644
+--- a/Dockerfile
++++ b/Dockerfile
+@@ -58,7 +58,7 @@ RUN chmod 0755 /usr/local/bin/turb-entrypoint \
+          "注册成功的邮箱.json" "注册成功的邮箱.txt" \
+          "注册成功的token.txt" "注册任务.json" \
+          "codex_导出状态.json" "sub2api_401_audit.json" \
+-         "chatgpt2api_401_audit.json" accounts_viewer.html \
++         "chatgpt2api_401_audit.json" "credential_health_scheduler.json" accounts_viewer.html \
+          outlook_accounts.txt outlook_accounts_used.json sub2api.json; \
+        do \
+          rm -rf "/app/$path"; \
+diff --git a/core/chatgpt2api_401_service.py b/core/chatgpt2api_401_service.py
+index 87cc316..2ed0d58 100644
+--- a/core/chatgpt2api_401_service.py
++++ b/core/chatgpt2api_401_service.py
+@@ -604,6 +604,7 @@ class ChatGPT2API401Service:
+                 "ok": False,
+                 "error": "confirm_replace 必须是字面量 true",
+                 "queued_count": 0,
++                "submitted_ids": [],
+                 "workers": _WORKERS,
+                 "skipped": [],
+             }
+@@ -676,6 +677,7 @@ class ChatGPT2API401Service:
+             return {
+                 "ok": True,
+                 "queued_count": len(submitted),
++                "submitted_ids": [_public_remote_id(remote_id) for remote_id in submitted],
+                 "workers": _WORKERS,
+                 "skipped": skipped,
+                 "progress": progress,
+diff --git a/core/credential_health_scheduler.py b/core/credential_health_scheduler.py
+new file mode 100644
+index 0000000..eaf39d9
+--- /dev/null
++++ b/core/credential_health_scheduler.py
+@@ -0,0 +1,527 @@
++# -*- coding: utf-8 -*-
++"""Persistence-backed process-local scheduler for credential health inspection."""
++from __future__ import annotations
++
++import copy
++import json
++import os
++import re
++import threading
++import uuid
++from concurrent.futures import Future, ThreadPoolExecutor
++from dataclasses import asdict, dataclass
++from datetime import datetime, timedelta, timezone
++from pathlib import Path
++from typing import Callable, Mapping
++
++JOB_NAMES = ("sub2api_401", "chatgpt2api_401")
++MIN_INTERVAL_MINUTES = 5
++MAX_INTERVAL_MINUTES = 1440
++DEFAULT_INTERVAL_MINUTES = 30
++_ALLOWED_PHASES = {"disabled", "idle", "running", "waiting_for_queue", "interrupted"}
++_ALLOWED_OUTCOMES = {"", "success", "partial", "failed", "skipped_busy", "interrupted"}
++_PROGRESS_KEYS = ("detected", "actionable", "submitted", "completed", "failed", "skipped")
++_SECRET_NAME = (
++    r"access[_ -]?token|refresh[_ -]?token|id[_ -]?token|api[_ -]?key|password|secret|"
++    r"callback(?:_url)?|oauth[_ -]?code|authorization"
++)
++_QUOTED_SECRET_RE = re.compile(
++    rf"(?is)([\"']?(?:{_SECRET_NAME})[\"']?\s*[:=]\s*)([\"']).*?\2"
++)
++_UNQUOTED_SECRET_RE = re.compile(
++    rf"(?i)([\"']?(?:{_SECRET_NAME})[\"']?\s*[:=]\s*)(?:(?:bearer|basic)\s+)?[^\s,;]+"
++)
++_AUTH_SCHEME_RE = re.compile(r"(?i)\b(?:bearer|basic)\s+[^\s,;]+")
++_URL_RE = re.compile(r"https?://[^\s,;]+", re.I)
++_TOKENISH_RE = re.compile(r"(?<![A-Za-z0-9])[A-Za-z0-9_+/=-]{20,}(?:\.[A-Za-z0-9_+/=-]{8,})*")
++_REGISTRY_LOCK = threading.Lock()
++_REGISTRY: dict[str, "CredentialHealthScheduler"] = {}
++
++
++@dataclass(frozen=True)
++class InspectionResult:
++    outcome: str
++    detected: int = 0
++    actionable: int = 0
++    submitted: int = 0
++    completed: int = 0
++    failed: int = 0
++    skipped: int = 0
++    error: str = ""
++
++
++def _utc_now() -> datetime:
++    return datetime.now(timezone.utc)
++
++
++def _aware_utc(value: datetime | None) -> datetime:
++    value = value or _utc_now()
++    if value.tzinfo is None:
++        value = value.replace(tzinfo=timezone.utc)
++    return value.astimezone(timezone.utc)
++
++
++def _iso(value: datetime | None) -> str:
++    return _aware_utc(value).isoformat() if value is not None else ""
++
++
++def _parse_time(value: object) -> datetime | None:
++    text = str(value or "").strip()
++    if not text:
++        return None
++    try:
++        parsed = datetime.fromisoformat(text[:-1] + "+00:00" if text.endswith("Z") else text)
++    except ValueError:
++        return None
++    return _aware_utc(parsed)
++
++
++def _bounded_count(value: object) -> int:
++    if isinstance(value, bool):
++        return 0
++    try:
++        parsed = int(value or 0)
++    except (TypeError, ValueError, OverflowError):
++        return 0
++    return max(0, min(1_000_000, parsed))
++
++
++def _safe_error(value: object) -> str:
++    text = " ".join(str(value or "").replace("\x00", " ").replace("\r", " ").replace("\n", " ").split())
++    text = _QUOTED_SECRET_RE.sub(r"\1\2[redacted]\2", text)
++    text = _UNQUOTED_SECRET_RE.sub(r"\1[redacted]", text)
++    text = _AUTH_SCHEME_RE.sub("authorization [redacted]", text)
++    text = _URL_RE.sub("[url-redacted]", text)
++    text = _TOKENISH_RE.sub("[token-redacted]", text)
++    return text[:500]
++
++
++def _state_registry_key(path: str | Path | None) -> str:
++    state_path = Path(path) if path is not None else Path(__file__).resolve().parent.parent / "credential_health_scheduler.json"
++    try:
++        if state_path.is_symlink():
++            state_path = state_path.resolve(strict=False)
++    except OSError:
++        pass
++    return str(state_path.resolve(strict=False))
++
++
++def _default_progress() -> dict[str, int]:
++    return {key: 0 for key in _PROGRESS_KEYS}
++
++
++def _default_job() -> dict:
++    return {
++        "enabled": False,
++        "interval_minutes": DEFAULT_INTERVAL_MINUTES,
++        "phase": "disabled",
++        "run_id": "",
++        "last_started_at": "",
++        "last_finished_at": "",
++        "next_run_at": "",
++        "last_outcome": "",
++        "progress": _default_progress(),
++        "error": "",
++    }
++
++
++class CredentialHealthScheduler:
++    """Run two independent credential-health jobs in one process."""
++
++    def __new__(cls, jobs, *, state_path=None, **_kwargs):
++        registry_key = _state_registry_key(state_path)
++        with _REGISTRY_LOCK:
++            existing = _REGISTRY.get(registry_key)
++            if existing is not None and not getattr(existing, "_stopped", False):
++                return existing
++            instance = super().__new__(cls)
++            instance._registry_key = registry_key
++            instance._constructor_lock = threading.RLock()
++            _REGISTRY[registry_key] = instance
++            return instance
++
++    def __init__(
++        self,
++        jobs: Mapping[str, Callable[[str], InspectionResult | dict]],
++        *,
++        state_path: str | Path | None = None,
++        now_fn: Callable[[], datetime] | None = None,
++        executor=None,
++        event_factory: Callable[[], threading.Event] = threading.Event,
++    ) -> None:
++        with self._constructor_lock:
++            if getattr(self, "_initialized", False):
++                return
++            missing = [name for name in JOB_NAMES if not callable(jobs.get(name))]
++            if missing:
++                with _REGISTRY_LOCK:
++                    if _REGISTRY.get(self._registry_key) is self:
++                        _REGISTRY.pop(self._registry_key, None)
++                raise ValueError(f"missing scheduler jobs: {', '.join(missing)}")
++            self._jobs = {name: jobs[name] for name in JOB_NAMES}
++            self._state_path = Path(state_path) if state_path is not None else Path(__file__).resolve().parent.parent / "credential_health_scheduler.json"
++            self._now_fn = now_fn or _utc_now
++            self._lock = threading.RLock()
++            self._wake_event = event_factory()
++            self._stop_event = event_factory()
++            self._executor = executor or ThreadPoolExecutor(max_workers=2, thread_name_prefix="credential-health")
++            self._owns_executor = executor is None
++            self._active: dict[str, Future] = {}
++            self._coordinator: threading.Thread | None = None
++            self._started = False
++            self._stopping = False
++            self._stopped = False
++            self._state = self._load_state()
++            if self._reconcile_interrupted():
++                self._persist_locked()
++            self._initialized = True
++
++    @property
++    def state_path(self) -> Path:
++        return self._state_path
++
++    def _target_path(self) -> Path:
++        try:
++            if self._state_path.is_symlink():
++                return self._state_path.resolve(strict=False)
++        except OSError:
++            pass
++        return self._state_path
++
++    def _sanitize_job(self, raw: object) -> dict:
++        default = _default_job()
++        if not isinstance(raw, dict):
++            return default
++        enabled = raw.get("enabled") if type(raw.get("enabled")) is bool else False
++        interval = raw.get("interval_minutes")
++        if isinstance(interval, bool) or not isinstance(interval, int) or not MIN_INTERVAL_MINUTES <= interval <= MAX_INTERVAL_MINUTES:
++            interval = DEFAULT_INTERVAL_MINUTES
++        phase = str(raw.get("phase") or ("idle" if enabled else "disabled"))
++        if phase not in _ALLOWED_PHASES:
++            phase = "idle" if enabled else "disabled"
++        if not enabled and phase not in {"running", "waiting_for_queue"}:
++            phase = "disabled"
++        outcome = str(raw.get("last_outcome") or "")
++        if outcome not in _ALLOWED_OUTCOMES:
++            outcome = ""
++        progress_raw = raw.get("progress") if isinstance(raw.get("progress"), dict) else {}
++        return {
++            "enabled": enabled,
++            "interval_minutes": interval,
++            "phase": phase,
++            "run_id": str(raw.get("run_id") or "")[:64],
++            "last_started_at": _iso(_parse_time(raw.get("last_started_at"))) if _parse_time(raw.get("last_started_at")) else "",
++            "last_finished_at": _iso(_parse_time(raw.get("last_finished_at"))) if _parse_time(raw.get("last_finished_at")) else "",
++            "next_run_at": _iso(_parse_time(raw.get("next_run_at"))) if _parse_time(raw.get("next_run_at")) else "",
++            "last_outcome": outcome,
++            "progress": {key: _bounded_count(progress_raw.get(key)) for key in _PROGRESS_KEYS},
++            "error": _safe_error(raw.get("error")),
++        }
++
++    def _load_state(self) -> dict:
++        try:
++            payload = json.loads(self._state_path.read_text(encoding="utf-8"))
++        except (FileNotFoundError, json.JSONDecodeError, OSError):
++            payload = {}
++        if not isinstance(payload, dict) or payload.get("version") != 1:
++            jobs = {}
++        else:
++            jobs = payload.get("jobs") if isinstance(payload.get("jobs"), dict) else {}
++        return {
++            "version": 1,
++            "updated_at": str(payload.get("updated_at") or "") if isinstance(payload, dict) else "",
++            "jobs": {name: self._sanitize_job(jobs.get(name)) for name in JOB_NAMES},
++        }
++
++    def _reconcile_interrupted(self) -> bool:
++        now = _aware_utc(self._now_fn())
++        changed = False
++        for job in self._state["jobs"].values():
++            if job["phase"] not in {"running", "waiting_for_queue"}:
++                if job["enabled"] and not _parse_time(job["next_run_at"]):
++                    job["phase"] = "idle"
++                    job["next_run_at"] = _iso(now)
++                    changed = True
++                continue
++            job["phase"] = "idle" if job["enabled"] else "disabled"
++            job["last_outcome"] = "interrupted"
++            job["last_finished_at"] = _iso(now)
++            job["next_run_at"] = _iso(now) if job["enabled"] else ""
++            job["error"] = "上次自动巡检因服务重启中断，已安排重新巡检" if job["enabled"] else "上次自动巡检因服务重启中断"
++            changed = True
++        return changed
++
++    def _persist_locked(self) -> None:
++        target = self._target_path()
++        target.parent.mkdir(parents=True, exist_ok=True)
++        self._state["updated_at"] = _iso(_aware_utc(self._now_fn()))
++        payload = json.dumps(self._state, ensure_ascii=False, indent=2) + "\n"
++        temp = target.with_name(f".{target.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
++        fd = -1
++        try:
++            fd = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
++            with os.fdopen(fd, "w", encoding="utf-8") as handle:
++                fd = -1
++                handle.write(payload)
++                handle.flush()
++                os.fsync(handle.fileno())
++            os.replace(temp, target)
++            try:
++                os.chmod(target, 0o600)
++            except OSError:
++                pass
++            try:
++                dir_fd = os.open(target.parent, os.O_RDONLY)
++            except OSError:
++                dir_fd = -1
++            if dir_fd >= 0:
++                try:
++                    os.fsync(dir_fd)
++                finally:
++                    os.close(dir_fd)
++        finally:
++            if fd >= 0:
++                os.close(fd)
++            try:
++                temp.unlink(missing_ok=True)
++            except OSError:
++                pass
++
++    def state(self, job_name: str) -> dict:
++        if job_name not in JOB_NAMES:
++            raise KeyError(job_name)
++        with self._lock:
++            return copy.deepcopy(self._state["jobs"][job_name])
++
++    def configure(self, job_name: str, *, enabled: bool, interval_minutes: int) -> dict:
++        if job_name not in JOB_NAMES:
++            raise KeyError(job_name)
++        if type(enabled) is not bool:
++            raise ValueError("enabled 必须是字面量布尔值")
++        if isinstance(interval_minutes, bool) or not isinstance(interval_minutes, int):
++            raise ValueError("interval_minutes 必须是整数")
++        if not MIN_INTERVAL_MINUTES <= interval_minutes <= MAX_INTERVAL_MINUTES:
++            raise ValueError("interval_minutes 必须在 5 到 1440 之间")
++        now = _aware_utc(self._now_fn())
++        with self._lock:
++            job = self._state["jobs"][job_name]
++            was_enabled = job["enabled"]
++            active = self._active.get(job_name)
++            running = (
++                (active is not None and not active.done())
++                or job["phase"] in {"running", "waiting_for_queue"}
++            )
++            interval_changed = job["interval_minutes"] != interval_minutes
++            job["enabled"] = enabled
++            job["interval_minutes"] = interval_minutes
++            if not enabled:
++                job["next_run_at"] = ""
++                if not running:
++                    job["phase"] = "disabled"
++            elif not was_enabled:
++                if not running:
++                    job["phase"] = "idle"
++                job["next_run_at"] = _iso(now)
++                job["error"] = ""
++            elif interval_changed and not running:
++                job["phase"] = "idle"
++                job["next_run_at"] = _iso(now + timedelta(minutes=interval_minutes))
++            elif not running and job["phase"] == "disabled":
++                job["phase"] = "idle"
++                job["next_run_at"] = job["next_run_at"] or _iso(now)
++            self._persist_locked()
++            result = copy.deepcopy(job)
++        if self._started and enabled:
++            self._ensure_coordinator()
++        self._wake_event.set()
++        return result
++
++    def update_progress(self, job_name: str, run_id: str, *, phase: str | None = None, **counts: int) -> bool:
++        if job_name not in JOB_NAMES:
++            return False
++        if phase is not None and phase not in {"running", "waiting_for_queue"}:
++            raise ValueError("invalid running phase")
++        with self._lock:
++            job = self._state["jobs"][job_name]
++            if job["run_id"] != run_id or job["phase"] not in {"running", "waiting_for_queue"}:
++                return False
++            if phase is not None:
++                job["phase"] = phase
++            for key, value in counts.items():
++                if key in _PROGRESS_KEYS:
++                    job["progress"][key] = _bounded_count(value)
++            self._persist_locked()
++        self._wake_event.set()
++        return True
++
++    def _normalize_result(self, result: InspectionResult | dict | None) -> InspectionResult:
++        if isinstance(result, InspectionResult):
++            candidate = result
++        elif isinstance(result, dict):
++            candidate = InspectionResult(
++                outcome=str(result.get("outcome") or "success"),
++                detected=_bounded_count(result.get("detected")),
++                actionable=_bounded_count(result.get("actionable")),
++                submitted=_bounded_count(result.get("submitted")),
++                completed=_bounded_count(result.get("completed")),
++                failed=_bounded_count(result.get("failed")),
++                skipped=_bounded_count(result.get("skipped")),
++                error=_safe_error(result.get("error")),
++            )
++        else:
++            candidate = InspectionResult(outcome="success")
++        outcome = candidate.outcome if candidate.outcome in _ALLOWED_OUTCOMES - {"", "interrupted"} else "failed"
++        return InspectionResult(
++            outcome=outcome,
++            detected=_bounded_count(candidate.detected),
++            actionable=_bounded_count(candidate.actionable),
++            submitted=_bounded_count(candidate.submitted),
++            completed=_bounded_count(candidate.completed),
++            failed=_bounded_count(candidate.failed),
++            skipped=_bounded_count(candidate.skipped),
++            error=_safe_error(candidate.error),
++        )
++
++    def _execute(self, job_name: str, run_id: str):
++        return self._jobs[job_name](run_id)
++
++    def _complete(self, job_name: str, run_id: str, future: Future) -> None:
++        try:
++            result = self._normalize_result(future.result())
++        except Exception as exc:
++            result = InspectionResult(
++                outcome="failed",
++                failed=1,
++                error=f"{type(exc).__name__}: 自动巡检执行失败",
++            )
++        finished = _aware_utc(self._now_fn())
++        with self._lock:
++            job = self._state["jobs"][job_name]
++            if job["run_id"] != run_id:
++                self._active.pop(job_name, None)
++                return
++            job["last_finished_at"] = _iso(finished)
++            job["last_outcome"] = result.outcome
++            job["progress"] = {key: _bounded_count(asdict(result).get(key)) for key in _PROGRESS_KEYS}
++            job["error"] = _safe_error(result.error)
++            if job["enabled"]:
++                job["phase"] = "idle"
++                job["next_run_at"] = _iso(finished + timedelta(minutes=job["interval_minutes"]))
++            else:
++                job["phase"] = "disabled"
++                job["next_run_at"] = ""
++            self._active.pop(job_name, None)
++            self._persist_locked()
++        self._wake_event.set()
++
++    def run_due(self, now: datetime | None = None) -> list[str]:
++        current = _aware_utc(now or self._now_fn())
++        submissions: list[tuple[str, str]] = []
++        with self._lock:
++            for job_name in JOB_NAMES:
++                job = self._state["jobs"][job_name]
++                active = self._active.get(job_name)
++                if active is not None and not active.done():
++                    continue
++                due = _parse_time(job["next_run_at"])
++                if not job["enabled"] or due is None or due > current:
++                    continue
++                run_id = uuid.uuid4().hex[:16]
++                job.update({
++                    "phase": "running",
++                    "run_id": run_id,
++                    "last_started_at": _iso(current),
++                    "last_finished_at": "",
++                    "next_run_at": "",
++                    "last_outcome": "",
++                    "progress": _default_progress(),
++                    "error": "",
++                })
++                self._persist_locked()
++                submissions.append((job_name, run_id))
++
++        started: list[str] = []
++        for job_name, run_id in submissions:
++            try:
++                future = self._executor.submit(self._execute, job_name, run_id)
++            except Exception as exc:
++                failed = Future()
++                failed.set_exception(exc)
++                self._complete(job_name, run_id, failed)
++                continue
++            with self._lock:
++                self._active[job_name] = future
++            future.add_done_callback(lambda done, name=job_name, rid=run_id: self._complete(name, rid, done))
++            started.append(job_name)
++        return started
++
++    def _next_timeout(self) -> float | None:
++        now = _aware_utc(self._now_fn())
++        with self._lock:
++            due_times = [
++                parsed for name in JOB_NAMES
++                if self._state["jobs"][name]["enabled"] and name not in self._active
++                for parsed in [_parse_time(self._state["jobs"][name]["next_run_at"])]
++                if parsed is not None
++            ]
++        if not due_times:
++            return None
++        return max(0.0, min((due - now).total_seconds() for due in due_times))
++
++    def _loop(self) -> None:
++        while not self._stop_event.is_set():
++            timeout = self._next_timeout()
++            self._wake_event.wait(timeout)
++            self._wake_event.clear()
++            if self._stop_event.is_set():
++                return
++            self.run_due()
++
++    def _ensure_coordinator(self) -> None:
++        with self._lock:
++            if self._stop_event.is_set():
++                return
++            if self._coordinator is not None and self._coordinator.is_alive():
++                return
++            self._coordinator = threading.Thread(target=self._loop, name="credential-health-scheduler", daemon=True)
++            self._coordinator.start()
++
++    def start(self) -> None:
++        with self._lock:
++            if self._started:
++                return
++            self._started = True
++            enabled = any(self._state["jobs"][name]["enabled"] for name in JOB_NAMES)
++        if enabled:
++            self._ensure_coordinator()
++        self._wake_event.set()
++
++    def stop(self) -> None:
++        with self._lock:
++            if self._stopped or self._stopping:
++                return
++            self._stopping = True
++        self._stop_event.set()
++        self._wake_event.set()
++        coordinator = self._coordinator
++        if coordinator is not None and coordinator.is_alive() and coordinator is not threading.current_thread():
++            coordinator.join(timeout=2)
++        if self._owns_executor:
++            # An orderly in-process restart must not let callbacks from this
++            # runtime overwrite the replacement scheduler's persisted state.
++            self._executor.shutdown(wait=True, cancel_futures=False)
++        with self._lock:
++            self._stopped = True
++            self._stopping = False
++        with _REGISTRY_LOCK:
++            if _REGISTRY.get(self._registry_key) is self:
++                _REGISTRY.pop(self._registry_key, None)
++
++
++__all__ = [
++    "CredentialHealthScheduler",
++    "InspectionResult",
++    "JOB_NAMES",
++    "MIN_INTERVAL_MINUTES",
++    "MAX_INTERVAL_MINUTES",
++]
+diff --git a/tests/test_chatgpt2api_401_service.py b/tests/test_chatgpt2api_401_service.py
+index 943782b..6d06d9b 100644
+--- a/tests/test_chatgpt2api_401_service.py
++++ b/tests/test_chatgpt2api_401_service.py
+@@ -101,6 +101,7 @@ class ChatGPT2API401ServiceTests(unittest.TestCase):
+
+         queued = self.enqueue(service)
+         self.assertEqual(1, queued["queued_count"])
++        self.assertEqual(["remote-old"], queued["submitted_ids"])
+         self.assertEqual(CHATGPT2API_401_WORKERS, queued["workers"])
+         final = self.wait_terminal(service, ["replaced"])
+
+diff --git a/tests/test_chatgpt2api_401_templates.py b/tests/test_chatgpt2api_401_templates.py
+index 6dbc8e1..5183de3 100644
+--- a/tests/test_chatgpt2api_401_templates.py
++++ b/tests/test_chatgpt2api_401_templates.py
+@@ -32,6 +32,31 @@ class ChatGPT2API401TemplateTests(unittest.TestCase):
+         self.assertNotIn("slice(0, 50)", page)
+         self.assertNotIn("完成前请保持页面打开", page)
+
++    def test_page_has_independent_scheduler_controls(self):
++        page = Path("webui/templates/chatgpt2api_401.html").read_text(encoding="utf-8")
++        for text in (
++            "开启 ChatGPT2API 自动巡检",
++            "30 分钟",
++            "1 小时",
++            'min="5" max="1440"',
++            "/api/chatgpt2api-401/scheduler",
++            "enabled:$('#autoEnabled').checked",
++            "interval_minutes:interval",
++            "关闭页面不会停止巡检",
++            "固定并发 5",
++            "精确远端 ID AT 写回",
++            "const queueRunning = Number(progress.queued || 0) + Number(progress.active || 0) > 0",
++            "items.some(item => item.state === 'queued' || item.state === 'refreshing')",
++            "scheduler.phase === 'running' || scheduler.phase === 'waiting_for_queue'",
++            "const schedulerDue = scheduler.enabled === true && Number.isFinite(nextRunAt) && nextRunAt <= Date.now() + 3000;",
++            "queueRunning || schedulerRunning || schedulerDue ? 3000",
++            "scheduler.enabled ? 30000 : 0",
++            "pollDelay !== delay",
++            "pollDelay = 0",
++            "showMessage(error.message, 'error'); schedulePolling();",
++        ):
++            self.assertIn(text, page)
++
+     def test_runtime_audit_is_ignored_and_docker_persisted(self):
+         dockerfile = Path("Dockerfile").read_text(encoding="utf-8")
+         gitignore = Path(".gitignore").read_text(encoding="utf-8")
+diff --git a/tests/test_credential_health_scheduler.py b/tests/test_credential_health_scheduler.py
+new file mode 100644
+index 0000000..8f14f42
+--- /dev/null
++++ b/tests/test_credential_health_scheduler.py
+@@ -0,0 +1,335 @@
++# -*- coding: utf-8 -*-
++import json
++import os
++import stat
++import tempfile
++import threading
++import unittest
++from concurrent.futures import Future, ThreadPoolExecutor
++from datetime import datetime, timedelta, timezone
++from pathlib import Path
++
++from core.credential_health_scheduler import CredentialHealthScheduler, InspectionResult
++
++
++class _Clock:
++    def __init__(self, value):
++        self.value = value
++
++    def __call__(self):
++        return self.value
++
++
++class _ManualExecutor:
++    def __init__(self):
++        self.submissions = []
++
++    def submit(self, fn, *args):
++        future = Future()
++        self.submissions.append((future, fn, args))
++        return future
++
++    def run(self, index=0):
++        future, fn, args = self.submissions[index]
++        try:
++            future.set_result(fn(*args))
++        except Exception as exc:
++            future.set_exception(exc)
++        return future
++
++
++class CredentialHealthSchedulerTests(unittest.TestCase):
++    def setUp(self):
++        self.tmp = tempfile.TemporaryDirectory()
++        self.addCleanup(self.tmp.cleanup)
++        self.path = Path(self.tmp.name) / "scheduler.json"
++        self.now = datetime(2026, 10, 13, 12, 0, tzinfo=timezone.utc)
++        self.clock = _Clock(self.now)
++        self.executor = _ManualExecutor()
++        self.calls = {"sub2api_401": [], "chatgpt2api_401": []}
++
++        def make_job(name):
++            def run(run_id):
++                self.calls[name].append(run_id)
++                return InspectionResult(outcome="success", detected=2, actionable=1, submitted=1, completed=1)
++            return run
++
++        self.scheduler = CredentialHealthScheduler(
++            {name: make_job(name) for name in self.calls},
++            state_path=self.path,
++            now_fn=self.clock,
++            executor=self.executor,
++        )
++        self.addCleanup(self.scheduler.stop)
++
++    def test_default_disabled_and_enable_runs_immediately(self):
++        self.assertFalse(self.scheduler.state("sub2api_401")["enabled"])
++        self.assertEqual([], self.scheduler.run_due(self.now + timedelta(days=1)))
++        configured = self.scheduler.configure("sub2api_401", enabled=True, interval_minutes=30)
++        self.assertEqual(self.now.isoformat(), configured["next_run_at"])
++        self.assertEqual(["sub2api_401"], self.scheduler.run_due(self.now))
++        self.executor.run()
++        state = self.scheduler.state("sub2api_401")
++        self.assertEqual("success", state["last_outcome"])
++        self.assertEqual((self.now + timedelta(minutes=30)).isoformat(), state["next_run_at"])
++        self.assertEqual(1, state["progress"]["completed"])
++
++    def test_completion_relative_cadence_and_single_flight(self):
++        self.scheduler.configure("sub2api_401", enabled=True, interval_minutes=30)
++        self.assertEqual(["sub2api_401"], self.scheduler.run_due(self.now))
++        self.assertEqual([], self.scheduler.run_due(self.now + timedelta(hours=3)))
++        self.clock.value = self.now + timedelta(minutes=7)
++        self.executor.run()
++        state = self.scheduler.state("sub2api_401")
++        self.assertEqual((self.clock.value + timedelta(minutes=30)).isoformat(), state["next_run_at"])
++        self.assertEqual([], self.scheduler.run_due(self.clock.value + timedelta(minutes=29)))
++
++    def test_jobs_are_independent(self):
++        for name in self.calls:
++            self.scheduler.configure(name, enabled=True, interval_minutes=30)
++        self.assertEqual(list(self.calls), self.scheduler.run_due(self.now))
++        self.executor.run(1)
++        self.assertEqual("running", self.scheduler.state("sub2api_401")["phase"])
++        self.assertEqual("idle", self.scheduler.state("chatgpt2api_401")["phase"])
++
++    def test_disable_during_run_and_reenable(self):
++        self.scheduler.configure("sub2api_401", enabled=True, interval_minutes=30)
++        self.scheduler.run_due(self.now)
++        state = self.scheduler.configure("sub2api_401", enabled=False, interval_minutes=60)
++        self.assertFalse(state["enabled"])
++        self.executor.run()
++        state = self.scheduler.state("sub2api_401")
++        self.assertEqual("disabled", state["phase"])
++        self.assertEqual("", state["next_run_at"])
++        self.clock.value += timedelta(minutes=1)
++        state = self.scheduler.configure("sub2api_401", enabled=True, interval_minutes=60)
++        self.assertEqual(self.clock.value.isoformat(), state["next_run_at"])
++
++    def test_idle_interval_update_reschedules_without_immediate_run(self):
++        self.scheduler.configure("sub2api_401", enabled=True, interval_minutes=30)
++        self.scheduler.run_due(self.now)
++        self.executor.run()
++        self.clock.value += timedelta(minutes=2)
++        state = self.scheduler.configure("sub2api_401", enabled=True, interval_minutes=60)
++        self.assertEqual((self.clock.value + timedelta(minutes=60)).isoformat(), state["next_run_at"])
++
++    def test_running_phase_is_not_rescheduled_before_future_registration(self):
++        self.scheduler.configure("sub2api_401", enabled=True, interval_minutes=30)
++        with self.scheduler._lock:
++            job = self.scheduler._state["jobs"]["sub2api_401"]
++            job["phase"] = "running"
++            job["run_id"] = "claimed-run"
++            job["next_run_at"] = ""
++        state = self.scheduler.configure("sub2api_401", enabled=True, interval_minutes=60)
++        self.assertEqual("running", state["phase"])
++        self.assertEqual("", state["next_run_at"])
++
++    def test_validation_preserves_previous_state(self):
++        before = self.scheduler.state("sub2api_401")
++        for enabled, interval in ((1, 30), (True, True), (True, 4), (True, 1441), (True, 30.0), (True, "30")):
++            with self.subTest(enabled=enabled, interval=interval), self.assertRaises(ValueError):
++                self.scheduler.configure("sub2api_401", enabled=enabled, interval_minutes=interval)
++        self.assertEqual(before, self.scheduler.state("sub2api_401"))
++        with self.assertRaises(KeyError):
++            self.scheduler.state("unknown")
++
++    def test_restart_recovers_interrupted_job_as_due(self):
++        payload = {
++            "version": 1,
++            "jobs": {
++                "sub2api_401": {
++                    "enabled": True, "interval_minutes": 30, "phase": "waiting_for_queue",
++                    "run_id": "old", "last_started_at": self.now.isoformat(), "next_run_at": "",
++                },
++                "chatgpt2api_401": {"enabled": False, "interval_minutes": 30, "phase": "disabled"},
++            },
++        }
++        self.scheduler.stop()
++        self.path.write_text(json.dumps(payload), encoding="utf-8")
++        recovered = CredentialHealthScheduler(
++            {name: (lambda _run_id: InspectionResult(outcome="success")) for name in self.calls},
++            state_path=self.path, now_fn=self.clock, executor=_ManualExecutor(),
++        )
++        state = recovered.state("sub2api_401")
++        self.assertEqual("interrupted", state["last_outcome"])
++        self.assertEqual("idle", state["phase"])
++        self.assertEqual(self.now.isoformat(), state["next_run_at"])
++
++    def test_exception_is_redacted_and_other_job_can_finish(self):
++        def secret_failure(_run_id):
++            raise RuntimeError("access_token=very-secret-value callback=https://secret.example/cb")
++
++        self.scheduler.stop()
++        executor = _ManualExecutor()
++        scheduler = CredentialHealthScheduler(
++            {
++                "sub2api_401": secret_failure,
++                "chatgpt2api_401": lambda _run_id: InspectionResult(outcome="success", completed=1),
++            },
++            state_path=self.path, now_fn=self.clock, executor=executor,
++        )
++        for name in self.calls:
++            scheduler.configure(name, enabled=True, interval_minutes=30)
++        scheduler.run_due(self.now)
++        executor.run(0)
++        executor.run(1)
++        failed = scheduler.state("sub2api_401")
++        self.assertEqual("failed", failed["last_outcome"])
++        self.assertNotIn("very-secret-value", failed["error"])
++        self.assertNotIn("secret.example", failed["error"])
++        self.assertEqual("success", scheduler.state("chatgpt2api_401")["last_outcome"])
++        persisted = self.path.read_text(encoding="utf-8")
++        self.assertNotIn("very-secret-value", persisted)
++
++    def test_progress_update_requires_matching_run(self):
++        self.scheduler.configure("chatgpt2api_401", enabled=True, interval_minutes=30)
++        self.scheduler.run_due(self.now)
++        run_id = self.scheduler.state("chatgpt2api_401")["run_id"]
++        self.assertFalse(self.scheduler.update_progress("chatgpt2api_401", "wrong", submitted=9))
++        self.assertTrue(self.scheduler.update_progress(
++            "chatgpt2api_401", run_id, phase="waiting_for_queue", detected=4, submitted=2
++        ))
++        state = self.scheduler.state("chatgpt2api_401")
++        self.assertEqual("waiting_for_queue", state["phase"])
++        self.assertEqual(2, state["progress"]["submitted"])
++
++    def test_symlink_target_is_preserved_and_mode_is_private(self):
++        real = Path(self.tmp.name) / "data" / "scheduler.json"
++        real.parent.mkdir()
++        link = Path(self.tmp.name) / "scheduler-link.json"
++        link.symlink_to(real)
++        scheduler = CredentialHealthScheduler(
++            {name: (lambda _run_id: InspectionResult(outcome="success")) for name in self.calls},
++            state_path=link, now_fn=self.clock, executor=_ManualExecutor(),
++        )
++        scheduler.configure("sub2api_401", enabled=True, interval_minutes=30)
++        self.assertTrue(link.is_symlink())
++        self.assertTrue(real.exists())
++        self.assertEqual(0o600, stat.S_IMODE(real.stat().st_mode))
++
++    def test_malformed_and_unknown_version_fall_back_disabled(self):
++        self.scheduler.stop()
++        for content in ("not-json", json.dumps({"version": 99, "jobs": {"sub2api_401": {"enabled": True}}})):
++            with self.subTest(content=content):
++                self.path.write_text(content, encoding="utf-8")
++                scheduler = CredentialHealthScheduler(
++                    {name: (lambda _run_id: InspectionResult(outcome="success")) for name in self.calls},
++                    state_path=self.path, now_fn=self.clock, executor=_ManualExecutor(),
++                )
++                self.assertFalse(scheduler.state("sub2api_401")["enabled"])
++                scheduler.stop()
++
++    def test_concurrent_same_path_construction_cannot_reset_persisted_configuration(self):
++        path = Path(self.tmp.name) / "concurrent-singleton.json"
++        barrier = threading.Barrier(2)
++
++        def construct_and_configure(interval):
++            barrier.wait()
++            scheduler = CredentialHealthScheduler(
++                {name: (lambda _run_id: InspectionResult(outcome="success")) for name in self.calls},
++                state_path=path,
++                now_fn=self.clock,
++                executor=_ManualExecutor(),
++            )
++            scheduler.configure("sub2api_401", enabled=True, interval_minutes=interval)
++            return scheduler
++
++        with ThreadPoolExecutor(max_workers=2) as pool:
++            first_future = pool.submit(construct_and_configure, 30)
++            second_future = pool.submit(construct_and_configure, 60)
++            first = first_future.result(timeout=3)
++            second = second_future.result(timeout=3)
++        self.addCleanup(first.stop)
++        self.assertIs(first, second)
++        state = first.state("sub2api_401")
++        self.assertTrue(state["enabled"])
++        self.assertIn(state["interval_minutes"], (30, 60))
++        stored = json.loads(path.read_text(encoding="utf-8"))
++        self.assertTrue(stored["jobs"]["sub2api_401"]["enabled"])
++        self.assertEqual(state["interval_minutes"], stored["jobs"]["sub2api_401"]["interval_minutes"])
++
++    def test_same_state_path_reuses_one_process_runtime(self):
++        second = CredentialHealthScheduler(
++            {name: (lambda _run_id: InspectionResult(outcome="success")) for name in self.calls},
++            state_path=self.path,
++            now_fn=self.clock,
++            executor=_ManualExecutor(),
++        )
++        self.assertIs(self.scheduler, second)
++        self.scheduler.configure("sub2api_401", enabled=True, interval_minutes=30)
++        second.configure("chatgpt2api_401", enabled=True, interval_minutes=60)
++        self.assertTrue(self.scheduler.state("sub2api_401")["enabled"])
++        self.assertTrue(second.state("chatgpt2api_401")["enabled"])
++        persisted = json.loads(self.path.read_text(encoding="utf-8"))
++        self.assertTrue(persisted["jobs"]["sub2api_401"]["enabled"])
++        self.assertTrue(persisted["jobs"]["chatgpt2api_401"]["enabled"])
++
++    def test_short_and_quoted_secrets_are_redacted_from_result_errors(self):
++        secret_error = (
++            'Authorization: Bearer short-secret authorization=Basic c2hvcnQ= '
++            '"access_token": "abc123" refresh_token=rt123 '
++            'callback=https://secret.example/cb?token=hidden'
++        )
++        self.scheduler._jobs["sub2api_401"] = lambda _run_id: InspectionResult(
++            outcome="failed", failed=1, error=secret_error
++        )
++        self.scheduler.configure("sub2api_401", enabled=True, interval_minutes=30)
++        self.scheduler.run_due(self.now)
++        self.executor.run()
++        error = self.scheduler.state("sub2api_401")["error"]
++        for secret in ("short-secret", "c2hvcnQ=", "abc123", "rt123", "secret.example", "hidden"):
++            self.assertNotIn(secret, error)
++        persisted = self.path.read_text(encoding="utf-8")
++        self.assertNotIn("abc123", persisted)
++        self.assertNotIn("short-secret", persisted)
++
++    def test_stop_waits_for_owned_executor_before_registry_replacement(self):
++        path = Path(self.tmp.name) / "stop-lifecycle.json"
++        started = threading.Event()
++        release = threading.Event()
++        stopped = threading.Event()
++
++        def blocking_job(_run_id):
++            started.set()
++            release.wait()
++            return InspectionResult(outcome="success", completed=1)
++
++        scheduler = CredentialHealthScheduler(
++            {
++                "sub2api_401": blocking_job,
++                "chatgpt2api_401": lambda _run_id: InspectionResult(outcome="success"),
++            },
++            state_path=path,
++            now_fn=self.clock,
++        )
++        scheduler.configure("sub2api_401", enabled=True, interval_minutes=30)
++        scheduler.run_due(self.now)
++        self.assertTrue(started.wait(2))
++
++        stop_thread = threading.Thread(target=lambda: (scheduler.stop(), stopped.set()))
++        stop_thread.start()
++        self.assertFalse(stopped.wait(0.05))
++        release.set()
++        self.assertTrue(stopped.wait(2))
++        stop_thread.join(timeout=2)
++
++        replacement = CredentialHealthScheduler(
++            {name: (lambda _run_id: InspectionResult(outcome="success")) for name in self.calls},
++            state_path=path,
++            now_fn=self.clock,
++            executor=_ManualExecutor(),
++        )
++        self.addCleanup(replacement.stop)
++        state = replacement.state("sub2api_401")
++        self.assertEqual("success", state["last_outcome"])
++        self.assertEqual(1, state["progress"]["completed"])
++
++    def test_start_is_idempotent_while_disabled(self):
++        self.scheduler.start()
++        self.scheduler.start()
++        self.assertTrue(self.scheduler._started)
++        self.assertIsNone(self.scheduler._coordinator)
++
++
++if __name__ == "__main__":
++    unittest.main()
+diff --git a/tests/test_sub2api_401_templates.py b/tests/test_sub2api_401_templates.py
+index 21b74d8..142aff2 100644
+--- a/tests/test_sub2api_401_templates.py
++++ b/tests/test_sub2api_401_templates.py
+@@ -49,20 +49,40 @@ class Sub2Api401TemplateTests(unittest.TestCase):
+             "let pollTimer = null;",
+             "let stateLoading = false;",
+             "const retrying = items.some(item => item.state === 'retrying');",
+-            "if (!retrying) {",
++            "const schedulerRunning = scheduler.phase === 'running' || scheduler.phase === 'waiting_for_queue';",
++            "const schedulerDue = scheduler.enabled === true && Number.isFinite(nextRunAt) && nextRunAt <= Date.now() + 3000;",
++            "const delay = retrying || schedulerRunning || schedulerDue ? 3000 : (scheduler.enabled ? 30000 : 0);",
++            "if (pollTimer && pollDelay !== delay) {",
+             "clearTimeout(pollTimer);",
++            "pollDelay = 0;",
++            "if (!delay) return;",
+             "pollTimer = setTimeout(async () => {",
+             "await loadState();",
+-            "}, 3000);",
++            "}, delay);",
+             "String(error?.message || '状态读取失败').slice(0, 160)",
+             "schedulePolling();",
+             "if (stateLoading) return;",
+-            "function applyData(data) { items = data.items || []; cleanupSupported = data.cleanup_supported !== false; updateCounts(data); render(); schedulePolling(); }",
++            "function applyData(data) { items = data.items || []; cleanupSupported = data.cleanup_supported !== false; applyScheduler(data.scheduler || scheduler); updateCounts(data); render(); schedulePolling(); }",
+             "  loadState();\n})();",
+         ):
+             self.assertIn(text, page)
+         self.assertEqual(page.count("/api/sub2api-401/detect"), 1)
+
++    def test_page_has_independent_scheduler_controls(self):
++        page = Path("webui/templates/sub2api_401.html").read_text(encoding="utf-8")
++        for text in (
++            "开启 Sub2API 自动巡检",
++            "30 分钟",
++            "1 小时",
++            'min="5" max="1440"',
++            "/api/sub2api-401/scheduler",
++            "enabled:$('#autoEnabled').checked",
++            "interval_minutes:interval",
++            "关闭页面不会停止巡检",
++            "精确旧 ID 清理流程",
++        ):
++            self.assertIn(text, page)
++
+
+ if __name__ == "__main__":
+     unittest.main()
+diff --git a/tests/test_webui_credential_health_scheduler.py b/tests/test_webui_credential_health_scheduler.py
+new file mode 100644
+index 0000000..5481808
+--- /dev/null
++++ b/tests/test_webui_credential_health_scheduler.py
+@@ -0,0 +1,342 @@
++import os
++import tempfile
++import unittest
++from unittest.mock import ANY, patch
++
++from core.chatgpt2api_401_service import ChatGPT2API401BusyError
++from webui.app import create_app
++
++
++class WebUICredentialHealthSchedulerTests(unittest.TestCase):
++    def setUp(self):
++        self.tmp = tempfile.TemporaryDirectory()
++        self.addCleanup(self.tmp.cleanup)
++        self.env = patch.dict(
++            os.environ,
++            {"CREDENTIAL_HEALTH_SCHEDULER_PATH": os.path.join(self.tmp.name, "scheduler.json")},
++        )
++        self.env.start()
++        self.addCleanup(self.env.stop)
++        self.app = create_app(auth_code="test-auth")
++        self.addCleanup(self.app.extensions["credential_health_scheduler"].stop)
++        self.client = self.app.test_client()
++        self.headers = {"X-Auth-Code": "test-auth"}
++
++    def assert_private(self, response):
++        self.assertIn("no-store", response.headers.get("Cache-Control", ""))
++        self.assertEqual("nosniff", response.headers.get("X-Content-Type-Options"))
++
++    def test_scheduler_routes_require_authentication(self):
++        for method, path in (
++            ("get", "/api/sub2api-401/scheduler"),
++            ("put", "/api/sub2api-401/scheduler"),
++            ("get", "/api/chatgpt2api-401/scheduler"),
++            ("put", "/api/chatgpt2api-401/scheduler"),
++        ):
++            with self.subTest(path=path):
++                response = getattr(self.client, method)(path)
++                self.assertEqual(401, response.status_code)
++                self.assert_private(response)
++                self.assertEqual("no-cache", response.headers.get("Pragma"))
++
++    def test_independent_scheduler_state_and_configuration(self):
++        states = {
++            "sub2api_401": {"enabled": True, "interval_minutes": 30, "phase": "idle"},
++            "chatgpt2api_401": {"enabled": False, "interval_minutes": 60, "phase": "disabled"},
++        }
++        scheduler = self.app.extensions["credential_health_scheduler"]
++        with patch.object(scheduler, "state", side_effect=lambda name: dict(states[name])):
++            sub = self.client.get("/api/sub2api-401/scheduler", headers=self.headers)
++            chat = self.client.get("/api/chatgpt2api-401/scheduler", headers=self.headers)
++        self.assertEqual(30, sub.get_json()["scheduler"]["interval_minutes"])
++        self.assertEqual(60, chat.get_json()["scheduler"]["interval_minutes"])
++        self.assert_private(sub)
++        self.assert_private(chat)
++
++        with patch.object(scheduler, "configure", return_value=states["sub2api_401"]) as configure:
++            response = self.client.put(
++                "/api/sub2api-401/scheduler",
++                headers=self.headers,
++                json={"enabled": True, "interval_minutes": 30},
++            )
++        self.assertEqual(200, response.status_code)
++        configure.assert_called_once_with("sub2api_401", enabled=True, interval_minutes=30)
++        self.assert_private(response)
++
++        with patch.object(scheduler, "configure", return_value=states["chatgpt2api_401"]) as configure:
++            response = self.client.put(
++                "/api/chatgpt2api-401/scheduler",
++                headers=self.headers,
++                json={"enabled": False, "interval_minutes": 60},
++            )
++        self.assertEqual(200, response.status_code)
++        configure.assert_called_once_with("chatgpt2api_401", enabled=False, interval_minutes=60)
++
++    def test_scheduler_configuration_persists_across_new_app_instance(self):
++        with tempfile.TemporaryDirectory() as temp_dir:
++            state_path = os.path.join(temp_dir, "credential-health.json")
++            with patch.dict(os.environ, {"CREDENTIAL_HEALTH_SCHEDULER_PATH": state_path}):
++                first = create_app(auth_code="persist-auth")
++                response = first.test_client().put(
++                    "/api/sub2api-401/scheduler",
++                    headers={"X-Auth-Code": "persist-auth"},
++                    json={"enabled": False, "interval_minutes": 60},
++                )
++                self.assertEqual(200, response.status_code)
++                first.extensions["credential_health_scheduler"].stop()
++
++                second = create_app(auth_code="persist-auth")
++                restored = second.test_client().get(
++                    "/api/sub2api-401/scheduler",
++                    headers={"X-Auth-Code": "persist-auth"},
++                )
++                self.assertEqual(60, restored.get_json()["scheduler"]["interval_minutes"])
++                self.assertFalse(restored.get_json()["scheduler"]["enabled"])
++                second.extensions["credential_health_scheduler"].stop()
++
++    def test_scheduler_configuration_validation_is_bounded(self):
++        scheduler = self.app.extensions["credential_health_scheduler"]
++        for path in ("/api/sub2api-401/scheduler", "/api/chatgpt2api-401/scheduler"):
++            with self.subTest(path=path):
++                response = self.client.put(path, headers=self.headers, data="[]", content_type="application/json")
++                self.assertEqual(400, response.status_code)
++                self.assert_private(response)
++                with patch.object(scheduler, "configure", side_effect=ValueError("interval_minutes 必须是 5–1440 的整数")):
++                    response = self.client.put(
++                        path,
++                        headers=self.headers,
++                        json={"enabled": True, "interval_minutes": 4},
++                    )
++                self.assertEqual(400, response.status_code)
++                self.assertNotIn("access_token", response.get_data(as_text=True).lower())
++
++    def test_state_responses_include_scheduler_projection(self):
++        scheduler = self.app.extensions["credential_health_scheduler"]
++        with patch("core.sub2api_401_service.Sub2Api401Service.state", return_value={"ok": True, "items": []}), patch(
++            "core.chatgpt2api_401_service.ChatGPT2API401Service.state", return_value={"ok": True, "items": [], "progress": {}}
++        ), patch.object(
++            scheduler,
++            "state",
++            side_effect=lambda name: {"enabled": name == "sub2api_401", "interval_minutes": 30, "phase": "idle"},
++        ):
++            sub = self.client.get("/api/sub2api-401/state", headers=self.headers)
++            chat = self.client.get("/api/chatgpt2api-401/state", headers=self.headers)
++        self.assertTrue(sub.get_json()["scheduler"]["enabled"])
++        self.assertFalse(chat.get_json()["scheduler"]["enabled"])
++
++    def test_sub2api_automatic_job_skips_while_manual_retry_is_active(self):
++        scheduler = self.app.extensions["credential_health_scheduler"]
++        current = {
++            "ok": True,
++            "items": [{"account_id": "old-exact-id", "email": "user@example.com", "state": "retrying"}],
++        }
++        with patch(
++            "core.sub2api_401_service.Sub2Api401Service.state", return_value=current
++        ), patch("webui.app.codex_retry_service.is_retrying", return_value=True), patch(
++            "core.sub2api_401_service.Sub2Api401Service.detect"
++        ) as detect:
++            result = scheduler._jobs["sub2api_401"]("manual-busy-run")
++        self.assertEqual("skipped_busy", result.outcome)
++        self.assertEqual(1, result.skipped)
++        detect.assert_not_called()
++
++    def test_chatgpt2api_automatic_job_skips_while_manual_queue_is_active(self):
++        scheduler = self.app.extensions["credential_health_scheduler"]
++        with patch(
++            "core.chatgpt2api_401_service.ChatGPT2API401Service.detect",
++            side_effect=ChatGPT2API401BusyError("queue active"),
++        ), patch("core.chatgpt2api_401_service.ChatGPT2API401Service.refresh") as refresh:
++            result = scheduler._jobs["chatgpt2api_401"]("manual-busy-run")
++        self.assertEqual("skipped_busy", result.outcome)
++        self.assertEqual(1, result.skipped)
++        refresh.assert_not_called()
++
++    def test_sub2api_automatic_job_reuses_retry_and_exact_cleanup(self):
++        scheduler = self.app.extensions["credential_health_scheduler"]
++        candidate = {
++            "account_id": "old-exact-id",
++            "email": "user@example.com",
++            "state": "pending",
++            "health": "unauthorized",
++            "retryable": True,
++        }
++        fresh = {"ok": True, "items": [candidate]}
++        batch = {}
++
++        def mark_selected(_ids, *, batch_id=""):
++            batch["id"] = batch_id
++
++        def detect_state(*_args, **_kwargs):
++            if "id" not in batch:
++                return fresh
++            return {"ok": True, "items": [{**candidate, "state": "cleanup_ready", "retry_batch_id": batch["id"]}]}
++
++        with patch("core.sub2api_401_service.Sub2Api401Service.state", return_value={"items": []}), patch(
++            "core.sub2api_401_service.Sub2Api401Service.detect", side_effect=detect_state
++        ) as detect, patch(
++            "core.sub2api_401_service.Sub2Api401Service.select_retryable", return_value=([candidate], [])
++        ), patch(
++            "core.sub2api_401_service.Sub2Api401Service.mark_retrying", side_effect=mark_selected
++        ) as mark_retrying, patch(
++            "core.sub2api_401_service.Sub2Api401Service.cleanup", return_value={"items": [{"ok": True}]}
++        ) as cleanup, patch(
++            "webui.app.db.list_accounts", return_value=[]
++        ), patch(
++            "webui.app.db.get_account_by_email", return_value={"id": 7, "email": "user@example.com"}
++        ), patch(
++            "webui.app.db.update_account_codex_status"
++        ), patch(
++            "webui.app.codex_retry_service.reserve", return_value=True
++        ), patch(
++            "webui.app.codex_retry_service.run_worker"
++        ):
++            result = scheduler._jobs["sub2api_401"]("scheduled-run")
++        self.assertEqual("success", result.outcome)
++        self.assertEqual(1, result.completed)
++        self.assertEqual(2, detect.call_count)
++        mark_retrying.assert_called_once_with(["old-exact-id"], batch_id=ANY)
++        cleanup.assert_called_once_with(["old-exact-id"], opt_in=True, limit=50)
++
++    def test_sub2api_automatic_job_counts_unverified_retry_as_failed(self):
++        scheduler = self.app.extensions["credential_health_scheduler"]
++        candidate = {
++            "account_id": "old-exact-id",
++            "email": "user@example.com",
++            "state": "pending",
++            "health": "unauthorized",
++            "retryable": True,
++        }
++        batch = {}
++
++        def mark_selected(_ids, *, batch_id=""):
++            batch["id"] = batch_id
++
++        def detect_state(*_args, **_kwargs):
++            if "id" not in batch:
++                return {"ok": True, "items": [candidate]}
++            return {
++                "ok": True,
++                "items": [{**candidate, "state": "ambiguous", "retry_batch_id": batch["id"]}],
++            }
++
++        with patch("core.sub2api_401_service.Sub2Api401Service.state", return_value={"items": []}), patch(
++            "core.sub2api_401_service.Sub2Api401Service.detect", side_effect=detect_state
++        ), patch(
++            "core.sub2api_401_service.Sub2Api401Service.select_retryable", return_value=([candidate], [])
++        ), patch(
++            "core.sub2api_401_service.Sub2Api401Service.mark_retrying", side_effect=mark_selected
++        ), patch(
++            "core.sub2api_401_service.Sub2Api401Service.cleanup"
++        ) as cleanup, patch(
++            "webui.app.db.list_accounts", return_value=[]
++        ), patch(
++            "webui.app.db.get_account_by_email", return_value={"id": 7, "email": "user@example.com"}
++        ), patch(
++            "webui.app.db.update_account_codex_status"
++        ), patch(
++            "webui.app.codex_retry_service.reserve", return_value=True
++        ), patch(
++            "webui.app.codex_retry_service.run_worker"
++        ):
++            result = scheduler._jobs["sub2api_401"]("ambiguous-run")
++        self.assertEqual("partial", result.outcome)
++        self.assertEqual(0, result.completed)
++        self.assertEqual(1, result.failed)
++        cleanup.assert_not_called()
++
++    def test_sub2api_restart_reconciles_stale_retrying_instead_of_blocking_forever(self):
++        scheduler = self.app.extensions["credential_health_scheduler"]
++        current = {"items": [{"account_id": "old-id", "email": "user@example.com", "state": "retrying"}]}
++        with patch("core.sub2api_401_service.Sub2Api401Service.state", return_value=current), patch(
++            "webui.app.db.list_accounts", return_value=[{"email": "user@example.com", "codex_status": "retrying"}]
++        ), patch(
++            "webui.app.codex_retry_service.is_retrying", return_value=False
++        ), patch(
++            "core.sub2api_401_service.Sub2Api401Service.detect", return_value={"ok": True, "items": []}
++        ) as detect:
++            result = scheduler._jobs["sub2api_401"]("restart-run")
++        self.assertEqual("success", result.outcome)
++        detect.assert_called_once_with({"user@example.com": "failed"})
++
++    def test_chatgpt2api_automatic_job_reuses_queue_and_exact_writeback(self):
++        scheduler = self.app.extensions["credential_health_scheduler"]
++        fresh = {
++            "ok": True,
++            "items": [{"remote_id": "remote-exact-id", "state": "pending", "retryable": True}],
++        }
++        terminal = {
++            "ok": True,
++            "items": [{"remote_id": "remote-exact-id", "state": "replaced"}],
++            "progress": {"queued": 0, "active": 0},
++        }
++        with patch(
++            "core.chatgpt2api_401_service.ChatGPT2API401Service.detect", return_value=fresh
++        ), patch(
++            "core.chatgpt2api_401_service.ChatGPT2API401Service.refresh",
++            return_value={"queued_count": 1, "submitted_ids": ["remote-exact-id"], "skipped": []},
++        ) as refresh, patch(
++            "core.chatgpt2api_401_service.ChatGPT2API401Service.state", return_value=terminal
++        ):
++            result = scheduler._jobs["chatgpt2api_401"]("scheduled-run")
++        self.assertEqual("success", result.outcome)
++        self.assertEqual(1, result.completed)
++        refresh.assert_called_once_with(["remote-exact-id"], opt_in=True, limit=5000)
++
++    def test_chatgpt2api_automatic_job_observes_only_ids_accepted_by_this_round(self):
++        scheduler = self.app.extensions["credential_health_scheduler"]
++        fresh = {
++            "ok": True,
++            "items": [
++                {"remote_id": "accepted-id", "state": "pending", "retryable": True},
++                {"remote_id": "skipped-id", "state": "pending", "retryable": True},
++            ],
++        }
++        terminal = {
++            "ok": True,
++            "items": [
++                {"remote_id": "accepted-id", "state": "replaced"},
++                {"remote_id": "skipped-id", "state": "replaced"},
++            ],
++            "progress": {"queued": 0, "active": 0},
++        }
++        with patch(
++            "core.chatgpt2api_401_service.ChatGPT2API401Service.detect", return_value=fresh
++        ), patch(
++            "core.chatgpt2api_401_service.ChatGPT2API401Service.refresh",
++            return_value={
++                "queued_count": 1,
++                "submitted_ids": ["accepted-id"],
++                "skipped": [{"remote_id": "skipped-id", "reason": "队列已满"}],
++            },
++        ), patch(
++            "core.chatgpt2api_401_service.ChatGPT2API401Service.state", return_value=terminal
++        ):
++            result = scheduler._jobs["chatgpt2api_401"]("mixed-run")
++        self.assertEqual("partial", result.outcome)
++        self.assertEqual(1, result.submitted)
++        self.assertEqual(1, result.completed)
++        self.assertEqual(1, result.skipped)
++
++    def test_chatgpt2api_missing_queued_audit_item_is_failure_not_success(self):
++        scheduler = self.app.extensions["credential_health_scheduler"]
++        fresh = {
++            "ok": True,
++            "items": [{"remote_id": "remote-exact-id", "state": "pending", "retryable": True}],
++        }
++        with patch(
++            "core.chatgpt2api_401_service.ChatGPT2API401Service.detect", return_value=fresh
++        ), patch(
++            "core.chatgpt2api_401_service.ChatGPT2API401Service.refresh",
++            return_value={"queued_count": 1, "submitted_ids": ["remote-exact-id"], "skipped": []},
++        ), patch(
++            "core.chatgpt2api_401_service.ChatGPT2API401Service.state",
++            return_value={"ok": True, "items": [], "progress": {"queued": 0, "active": 0}},
++        ):
++            result = scheduler._jobs["chatgpt2api_401"]("missing-run")
++        self.assertEqual("partial", result.outcome)
++        self.assertEqual(0, result.completed)
++        self.assertEqual(1, result.failed)
++
++
++if __name__ == "__main__":
++    unittest.main()
+diff --git a/webui/app.py b/webui/app.py
+index 8eaa90a..b36bcd9 100644
+--- a/webui/app.py
++++ b/webui/app.py
+@@ -13,6 +13,7 @@ Flask 本地控制台。
+ import logging
+ import gzip
+ import json
++import os
+ import threading
+ import time
+ import uuid
+@@ -28,6 +29,7 @@ from core.chatgpt2api_401_service import (
+     ChatGPT2API401Service,
+ )
+ from core.chatgpt2api_admin import ChatGPT2APIAdminError
++from core.credential_health_scheduler import CredentialHealthScheduler, InspectionResult
+ from core.sub2api_401_service import Sub2Api401Service, Sub2ApiSnapshotConflict
+ from core.sub2api_admin import Sub2ApiAdminError
+ from webui.auth import init_auth, register_auth_routes
+@@ -266,6 +268,7 @@ def create_app(auth_code: str | None = None) -> Flask:
+     _prepared_downloads: dict[str, dict] = {}
+     sub2api_401_service = Sub2Api401Service()
+     chatgpt2api_401_service = ChatGPT2API401Service()
++    credential_health_scheduler = None
+
+     @app.after_request
+     def _compress_json_response(response: Response):
+@@ -2552,9 +2555,9 @@ def create_app(auth_code: str | None = None) -> Flask:
+     def _release_codex_retry(email: str) -> None:
+         codex_retry_service.release(email)
+
+-    def _run_codex_retry_worker(email: str, *, batch_label: str | None = None, clear_log: bool = True) -> None:
++    def _run_codex_retry_worker(email: str, *, batch_label: str | None = None, clear_log: bool = True) -> dict:
+         """执行一个账号的 Codex 补跑。调用前必须已经 reserve。"""
+-        codex_retry_service.run_worker(email, batch_label=batch_label, clear_log=clear_log)
++        return codex_retry_service.run_worker(email, batch_label=batch_label, clear_log=clear_log)
+
+
+     @app.post("/api/codex/stop")
+@@ -2793,7 +2796,31 @@ def create_app(auth_code: str | None = None) -> Flask:
+     @app.get("/api/sub2api-401/state")
+     def api_sub2api_401_state():
+         """读取最近一次持久化的非敏感 Sub2API 401 轮换审计状态。"""
+-        return _sub2api_401_response(sub2api_401_service.state())
++        payload = sub2api_401_service.state()
++        payload["scheduler"] = credential_health_scheduler.state("sub2api_401")
++        return _sub2api_401_response(payload)
++
++    @app.get("/api/sub2api-401/scheduler")
++    def api_sub2api_401_scheduler_state():
++        return _sub2api_401_response({
++            "ok": True,
++            "scheduler": credential_health_scheduler.state("sub2api_401"),
++        })
++
++    @app.put("/api/sub2api-401/scheduler")
++    def api_sub2api_401_scheduler_configure():
++        data = request.get_json(silent=True)
++        if not isinstance(data, dict):
++            return _sub2api_401_response({"ok": False, "error": "请求体必须是 JSON 对象"}, 400)
++        try:
++            scheduler_state = credential_health_scheduler.configure(
++                "sub2api_401",
++                enabled=data.get("enabled"),
++                interval_minutes=data.get("interval_minutes"),
++            )
++        except (ValueError, KeyError) as exc:
++            return _sub2api_401_response({"ok": False, "error": str(exc)}, 400)
++        return _sub2api_401_response({"ok": True, "scheduler": scheduler_state})
+
+     @app.post("/api/sub2api-401/detect")
+     def api_sub2api_401_detect():
+@@ -2806,22 +2833,97 @@ def create_app(auth_code: str | None = None) -> Flask:
+             logger.warning("Sub2API 401 检测失败: %s", error)
+             return _sub2api_401_response({"ok": False, "error": error}, status)
+
+-    @app.post("/api/sub2api-401/retry")
+-    def api_sub2api_401_retry():
+-        """对选中的 unauthorized account_id 复用现有 Codex OAuth 补跑工作流。"""
+-        data = request.get_json(silent=True)
+-        if not isinstance(data, dict):
+-            return _sub2api_401_response({"ok": False, "error": "请求体必须是 JSON 对象"}, 400)
+-        account_ids = data.get("account_ids")
+-        if not isinstance(account_ids, list) or not account_ids:
+-            return _sub2api_401_response({"ok": False, "error": "account_ids 必须是非空数组"}, 400)
+-        if len(account_ids) > 50:
+-            return _sub2api_401_response({"ok": False, "error": "单次最多选择 50 个账号"}, 400)
+-        raw_workers = data.get("workers", 3)
+-        if isinstance(raw_workers, bool) or not isinstance(raw_workers, int):
+-            return _sub2api_401_response({"ok": False, "error": "workers 必须是整数"}, 400)
+-        workers = max(1, min(8, raw_workers))
++    def _sub2api_401_run_batch(items: list[dict], max_workers: int, batch: str, selected_ids: list[str]) -> dict:
++        """Run the existing Codex retry, post-detect, and exact-ID cleanup workflow."""
++        from concurrent.futures import ThreadPoolExecutor, as_completed
+
++        worker_failures = 0
++        with ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix=f"sub2api-401-{batch}") as executor:
++            futures = {
++                executor.submit(
++                    _run_codex_retry_worker,
++                    item["email"],
++                    batch_label=f"SUB2API401 {batch} #{idx}/{len(items)}",
++                    clear_log=False,
++                ): item["account_id"]
++                for idx, item in enumerate(items, 1)
++            }
++            for future in as_completed(futures):
++                try:
++                    worker_result = future.result()
++                    if not isinstance(worker_result, dict) or worker_result.get("ok") is not True:
++                        worker_failures += 1
++                except Exception as exc:
++                    worker_failures += 1
++                    logger.warning("Sub2API 401 Codex 补跑子任务异常 batch=%s error=%s", batch, type(exc).__name__)
++
++        try:
++            result = sub2api_401_service.detect(_sub2api_401_local_statuses())
++        except Exception as exc:
++            error, _status = _sub2api_401_remote_error(exc)
++            sub2api_401_service.mark_verification_error(selected_ids, f"{error}；旧账号保持不变")
++            logger.warning("Sub2API 401 后置验证失败 batch=%s: %s", batch, error)
++            return {
++                "outcome": "failed",
++                "completed": 0,
++                "failed": max(1, len(items)),
++                "cleanup_failed": 0,
++                "worker_failures": worker_failures,
++                "error": error,
++            }
++
++        post_items = {
++            str(item.get("account_id") or ""): item
++            for item in result.get("items", [])
++            if str(item.get("account_id") or "") in selected_ids
++        }
++        completed_ids = {
++            account_id for account_id, item in post_items.items()
++            if item.get("state") == "cleaned"
++        }
++        cleanup_ids = [
++            account_id for account_id, item in post_items.items()
++            if item.get("retry_batch_id") == batch and item.get("state") == "cleanup_ready"
++        ]
++        cleanup_success_ids: set[str] = set()
++        if cleanup_ids:
++            try:
++                cleanup_result = sub2api_401_service.cleanup(cleanup_ids, opt_in=True, limit=50)
++                cleanup_items = list(cleanup_result.get("items") or [])
++                for index, item in enumerate(cleanup_items):
++                    account_id = str(item.get("account_id") or item.get("cleanup_account_id") or "")
++                    if not account_id and index < len(cleanup_ids):
++                        account_id = cleanup_ids[index]
++                    if item.get("ok") and account_id in cleanup_ids:
++                        cleanup_success_ids.add(account_id)
++            except Exception as exc:
++                logger.warning(
++                    "Sub2API 401 自动清理异常 batch=%s error=%s；保留 cleanup_ready",
++                    batch,
++                    type(exc).__name__,
++                )
++        completed_ids.update(cleanup_success_ids)
++        failed_ids = set(selected_ids) - completed_ids
++        cleanup_failures = len(set(cleanup_ids) - cleanup_success_ids)
++        if cleanup_failures:
++            logger.warning("Sub2API 401 自动清理失败 batch=%s count=%s", batch, cleanup_failures)
++        failed = len(failed_ids)
++        return {
++            "outcome": "success" if failed == 0 else "partial",
++            "completed": len(completed_ids),
++            "failed": failed,
++            "cleanup_completed": len(cleanup_success_ids),
++            "cleanup_failed": cleanup_failures,
++            "worker_failures": worker_failures,
++            "error": "" if failed == 0 else "部分账号补跑或精确旧 ID 清理未完成",
++        }
++
++    def _start_sub2api_401_retry(
++        account_ids: list[object],
++        *,
++        workers: int,
++        background: bool,
++    ) -> tuple[dict, int]:
+         candidates, skipped = sub2api_401_service.select_retryable(account_ids, limit=50)
+         selected: list[dict] = []
+         for item in candidates:
+@@ -2840,12 +2942,12 @@ def create_app(auth_code: str | None = None) -> Flask:
+             selected.append({"account_id": account_id, "email": email})
+
+         if not selected:
+-            return _sub2api_401_response({
++            return {
+                 "ok": False,
+                 "error": "没有可启动的 Sub2API unauthorized/401 账号",
+                 "started_count": 0,
+                 "skipped": skipped[:50],
+-            }, 422)
++            }, 422
+
+         batch_id = uuid.uuid4().hex[:12]
+         selected_ids = [item["account_id"] for item in selected]
+@@ -2863,88 +2965,63 @@ def create_app(auth_code: str | None = None) -> Flask:
+         except Sub2ApiSnapshotConflict as exc:
+             for email in selected_emails:
+                 _release_codex_retry(email)
+-            return _sub2api_401_response({
+-                "ok": False,
+-                "error": str(exc),
+-                "conflicts": exc.account_ids,
+-            }, 409)
++            return {"ok": False, "error": str(exc), "conflicts": exc.account_ids}, 409
+         except Exception as exc:
+             for email in selected_emails:
+                 _release_codex_retry(email)
+-            sub2api_401_service.mark_verification_error(selected_ids, "Sub2API 401 补跑任务初始化失败；旧账号保持不变")
++            sub2api_401_service.mark_verification_error(
++                selected_ids, "Sub2API 401 补跑任务初始化失败；旧账号保持不变"
++            )
+             logger.warning("Sub2API 401 补跑任务初始化失败 batch=%s error=%s", batch_id, type(exc).__name__)
+-            return _sub2api_401_response({"ok": False, "error": "Sub2API 401 补跑任务初始化失败"}, 500)
+-
+-        def _sub2api_401_runner(items: list[dict], max_workers: int, batch: str):
+-            from concurrent.futures import ThreadPoolExecutor, as_completed
+-
+-            with ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix=f"sub2api-401-{batch}") as executor:
+-                futures = [
+-                    executor.submit(
+-                        _run_codex_retry_worker,
+-                        item["email"],
+-                        batch_label=f"SUB2API401 {batch} #{idx}/{len(items)}",
+-                        clear_log=False,
+-                    )
+-                    for idx, item in enumerate(items, 1)
+-                ]
+-                for future in as_completed(futures):
+-                    try:
+-                        future.result()
+-                    except Exception as exc:
+-                        logger.warning("Sub2API 401 Codex 补跑子任务异常 batch=%s error=%s", batch, type(exc).__name__)
++            return {"ok": False, "error": "Sub2API 401 补跑任务初始化失败"}, 500
++
++        workflow_result = None
++        if background:
+             try:
+-                result = sub2api_401_service.detect(_sub2api_401_local_statuses())
++                threading.Thread(
++                    target=_sub2api_401_run_batch,
++                    args=(selected, workers, batch_id, selected_ids),
++                    name=f"sub2api-401-dispatch-{batch_id}",
++                    daemon=True,
++                ).start()
+             except Exception as exc:
+-                error, _status = _sub2api_401_remote_error(exc)
++                for email in selected_emails:
++                    _release_codex_retry(email)
+                 sub2api_401_service.mark_verification_error(
+-                    [item["account_id"] for item in items],
+-                    f"{error}；旧账号保持不变",
++                    selected_ids, "Sub2API 401 补跑调度失败；旧账号保持不变"
+                 )
+-                logger.warning("Sub2API 401 后置验证失败 batch=%s: %s", batch, error)
+-            else:
+-                cleanup_ids = [
+-                    item["account_id"] for item in result.get("items", [])
+-                    if (
+-                        item.get("account_id") in selected_ids
+-                        and item.get("retry_batch_id") == batch
+-                        and item.get("state") == "cleanup_ready"
+-                    )
+-                ]
+-                if cleanup_ids:
+-                    try:
+-                        cleanup_result = sub2api_401_service.cleanup(cleanup_ids, opt_in=True, limit=50)
+-                        failed_cleanup = sum(1 for item in cleanup_result.get("items", []) if not item.get("ok"))
+-                        if failed_cleanup:
+-                            logger.warning("Sub2API 401 自动清理失败 batch=%s count=%s", batch, failed_cleanup)
+-                    except Exception as exc:
+-                        logger.warning(
+-                            "Sub2API 401 自动清理异常 batch=%s error=%s；保留 cleanup_ready",
+-                            batch,
+-                            type(exc).__name__,
+-                        )
++                logger.warning("Sub2API 401 补跑调度失败 batch=%s error=%s", batch_id, type(exc).__name__)
++                return {"ok": False, "error": "Sub2API 401 补跑调度失败"}, 500
++        else:
++            workflow_result = _sub2api_401_run_batch(selected, workers, batch_id, selected_ids)
+
+-        try:
+-            threading.Thread(
+-                target=_sub2api_401_runner,
+-                args=(selected, workers, batch_id),
+-                name=f"sub2api-401-dispatch-{batch_id}",
+-                daemon=True,
+-            ).start()
+-        except Exception as exc:
+-            for email in selected_emails:
+-                _release_codex_retry(email)
+-            sub2api_401_service.mark_verification_error(selected_ids, "Sub2API 401 补跑调度失败；旧账号保持不变")
+-            logger.warning("Sub2API 401 补跑调度失败 batch=%s error=%s", batch_id, type(exc).__name__)
+-            return _sub2api_401_response({"ok": False, "error": "Sub2API 401 补跑调度失败"}, 500)
+-        return _sub2api_401_response({
++        return {
+             "ok": True,
+             "message": f"已启动 {len(selected)} 个 Codex 补跑任务；唯一健康替代 account_id 验证成功后将自动删除锁定旧 ID",
+             "started": selected,
+             "started_count": len(selected),
+             "skipped": skipped[:50],
+             "batch_id": batch_id,
+-        })
++            "workflow_result": workflow_result,
++        }, 200
++
++    @app.post("/api/sub2api-401/retry")
++    def api_sub2api_401_retry():
++        """对选中的 unauthorized account_id 复用现有 Codex OAuth 补跑工作流。"""
++        data = request.get_json(silent=True)
++        if not isinstance(data, dict):
++            return _sub2api_401_response({"ok": False, "error": "请求体必须是 JSON 对象"}, 400)
++        account_ids = data.get("account_ids")
++        if not isinstance(account_ids, list) or not account_ids:
++            return _sub2api_401_response({"ok": False, "error": "account_ids 必须是非空数组"}, 400)
++        if len(account_ids) > 50:
++            return _sub2api_401_response({"ok": False, "error": "单次最多选择 50 个账号"}, 400)
++        raw_workers = data.get("workers", 3)
++        if isinstance(raw_workers, bool) or not isinstance(raw_workers, int):
++            return _sub2api_401_response({"ok": False, "error": "workers 必须是整数"}, 400)
++        workers = max(1, min(8, raw_workers))
++        payload, status = _start_sub2api_401_retry(account_ids, workers=workers, background=True)
++        return _sub2api_401_response(payload, status)
+
+     @app.post("/api/sub2api-401/cleanup")
+     def api_sub2api_401_cleanup():
+@@ -3021,7 +3098,31 @@ def create_app(auth_code: str | None = None) -> Flask:
+     @app.get("/api/chatgpt2api-401/state")
+     def api_chatgpt2api_401_state():
+         """读取仅含摘要与稳定 ID 的 ChatGPT2API 401 审计状态。"""
+-        return _chatgpt2api_401_response(chatgpt2api_401_service.state())
++        payload = chatgpt2api_401_service.state()
++        payload["scheduler"] = credential_health_scheduler.state("chatgpt2api_401")
++        return _chatgpt2api_401_response(payload)
++
++    @app.get("/api/chatgpt2api-401/scheduler")
++    def api_chatgpt2api_401_scheduler_state():
++        return _chatgpt2api_401_response({
++            "ok": True,
++            "scheduler": credential_health_scheduler.state("chatgpt2api_401"),
++        })
++
++    @app.put("/api/chatgpt2api-401/scheduler")
++    def api_chatgpt2api_401_scheduler_configure():
++        data = request.get_json(silent=True)
++        if not isinstance(data, dict):
++            return _chatgpt2api_401_response({"ok": False, "error": "请求体必须是 JSON 对象"}, 400)
++        try:
++            scheduler_state = credential_health_scheduler.configure(
++                "chatgpt2api_401",
++                enabled=data.get("enabled"),
++                interval_minutes=data.get("interval_minutes"),
++            )
++        except (ValueError, KeyError) as exc:
++            return _chatgpt2api_401_response({"ok": False, "error": str(exc)}, 400)
++        return _chatgpt2api_401_response({"ok": True, "scheduler": scheduler_state})
+
+     @app.post("/api/chatgpt2api-401/detect")
+     def api_chatgpt2api_401_detect():
+@@ -3689,4 +3790,179 @@ def create_app(auth_code: str | None = None) -> Flask:
+             ),
+         })
+
++    def _run_sub2api_401_inspection(run_id: str) -> InspectionResult:
++        current = sub2api_401_service.state()
++        local_statuses = _sub2api_401_local_statuses()
++        retrying_items = [item for item in current.get("items", []) if item.get("state") == "retrying"]
++        active_emails = {
++            str(item.get("email") or "").strip().lower()
++            for item in retrying_items
++            if str(item.get("email") or "").strip() and codex_retry_service.is_retrying(str(item.get("email") or ""))
++        }
++        if active_emails:
++            return InspectionResult(outcome="skipped_busy", skipped=len(active_emails), error="Sub2API Codex 补跑仍在运行")
++        # A process restart cannot preserve Codex worker threads. Convert stale local
++        # `retrying` evidence to failed for this reconciliation detect, then let the
++        # existing exact-ID snapshot gates decide whether it is safely retryable.
++        for item in retrying_items:
++            email = str(item.get("email") or "").strip().lower()
++            if email and local_statuses.get(email) in {"retrying", "queued", "running"}:
++                local_statuses[email] = "failed"
++        detected = sub2api_401_service.detect(local_statuses)
++        items = list(detected.get("items") or [])
++        actionable_ids = [
++            str(item.get("account_id") or "").strip()
++            for item in items
++            if item.get("state") == "pending"
++            and item.get("health") == "unauthorized"
++            and item.get("retryable") is True
++            and str(item.get("account_id") or "").strip()
++        ]
++        selected_ids = actionable_ids[:50]
++        credential_health_scheduler.update_progress(
++            "sub2api_401",
++            run_id,
++            detected=len(items),
++            actionable=len(actionable_ids),
++            submitted=len(selected_ids),
++            skipped=max(0, len(actionable_ids) - len(selected_ids)),
++        )
++        if not selected_ids:
++            return InspectionResult(outcome="success", detected=len(items), actionable=0)
++        payload, status = _start_sub2api_401_retry(selected_ids, workers=3, background=False)
++        workflow = payload.get("workflow_result") if isinstance(payload, dict) else None
++        if status != 200 or not isinstance(workflow, dict):
++            skipped = len(payload.get("skipped") or []) if isinstance(payload, dict) else len(selected_ids)
++            return InspectionResult(
++                outcome="skipped_busy" if status == 422 else "failed",
++                detected=len(items),
++                actionable=len(actionable_ids),
++                submitted=int(payload.get("started_count") or 0) if isinstance(payload, dict) else 0,
++                failed=0 if status == 422 else 1,
++                skipped=max(skipped, len(actionable_ids) - len(selected_ids)),
++                error=str(payload.get("error") or "Sub2API 自动补跑未启动") if isinstance(payload, dict) else "Sub2API 自动补跑未启动",
++            )
++        return InspectionResult(
++            outcome=str(workflow.get("outcome") or "failed"),
++            detected=len(items),
++            actionable=len(actionable_ids),
++            submitted=int(payload.get("started_count") or 0),
++            completed=int(workflow.get("completed") or 0),
++            failed=int(workflow.get("failed") or 0),
++            skipped=len(payload.get("skipped") or []) + max(0, len(actionable_ids) - len(selected_ids)),
++            error=str(workflow.get("error") or ""),
++        )
++
++    def _run_chatgpt2api_401_inspection(run_id: str) -> InspectionResult:
++        try:
++            detected = chatgpt2api_401_service.detect()
++        except ChatGPT2API401BusyError:
++            return InspectionResult(outcome="skipped_busy", skipped=1, error="ChatGPT2API 查活写回队列仍在运行")
++        items = list(detected.get("items") or [])
++        remote_ids = [
++            str(item.get("remote_id") or "").strip()
++            for item in items
++            if item.get("state") == "pending"
++            and item.get("retryable") is True
++            and str(item.get("remote_id") or "").strip()
++        ][:CHATGPT2API_401_MAX_ITEMS]
++        credential_health_scheduler.update_progress(
++            "chatgpt2api_401",
++            run_id,
++            detected=len(items),
++            actionable=len(remote_ids),
++        )
++        if not remote_ids:
++            return InspectionResult(outcome="success", detected=len(items), actionable=0)
++        queued = chatgpt2api_401_service.refresh(
++            remote_ids,
++            opt_in=True,
++            limit=CHATGPT2API_401_MAX_ITEMS,
++        )
++        submitted_ids = [
++            str(value).strip()
++            for value in (queued.get("submitted_ids") or [])
++            if str(value).strip()
++        ]
++        submitted = len(submitted_ids)
++        initial_skipped = len(queued.get("skipped") or [])
++        credential_health_scheduler.update_progress(
++            "chatgpt2api_401",
++            run_id,
++            phase="waiting_for_queue",
++            detected=len(items),
++            actionable=len(remote_ids),
++            submitted=submitted,
++            skipped=initial_skipped,
++        )
++        if submitted <= 0:
++            return InspectionResult(
++                outcome="skipped_busy" if initial_skipped else "success",
++                detected=len(items),
++                actionable=len(remote_ids),
++                submitted=0,
++                skipped=initial_skipped,
++                error="没有可加入 ChatGPT2API 查活队列的账号" if initial_skipped else "",
++            )
++
++        target_ids = set(submitted_ids)
++        completed = failed = 0
++        last_progress = None
++        while True:
++            state = chatgpt2api_401_service.state()
++            by_id = {
++                str(item.get("remote_id") or ""): item
++                for item in state.get("items", [])
++                if str(item.get("remote_id") or "") in target_ids
++            }
++            active = sum(1 for item in by_id.values() if item.get("state") in {"queued", "refreshing", "ready"})
++            failed = sum(1 for item in by_id.values() if item.get("state") in {"failed", "conflict", "ambiguous"})
++            completed = sum(1 for item in by_id.values() if item.get("state") == "replaced")
++            missing = max(0, submitted - active - failed - completed)
++            failed += missing
++            progress = (
++                "waiting_for_queue" if active else "running",
++                completed,
++                failed,
++            )
++            if progress != last_progress:
++                credential_health_scheduler.update_progress(
++                    "chatgpt2api_401",
++                    run_id,
++                    phase=progress[0],
++                    detected=len(items),
++                    actionable=len(remote_ids),
++                    submitted=submitted,
++                    completed=completed,
++                    failed=failed,
++                    skipped=initial_skipped,
++                )
++                last_progress = progress
++            if active == 0:
++                break
++            threading.Event().wait(1.0)
++
++        outcome = "success" if failed == 0 and initial_skipped == 0 else "partial"
++        return InspectionResult(
++            outcome=outcome,
++            detected=len(items),
++            actionable=len(remote_ids),
++            submitted=submitted,
++            completed=completed,
++            failed=failed,
++            skipped=initial_skipped,
++            error="" if outcome == "success" else "部分账号未完成查活或精确远端 ID 写回",
++        )
++
++    credential_health_scheduler = CredentialHealthScheduler(
++        {
++            "sub2api_401": _run_sub2api_401_inspection,
++            "chatgpt2api_401": _run_chatgpt2api_401_inspection,
++        },
++        state_path=os.getenv("CREDENTIAL_HEALTH_SCHEDULER_PATH") or None,
++    )
++    app.extensions["credential_health_scheduler"] = credential_health_scheduler
++    credential_health_scheduler.start()
++    logger.info("凭证自动巡检调度器已启动（进程内单实例，要求 Gunicorn workers=1）")
++
+     return app
+diff --git a/webui/auth.py b/webui/auth.py
+index ad8e617..9331f27 100644
+--- a/webui/auth.py
++++ b/webui/auth.py
+@@ -97,7 +97,11 @@ def _wants_json() -> bool:
+
+ def _unauthorized_response():
+     if _wants_json():
+-        return jsonify({"ok": False, "error": "未授权：请先登录或提供授权码"}), 401
++        response = jsonify({"ok": False, "error": "未授权：请先登录或提供授权码"})
++        response.headers["Cache-Control"] = "no-store, max-age=0"
++        response.headers["Pragma"] = "no-cache"
++        response.headers["X-Content-Type-Options"] = "nosniff"
++        return response, 401
+     return redirect(url_for("auth_login", next=request.path))
+
+
+diff --git a/webui/templates/chatgpt2api_401.html b/webui/templates/chatgpt2api_401.html
+index c4f7d58..76c2109 100644
+--- a/webui/templates/chatgpt2api_401.html
++++ b/webui/templates/chatgpt2api_401.html
+@@ -9,12 +9,13 @@
+     *{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font:14px/1.5 system-ui,-apple-system,"Segoe UI",sans-serif;letter-spacing:0}
+     .wrap{max-width:1420px;margin:0 auto;padding:28px 20px 56px}.top{display:flex;align-items:flex-start;justify-content:space-between;gap:20px;margin-bottom:18px}h1{font-size:25px;line-height:1.25;margin:0 0 5px}.muted{color:var(--muted)}a{color:var(--primary);text-decoration:none}
+     .panel{background:var(--surface);border:1px solid var(--line);border-radius:8px;padding:18px;margin-bottom:16px}.toolbar{display:flex;flex-wrap:wrap;align-items:center;gap:10px}.spacer{flex:1}
+-    button{font:inherit;border:1px solid var(--line);border-radius:7px;padding:9px 13px;background:#fff;color:var(--text);cursor:pointer;font-weight:650}button.primary{background:var(--primary);border-color:var(--primary);color:#fff}button.danger{border-color:#f0a39c;background:#fff7f6;color:var(--danger)}button:disabled{opacity:.48;cursor:not-allowed}
++    button,select,input{font:inherit;border:1px solid var(--line);border-radius:7px;padding:9px 13px;background:#fff;color:var(--text)}button{cursor:pointer;font-weight:650}button.primary{background:var(--primary);border-color:var(--primary);color:#fff}button.danger{border-color:#f0a39c;background:#fff7f6;color:var(--danger)}button:disabled{opacity:.48;cursor:not-allowed}
++    .scheduler-grid{display:grid;grid-template-columns:minmax(200px,1fr) repeat(3,minmax(140px,auto));gap:12px;align-items:end}.scheduler-grid label{display:grid;gap:5px}.scheduler-meta{margin-top:12px;display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:10px}.scheduler-meta>div{border:1px solid var(--line);border-radius:7px;padding:9px 11px}.switch{display:flex!important;align-items:center;gap:9px;padding:9px 0}.switch input{width:18px;height:18px;padding:0}
+     .counts{display:grid;grid-template-columns:repeat(auto-fit,minmax(105px,1fr));gap:9px;margin-top:14px}.metric{border:1px solid var(--line);border-radius:7px;padding:10px 12px}.metric b{display:block;font-size:20px}.notice{margin-top:12px;padding:10px 12px;border-left:3px solid #e2a73b;background:#fff8e8;color:#714b00}.notice.error{border-color:#e56b61;background:#fff3f2;color:var(--danger)}.notice.ok{border-color:#54b58a;background:#edfdf4;color:var(--ok)}
+     .table-wrap{overflow:auto;padding:0}table{width:100%;border-collapse:collapse;min-width:1220px}th,td{border-bottom:1px solid #e9edf2;padding:11px 10px;text-align:left;vertical-align:top}th{font-size:12px;color:var(--muted);background:#f8fafc}tbody tr:last-child td{border-bottom:0}.id{max-width:260px;word-break:break-all;font:12px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace}
+     .badge{display:inline-block;padding:3px 8px;border-radius:999px;font-size:12px;font-weight:700}.pending{background:#fff5e5;color:var(--warn)}.queued,.refreshing{background:#edf4ff;color:#175cd3}.ready{background:#eef4ff;color:#3538cd}.replaced{background:#ecfdf3;color:var(--ok)}.failed,.ambiguous,.conflict{background:#fff1f0;color:var(--danger)}
+     .preview{margin:12px 0 0;white-space:pre-wrap;word-break:break-all;background:#151b26;color:#e8edf5;border-radius:7px;padding:12px;max-height:260px;overflow:auto}.hidden{display:none}
+-    @media(max-width:900px){.top{flex-direction:column}.counts{grid-template-columns:repeat(2,minmax(0,1fr))}.wrap{padding:20px 12px 40px}}
++    @media(max-width:900px){.top{flex-direction:column}.counts{grid-template-columns:repeat(2,minmax(0,1fr))}.wrap{padding:20px 12px 40px}.scheduler-grid,.scheduler-meta{grid-template-columns:1fr}}
+   </style>
+ </head>
+ <body>
+@@ -23,6 +24,21 @@
+     <div><h1>ChatGPT2API 401 AT 安全替换</h1><div class="muted">锁定远端 ID 与唯一邮箱映射，以固定 5 并发后台查活，并自动原位写回通过验证的新 AT。</div></div>
+     <a href="/">返回控制台</a>
+   </div>
++  <section class="panel" id="schedulerPanel">
++    <div class="scheduler-grid">
++      <label class="switch"><input type="checkbox" id="autoEnabled"> 开启 ChatGPT2API 自动巡检</label>
++      <label>巡检周期<select id="intervalPreset"><option value="30">30 分钟</option><option value="60">1 小时</option><option value="custom">自定义</option></select></label>
++      <label id="customIntervalLabel" class="hidden">自定义分钟<input type="number" id="customInterval" min="5" max="1440" step="1" value="30"></label>
++      <button class="primary" id="saveSchedulerBtn">保存自动巡检</button>
++    </div>
++    <div class="scheduler-meta">
++      <div><span class="muted">运行状态</span><b id="schedulerStatus">读取中…</b></div>
++      <div><span class="muted">最近 / 下次</span><div id="schedulerTimes">—</div></div>
++      <div><span class="muted">本轮进度</span><div id="schedulerProgress">—</div></div>
++    </div>
++    <div id="schedulerError"></div>
++    <div class="notice">启用后服务端立即执行一次，之后按完成时间计算下个周期。关闭页面不会停止巡检；发现明确失效/401 后复用固定并发 5 的现有查活、精确远端 ID AT 写回和 RT 保留验证。</div>
++  </section>
+   <section class="panel">
+     <div class="toolbar">
+       <button class="primary" id="detectBtn">检测失效 / 401</button>
+@@ -56,7 +72,9 @@
+   const $ = selector => document.querySelector(selector);
+   const selected = new Set();
+   let items = [];
++  let scheduler = {};
+   let pollTimer = null;
++  let pollDelay = 0;
+   let stateLoading = false;
+   const esc = value => String(value ?? '').replace(/[&<>"']/g, ch => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch]));
+   const labels = {pending:'待查活',queued:'队列等待',refreshing:'查活中',ready:'历史待写回',replaced:'已替换',failed:'查活失败',ambiguous:'映射不明确',conflict:'快照冲突'};
+@@ -67,6 +85,22 @@
+     return data;
+   }
+   function showMessage(text='', kind='') { $('#message').innerHTML = text ? `<div class="notice ${kind}">${esc(text)}</div>` : ''; }
++  function timeText(value) { return value ? new Date(value).toLocaleString() : '—'; }
++  function applyScheduler(value) {
++    scheduler = value || {};
++    $('#autoEnabled').checked = scheduler.enabled === true;
++    const interval = Number(scheduler.interval_minutes || 30);
++    const preset = interval === 30 || interval === 60 ? String(interval) : 'custom';
++    $('#intervalPreset').value = preset;
++    $('#customInterval').value = String(interval);
++    $('#customIntervalLabel').classList.toggle('hidden', preset !== 'custom');
++    const phaseLabels = {disabled:'已关闭',idle:'等待下次巡检',running:'正在检测',waiting_for_queue:'等待查活写回队列',interrupted:'上次运行中断'};
++    $('#schedulerStatus').textContent = `${phaseLabels[scheduler.phase] || scheduler.phase || '未知'}${scheduler.last_outcome ? ` · ${scheduler.last_outcome}` : ''}`;
++    $('#schedulerTimes').textContent = `最近 ${timeText(scheduler.last_finished_at || scheduler.last_started_at)} · 下次 ${timeText(scheduler.next_run_at)}`;
++    const progress = scheduler.progress || {};
++    $('#schedulerProgress').textContent = `检测 ${progress.detected || 0} / 可处理 ${progress.actionable || 0} / 提交 ${progress.submitted || 0} / 完成 ${progress.completed || 0} / 失败 ${progress.failed || 0} / 跳过 ${progress.skipped || 0}`;
++    $('#schedulerError').innerHTML = scheduler.error ? `<div class="notice error">${esc(scheduler.error)}</div>` : '';
++  }
+   function updateCounts(data) {
+     const counts = data.counts || {};
+     const progress = data.progress || {};
+@@ -102,22 +136,32 @@
+     $('#selectAll').checked = available.length > 0 && available.every(item => selected.has(item.remote_id));
+     $('#selectAll').indeterminate = selected.size > 0 && !$('#selectAll').checked;
+   }
+-  function schedulePolling(data) {
++  function schedulePolling(data={}) {
+     const progress = data.progress || {};
+-    const running = Number(progress.queued || 0) + Number(progress.active || 0) > 0;
+-    if (!running && pollTimer) {
++    const queueRunning = Number(progress.queued || 0) + Number(progress.active || 0) > 0
++      || items.some(item => item.state === 'queued' || item.state === 'refreshing');
++    const schedulerRunning = scheduler.phase === 'running' || scheduler.phase === 'waiting_for_queue';
++    const nextRunAt = Date.parse(scheduler.next_run_at || '');
++    const schedulerDue = scheduler.enabled === true && Number.isFinite(nextRunAt) && nextRunAt <= Date.now() + 3000;
++    const delay = queueRunning || schedulerRunning || schedulerDue ? 3000 : (scheduler.enabled ? 30000 : 0);
++    if (pollTimer && pollDelay !== delay) {
+       clearTimeout(pollTimer);
+       pollTimer = null;
++      pollDelay = 0;
+     }
+-    if (running && !pollTimer) {
++    if (!delay) return;
++    if (!pollTimer) {
++      pollDelay = delay;
+       pollTimer = setTimeout(async () => {
+         pollTimer = null;
++        pollDelay = 0;
+         await loadState();
+-      }, 3000);
++      }, delay);
+     }
+   }
+   function applyData(data) {
+     items = data.items || [];
++    applyScheduler(data.scheduler || scheduler);
+     updateCounts(data);
+     render();
+     schedulePolling(data);
+@@ -126,9 +170,24 @@
+     if (stateLoading) return;
+     stateLoading = true;
+     try { applyData(await api('/api/chatgpt2api-401/state')); }
+-    catch (error) { showMessage(error.message, 'error'); }
++    catch (error) { showMessage(error.message, 'error'); schedulePolling(); }
+     finally { stateLoading = false; }
+   }
++  $('#intervalPreset').addEventListener('change', event => {
++    $('#customIntervalLabel').classList.toggle('hidden', event.target.value !== 'custom');
++    if (event.target.value !== 'custom') $('#customInterval').value = event.target.value;
++  });
++  $('#saveSchedulerBtn').addEventListener('click', async () => {
++    const preset = $('#intervalPreset').value;
++    const interval = Number(preset === 'custom' ? $('#customInterval').value : preset);
++    if (!Number.isInteger(interval) || interval < 5 || interval > 1440) { showMessage('自动巡检周期必须是 5–1440 分钟的整数', 'error'); return; }
++    $('#saveSchedulerBtn').disabled = true;
++    try {
++      const data = await api('/api/chatgpt2api-401/scheduler', {method:'PUT', body:JSON.stringify({enabled:$('#autoEnabled').checked, interval_minutes:interval})});
++      applyScheduler(data.scheduler || data); schedulePolling(); showMessage('自动巡检配置已保存。', 'ok');
++    } catch (error) { showMessage(error.message, 'error'); }
++    finally { $('#saveSchedulerBtn').disabled = false; }
++  });
+   $('#detectBtn').addEventListener('click', async () => {
+     $('#detectBtn').disabled = true; $('#preview').classList.add('hidden'); showMessage('正在读取远端状态并建立锁定快照…');
+     try {
+diff --git a/webui/templates/sub2api_401.html b/webui/templates/sub2api_401.html
+index 78da14f..b6e2d67 100644
+--- a/webui/templates/sub2api_401.html
++++ b/webui/templates/sub2api_401.html
+@@ -9,18 +9,34 @@
+     *{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font:14px/1.5 system-ui,-apple-system,"Segoe UI",sans-serif}
+     .wrap{max-width:1450px;margin:0 auto;padding:28px 20px 60px}.top{display:flex;align-items:center;justify-content:space-between;gap:16px;margin-bottom:18px}
+     h1{font-size:25px;margin:0}.muted{color:var(--muted)}a{color:var(--primary);text-decoration:none}.card{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:18px;box-shadow:0 8px 24px rgba(15,23,42,.04);margin-bottom:16px}
+-    .toolbar{display:flex;flex-wrap:wrap;align-items:center;gap:10px}.spacer{flex:1}button,select{font:inherit;border:1px solid var(--line);border-radius:9px;padding:9px 13px;background:#fff;color:var(--text)}button{cursor:pointer;font-weight:650}button.primary{background:var(--primary);color:#fff;border-color:var(--primary)}button.danger{background:#fff1f0;color:var(--danger);border-color:#fda29b}button:disabled{opacity:.5;cursor:not-allowed}
++    .toolbar{display:flex;flex-wrap:wrap;align-items:center;gap:10px}.spacer{flex:1}button,select,input{font:inherit;border:1px solid var(--line);border-radius:9px;padding:9px 13px;background:#fff;color:var(--text)}button{cursor:pointer;font-weight:650}button.primary{background:var(--primary);color:#fff;border-color:var(--primary)}button.danger{background:#fff1f0;color:var(--danger);border-color:#fda29b}button:disabled{opacity:.5;cursor:not-allowed}
++    .scheduler-grid{display:grid;grid-template-columns:minmax(180px,1fr) repeat(3,minmax(140px,auto));gap:12px;align-items:end}.scheduler-grid label{display:grid;gap:5px}.scheduler-meta{margin-top:12px;display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:10px}.scheduler-meta>div{border:1px solid var(--line);border-radius:9px;padding:9px 11px}.switch{display:flex!important;align-items:center;gap:9px;padding:9px 0}.switch input{width:18px;height:18px;padding:0}
+     .counts{display:grid;grid-template-columns:repeat(6,minmax(105px,1fr));gap:10px;margin-top:14px}.metric{border:1px solid var(--line);border-radius:10px;padding:10px 12px}.metric b{display:block;font-size:20px}
+     .notice{margin-top:12px;padding:10px 12px;border-radius:9px;background:#fff7ed;color:#9a3412}.notice.error{background:#fef2f2;color:var(--danger)}.notice.ok{background:#ecfdf3;color:var(--ok)}
+     .table-wrap{overflow:auto}table{width:100%;border-collapse:collapse;min-width:1450px}th,td{border-bottom:1px solid #edf1f7;padding:11px 9px;text-align:left;vertical-align:top}th{font-size:12px;text-transform:uppercase;letter-spacing:.03em;color:var(--muted);background:#f8fafc}.ids{max-width:280px;word-break:break-all;color:var(--muted);font-size:12px}
+     .badge{display:inline-block;padding:3px 8px;border-radius:999px;font-size:12px;font-weight:700}.pending{background:#fff7ed;color:var(--warn)}.retrying{background:#eff6ff;color:#1d4ed8}.verified,.cleaned{background:#ecfdf3;color:var(--ok)}.cleanup_ready{background:#eef2ff;color:#4338ca}.failed,.ambiguous{background:#fef2f2;color:var(--danger)}
+     .queue{margin:12px 0 0;white-space:pre-wrap;word-break:break-all;background:#0f172a;color:#e2e8f0;border-radius:9px;padding:12px;max-height:280px;overflow:auto}.hidden{display:none}
+-    @media(max-width:900px){.counts{grid-template-columns:repeat(2,1fr)}.top{align-items:flex-start;flex-direction:column}}
++    @media(max-width:900px){.counts{grid-template-columns:repeat(2,1fr)}.top{align-items:flex-start;flex-direction:column}.scheduler-grid,.scheduler-meta{grid-template-columns:1fr}}
+   </style>
+ </head>
+ <body>
+ <div class="wrap">
+   <div class="top"><div><h1>Sub2API 401 凭证轮换</h1><div class="muted">批量刷新 OpenAI OAuth 账号 → 补跑 unauthorized → 验证同邮箱新 account_id → 自动清理锁定旧 ID（历史重复项或失败时可手动重试）。</div></div><a href="/">← 返回控制台</a></div>
++  <section class="card" id="schedulerCard">
++    <div class="scheduler-grid">
++      <label class="switch"><input type="checkbox" id="autoEnabled"> 开启 Sub2API 自动巡检</label>
++      <label>巡检周期<select id="intervalPreset"><option value="30">30 分钟</option><option value="60">1 小时</option><option value="custom">自定义</option></select></label>
++      <label id="customIntervalLabel" class="hidden">自定义分钟<input type="number" id="customInterval" min="5" max="1440" step="1" value="30"></label>
++      <button class="primary" id="saveSchedulerBtn">保存自动巡检</button>
++    </div>
++    <div class="scheduler-meta">
++      <div><span class="muted">运行状态</span><b id="schedulerStatus">读取中…</b></div>
++      <div><span class="muted">最近 / 下次</span><div id="schedulerTimes">—</div></div>
++      <div><span class="muted">本轮进度</span><div id="schedulerProgress">—</div></div>
++    </div>
++    <div id="schedulerError"></div>
++    <div class="notice">启用后服务端立即执行一次，之后按完成时间计算下个周期。关闭页面不会停止巡检；发现 unauthorized/401 后复用现有 Codex 补跑、替代 ID 验证和精确旧 ID 清理流程。</div>
++  </section>
+   <section class="card">
+     <div class="toolbar">
+       <button class="primary" id="detectBtn">检测 Sub2API 401</button>
+@@ -54,7 +70,9 @@
+   const selected = new Set();
+   let items = [];
+   let cleanupSupported = true;
++  let scheduler = {};
+   let pollTimer = null;
++  let pollDelay = 0;
+   let stateLoading = false;
+   const esc = value => String(value ?? '').replace(/[&<>"']/g, ch => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch]));
+   const stateText = {pending:'待补跑',retrying:'补跑中',verified:'已验证',cleanup_ready:'待清理/可重试',cleaned:'已清理',failed:'补跑失败',ambiguous:'状态不明确'};
+@@ -66,6 +84,22 @@
+   }
+   function message(text='', kind='') { $('#message').innerHTML = text ? `<div class="notice ${kind}">${esc(text)}</div>` : ''; }
+   function idLines(values) { return (values || []).map(esc).join('<br>') || '—'; }
++  function timeText(value) { return value ? new Date(value).toLocaleString() : '—'; }
++  function applyScheduler(value) {
++    scheduler = value || {};
++    $('#autoEnabled').checked = scheduler.enabled === true;
++    const interval = Number(scheduler.interval_minutes || 30);
++    const preset = interval === 30 || interval === 60 ? String(interval) : 'custom';
++    $('#intervalPreset').value = preset;
++    $('#customInterval').value = String(interval);
++    $('#customIntervalLabel').classList.toggle('hidden', preset !== 'custom');
++    const phaseLabels = {disabled:'已关闭',idle:'等待下次巡检',running:'正在检测/补跑',waiting_for_queue:'等待后台任务',interrupted:'上次运行中断'};
++    $('#schedulerStatus').textContent = `${phaseLabels[scheduler.phase] || scheduler.phase || '未知'}${scheduler.last_outcome ? ` · ${scheduler.last_outcome}` : ''}`;
++    $('#schedulerTimes').textContent = `最近 ${timeText(scheduler.last_finished_at || scheduler.last_started_at)} · 下次 ${timeText(scheduler.next_run_at)}`;
++    const progress = scheduler.progress || {};
++    $('#schedulerProgress').textContent = `检测 ${progress.detected || 0} / 可处理 ${progress.actionable || 0} / 提交 ${progress.submitted || 0} / 完成 ${progress.completed || 0} / 失败 ${progress.failed || 0} / 跳过 ${progress.skipped || 0}`;
++    $('#schedulerError').innerHTML = scheduler.error ? `<div class="notice error">${esc(scheduler.error)}</div>` : '';
++  }
+   function updateCounts(data) {
+     const counts = data.counts || {};
+     $('#unauthorizedCount').textContent = counts.unauthorized || 0;
+@@ -98,21 +132,26 @@
+   }
+   function schedulePolling() {
+     const retrying = items.some(item => item.state === 'retrying');
+-    if (!retrying) {
+-      if (pollTimer) {
+-        clearTimeout(pollTimer);
+-        pollTimer = null;
+-      }
+-      return;
++    const schedulerRunning = scheduler.phase === 'running' || scheduler.phase === 'waiting_for_queue';
++    const nextRunAt = Date.parse(scheduler.next_run_at || '');
++    const schedulerDue = scheduler.enabled === true && Number.isFinite(nextRunAt) && nextRunAt <= Date.now() + 3000;
++    const delay = retrying || schedulerRunning || schedulerDue ? 3000 : (scheduler.enabled ? 30000 : 0);
++    if (pollTimer && pollDelay !== delay) {
++      clearTimeout(pollTimer);
++      pollTimer = null;
++      pollDelay = 0;
+     }
++    if (!delay) return;
+     if (!pollTimer) {
++      pollDelay = delay;
+       pollTimer = setTimeout(async () => {
+         pollTimer = null;
++        pollDelay = 0;
+         await loadState();
+-      }, 3000);
++      }, delay);
+     }
+   }
+-  function applyData(data) { items = data.items || []; cleanupSupported = data.cleanup_supported !== false; updateCounts(data); render(); schedulePolling(); }
++  function applyData(data) { items = data.items || []; cleanupSupported = data.cleanup_supported !== false; applyScheduler(data.scheduler || scheduler); updateCounts(data); render(); schedulePolling(); }
+   async function loadState() {
+     if (stateLoading) return;
+     stateLoading = true;
+@@ -133,6 +172,21 @@
+     } catch (error) { message(error.message, 'error'); }
+     finally { $('#detectBtn').disabled = false; }
+   }
++  $('#intervalPreset').addEventListener('change', event => {
++    $('#customIntervalLabel').classList.toggle('hidden', event.target.value !== 'custom');
++    if (event.target.value !== 'custom') $('#customInterval').value = event.target.value;
++  });
++  $('#saveSchedulerBtn').addEventListener('click', async () => {
++    const preset = $('#intervalPreset').value;
++    const interval = Number(preset === 'custom' ? $('#customInterval').value : preset);
++    if (!Number.isInteger(interval) || interval < 5 || interval > 1440) { message('自动巡检周期必须是 5–1440 分钟的整数', 'error'); return; }
++    $('#saveSchedulerBtn').disabled = true;
++    try {
++      const data = await api('/api/sub2api-401/scheduler', {method:'PUT', body:JSON.stringify({enabled:$('#autoEnabled').checked, interval_minutes:interval})});
++      applyScheduler(data.scheduler || data); schedulePolling(); message('自动巡检配置已保存。', 'ok');
++    } catch (error) { message(error.message, 'error'); }
++    finally { $('#saveSchedulerBtn').disabled = false; }
++  });
+   $('#detectBtn').addEventListener('click', detect);
+   $('#retryBtn').addEventListener('click', async () => {
+     const accountIds = [...selected].filter(accountId => items.some(item => item.account_id === accountId && item.retryable));

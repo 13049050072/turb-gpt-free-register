@@ -13,6 +13,7 @@ Flask 本地控制台。
 import logging
 import gzip
 import json
+import os
 import threading
 import time
 import uuid
@@ -28,6 +29,7 @@ from core.chatgpt2api_401_service import (
     ChatGPT2API401Service,
 )
 from core.chatgpt2api_admin import ChatGPT2APIAdminError
+from core.credential_health_scheduler import CredentialHealthScheduler, InspectionResult
 from core.sub2api_401_service import Sub2Api401Service, Sub2ApiSnapshotConflict
 from core.sub2api_admin import Sub2ApiAdminError
 from webui.auth import init_auth, register_auth_routes
@@ -266,6 +268,7 @@ def create_app(auth_code: str | None = None) -> Flask:
     _prepared_downloads: dict[str, dict] = {}
     sub2api_401_service = Sub2Api401Service()
     chatgpt2api_401_service = ChatGPT2API401Service()
+    credential_health_scheduler = None
 
     @app.after_request
     def _compress_json_response(response: Response):
@@ -2552,9 +2555,9 @@ def create_app(auth_code: str | None = None) -> Flask:
     def _release_codex_retry(email: str) -> None:
         codex_retry_service.release(email)
 
-    def _run_codex_retry_worker(email: str, *, batch_label: str | None = None, clear_log: bool = True) -> None:
+    def _run_codex_retry_worker(email: str, *, batch_label: str | None = None, clear_log: bool = True) -> dict:
         """执行一个账号的 Codex 补跑。调用前必须已经 reserve。"""
-        codex_retry_service.run_worker(email, batch_label=batch_label, clear_log=clear_log)
+        return codex_retry_service.run_worker(email, batch_label=batch_label, clear_log=clear_log)
 
 
     @app.post("/api/codex/stop")
@@ -2793,7 +2796,31 @@ def create_app(auth_code: str | None = None) -> Flask:
     @app.get("/api/sub2api-401/state")
     def api_sub2api_401_state():
         """读取最近一次持久化的非敏感 Sub2API 401 轮换审计状态。"""
-        return _sub2api_401_response(sub2api_401_service.state())
+        payload = sub2api_401_service.state()
+        payload["scheduler"] = credential_health_scheduler.state("sub2api_401")
+        return _sub2api_401_response(payload)
+
+    @app.get("/api/sub2api-401/scheduler")
+    def api_sub2api_401_scheduler_state():
+        return _sub2api_401_response({
+            "ok": True,
+            "scheduler": credential_health_scheduler.state("sub2api_401"),
+        })
+
+    @app.put("/api/sub2api-401/scheduler")
+    def api_sub2api_401_scheduler_configure():
+        data = request.get_json(silent=True)
+        if not isinstance(data, dict):
+            return _sub2api_401_response({"ok": False, "error": "请求体必须是 JSON 对象"}, 400)
+        try:
+            scheduler_state = credential_health_scheduler.configure(
+                "sub2api_401",
+                enabled=data.get("enabled"),
+                interval_minutes=data.get("interval_minutes"),
+            )
+        except (ValueError, KeyError) as exc:
+            return _sub2api_401_response({"ok": False, "error": str(exc)}, 400)
+        return _sub2api_401_response({"ok": True, "scheduler": scheduler_state})
 
     @app.post("/api/sub2api-401/detect")
     def api_sub2api_401_detect():
@@ -2806,22 +2833,97 @@ def create_app(auth_code: str | None = None) -> Flask:
             logger.warning("Sub2API 401 检测失败: %s", error)
             return _sub2api_401_response({"ok": False, "error": error}, status)
 
-    @app.post("/api/sub2api-401/retry")
-    def api_sub2api_401_retry():
-        """对选中的 unauthorized account_id 复用现有 Codex OAuth 补跑工作流。"""
-        data = request.get_json(silent=True)
-        if not isinstance(data, dict):
-            return _sub2api_401_response({"ok": False, "error": "请求体必须是 JSON 对象"}, 400)
-        account_ids = data.get("account_ids")
-        if not isinstance(account_ids, list) or not account_ids:
-            return _sub2api_401_response({"ok": False, "error": "account_ids 必须是非空数组"}, 400)
-        if len(account_ids) > 50:
-            return _sub2api_401_response({"ok": False, "error": "单次最多选择 50 个账号"}, 400)
-        raw_workers = data.get("workers", 3)
-        if isinstance(raw_workers, bool) or not isinstance(raw_workers, int):
-            return _sub2api_401_response({"ok": False, "error": "workers 必须是整数"}, 400)
-        workers = max(1, min(8, raw_workers))
+    def _sub2api_401_run_batch(items: list[dict], max_workers: int, batch: str, selected_ids: list[str]) -> dict:
+        """Run the existing Codex retry, post-detect, and exact-ID cleanup workflow."""
+        from concurrent.futures import ThreadPoolExecutor, as_completed
 
+        worker_failures = 0
+        with ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix=f"sub2api-401-{batch}") as executor:
+            futures = {
+                executor.submit(
+                    _run_codex_retry_worker,
+                    item["email"],
+                    batch_label=f"SUB2API401 {batch} #{idx}/{len(items)}",
+                    clear_log=False,
+                ): item["account_id"]
+                for idx, item in enumerate(items, 1)
+            }
+            for future in as_completed(futures):
+                try:
+                    worker_result = future.result()
+                    if not isinstance(worker_result, dict) or worker_result.get("ok") is not True:
+                        worker_failures += 1
+                except Exception as exc:
+                    worker_failures += 1
+                    logger.warning("Sub2API 401 Codex 补跑子任务异常 batch=%s error=%s", batch, type(exc).__name__)
+
+        try:
+            result = sub2api_401_service.detect(_sub2api_401_local_statuses())
+        except Exception as exc:
+            error, _status = _sub2api_401_remote_error(exc)
+            sub2api_401_service.mark_verification_error(selected_ids, f"{error}；旧账号保持不变")
+            logger.warning("Sub2API 401 后置验证失败 batch=%s: %s", batch, error)
+            return {
+                "outcome": "failed",
+                "completed": 0,
+                "failed": max(1, len(items)),
+                "cleanup_failed": 0,
+                "worker_failures": worker_failures,
+                "error": error,
+            }
+
+        post_items = {
+            str(item.get("account_id") or ""): item
+            for item in result.get("items", [])
+            if str(item.get("account_id") or "") in selected_ids
+        }
+        completed_ids = {
+            account_id for account_id, item in post_items.items()
+            if item.get("state") == "cleaned"
+        }
+        cleanup_ids = [
+            account_id for account_id, item in post_items.items()
+            if item.get("retry_batch_id") == batch and item.get("state") == "cleanup_ready"
+        ]
+        cleanup_success_ids: set[str] = set()
+        if cleanup_ids:
+            try:
+                cleanup_result = sub2api_401_service.cleanup(cleanup_ids, opt_in=True, limit=50)
+                cleanup_items = list(cleanup_result.get("items") or [])
+                for index, item in enumerate(cleanup_items):
+                    account_id = str(item.get("account_id") or item.get("cleanup_account_id") or "")
+                    if not account_id and index < len(cleanup_ids):
+                        account_id = cleanup_ids[index]
+                    if item.get("ok") and account_id in cleanup_ids:
+                        cleanup_success_ids.add(account_id)
+            except Exception as exc:
+                logger.warning(
+                    "Sub2API 401 自动清理异常 batch=%s error=%s；保留 cleanup_ready",
+                    batch,
+                    type(exc).__name__,
+                )
+        completed_ids.update(cleanup_success_ids)
+        failed_ids = set(selected_ids) - completed_ids
+        cleanup_failures = len(set(cleanup_ids) - cleanup_success_ids)
+        if cleanup_failures:
+            logger.warning("Sub2API 401 自动清理失败 batch=%s count=%s", batch, cleanup_failures)
+        failed = len(failed_ids)
+        return {
+            "outcome": "success" if failed == 0 else "partial",
+            "completed": len(completed_ids),
+            "failed": failed,
+            "cleanup_completed": len(cleanup_success_ids),
+            "cleanup_failed": cleanup_failures,
+            "worker_failures": worker_failures,
+            "error": "" if failed == 0 else "部分账号补跑或精确旧 ID 清理未完成",
+        }
+
+    def _start_sub2api_401_retry(
+        account_ids: list[object],
+        *,
+        workers: int,
+        background: bool,
+    ) -> tuple[dict, int]:
         candidates, skipped = sub2api_401_service.select_retryable(account_ids, limit=50)
         selected: list[dict] = []
         for item in candidates:
@@ -2840,12 +2942,12 @@ def create_app(auth_code: str | None = None) -> Flask:
             selected.append({"account_id": account_id, "email": email})
 
         if not selected:
-            return _sub2api_401_response({
+            return {
                 "ok": False,
                 "error": "没有可启动的 Sub2API unauthorized/401 账号",
                 "started_count": 0,
                 "skipped": skipped[:50],
-            }, 422)
+            }, 422
 
         batch_id = uuid.uuid4().hex[:12]
         selected_ids = [item["account_id"] for item in selected]
@@ -2863,88 +2965,63 @@ def create_app(auth_code: str | None = None) -> Flask:
         except Sub2ApiSnapshotConflict as exc:
             for email in selected_emails:
                 _release_codex_retry(email)
-            return _sub2api_401_response({
-                "ok": False,
-                "error": str(exc),
-                "conflicts": exc.account_ids,
-            }, 409)
+            return {"ok": False, "error": str(exc), "conflicts": exc.account_ids}, 409
         except Exception as exc:
             for email in selected_emails:
                 _release_codex_retry(email)
-            sub2api_401_service.mark_verification_error(selected_ids, "Sub2API 401 补跑任务初始化失败；旧账号保持不变")
+            sub2api_401_service.mark_verification_error(
+                selected_ids, "Sub2API 401 补跑任务初始化失败；旧账号保持不变"
+            )
             logger.warning("Sub2API 401 补跑任务初始化失败 batch=%s error=%s", batch_id, type(exc).__name__)
-            return _sub2api_401_response({"ok": False, "error": "Sub2API 401 补跑任务初始化失败"}, 500)
+            return {"ok": False, "error": "Sub2API 401 补跑任务初始化失败"}, 500
 
-        def _sub2api_401_runner(items: list[dict], max_workers: int, batch: str):
-            from concurrent.futures import ThreadPoolExecutor, as_completed
-
-            with ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix=f"sub2api-401-{batch}") as executor:
-                futures = [
-                    executor.submit(
-                        _run_codex_retry_worker,
-                        item["email"],
-                        batch_label=f"SUB2API401 {batch} #{idx}/{len(items)}",
-                        clear_log=False,
-                    )
-                    for idx, item in enumerate(items, 1)
-                ]
-                for future in as_completed(futures):
-                    try:
-                        future.result()
-                    except Exception as exc:
-                        logger.warning("Sub2API 401 Codex 补跑子任务异常 batch=%s error=%s", batch, type(exc).__name__)
+        workflow_result = None
+        if background:
             try:
-                result = sub2api_401_service.detect(_sub2api_401_local_statuses())
+                threading.Thread(
+                    target=_sub2api_401_run_batch,
+                    args=(selected, workers, batch_id, selected_ids),
+                    name=f"sub2api-401-dispatch-{batch_id}",
+                    daemon=True,
+                ).start()
             except Exception as exc:
-                error, _status = _sub2api_401_remote_error(exc)
+                for email in selected_emails:
+                    _release_codex_retry(email)
                 sub2api_401_service.mark_verification_error(
-                    [item["account_id"] for item in items],
-                    f"{error}；旧账号保持不变",
+                    selected_ids, "Sub2API 401 补跑调度失败；旧账号保持不变"
                 )
-                logger.warning("Sub2API 401 后置验证失败 batch=%s: %s", batch, error)
-            else:
-                cleanup_ids = [
-                    item["account_id"] for item in result.get("items", [])
-                    if (
-                        item.get("account_id") in selected_ids
-                        and item.get("retry_batch_id") == batch
-                        and item.get("state") == "cleanup_ready"
-                    )
-                ]
-                if cleanup_ids:
-                    try:
-                        cleanup_result = sub2api_401_service.cleanup(cleanup_ids, opt_in=True, limit=50)
-                        failed_cleanup = sum(1 for item in cleanup_result.get("items", []) if not item.get("ok"))
-                        if failed_cleanup:
-                            logger.warning("Sub2API 401 自动清理失败 batch=%s count=%s", batch, failed_cleanup)
-                    except Exception as exc:
-                        logger.warning(
-                            "Sub2API 401 自动清理异常 batch=%s error=%s；保留 cleanup_ready",
-                            batch,
-                            type(exc).__name__,
-                        )
+                logger.warning("Sub2API 401 补跑调度失败 batch=%s error=%s", batch_id, type(exc).__name__)
+                return {"ok": False, "error": "Sub2API 401 补跑调度失败"}, 500
+        else:
+            workflow_result = _sub2api_401_run_batch(selected, workers, batch_id, selected_ids)
 
-        try:
-            threading.Thread(
-                target=_sub2api_401_runner,
-                args=(selected, workers, batch_id),
-                name=f"sub2api-401-dispatch-{batch_id}",
-                daemon=True,
-            ).start()
-        except Exception as exc:
-            for email in selected_emails:
-                _release_codex_retry(email)
-            sub2api_401_service.mark_verification_error(selected_ids, "Sub2API 401 补跑调度失败；旧账号保持不变")
-            logger.warning("Sub2API 401 补跑调度失败 batch=%s error=%s", batch_id, type(exc).__name__)
-            return _sub2api_401_response({"ok": False, "error": "Sub2API 401 补跑调度失败"}, 500)
-        return _sub2api_401_response({
+        return {
             "ok": True,
             "message": f"已启动 {len(selected)} 个 Codex 补跑任务；唯一健康替代 account_id 验证成功后将自动删除锁定旧 ID",
             "started": selected,
             "started_count": len(selected),
             "skipped": skipped[:50],
             "batch_id": batch_id,
-        })
+            "workflow_result": workflow_result,
+        }, 200
+
+    @app.post("/api/sub2api-401/retry")
+    def api_sub2api_401_retry():
+        """对选中的 unauthorized account_id 复用现有 Codex OAuth 补跑工作流。"""
+        data = request.get_json(silent=True)
+        if not isinstance(data, dict):
+            return _sub2api_401_response({"ok": False, "error": "请求体必须是 JSON 对象"}, 400)
+        account_ids = data.get("account_ids")
+        if not isinstance(account_ids, list) or not account_ids:
+            return _sub2api_401_response({"ok": False, "error": "account_ids 必须是非空数组"}, 400)
+        if len(account_ids) > 50:
+            return _sub2api_401_response({"ok": False, "error": "单次最多选择 50 个账号"}, 400)
+        raw_workers = data.get("workers", 3)
+        if isinstance(raw_workers, bool) or not isinstance(raw_workers, int):
+            return _sub2api_401_response({"ok": False, "error": "workers 必须是整数"}, 400)
+        workers = max(1, min(8, raw_workers))
+        payload, status = _start_sub2api_401_retry(account_ids, workers=workers, background=True)
+        return _sub2api_401_response(payload, status)
 
     @app.post("/api/sub2api-401/cleanup")
     def api_sub2api_401_cleanup():
@@ -3021,7 +3098,31 @@ def create_app(auth_code: str | None = None) -> Flask:
     @app.get("/api/chatgpt2api-401/state")
     def api_chatgpt2api_401_state():
         """读取仅含摘要与稳定 ID 的 ChatGPT2API 401 审计状态。"""
-        return _chatgpt2api_401_response(chatgpt2api_401_service.state())
+        payload = chatgpt2api_401_service.state()
+        payload["scheduler"] = credential_health_scheduler.state("chatgpt2api_401")
+        return _chatgpt2api_401_response(payload)
+
+    @app.get("/api/chatgpt2api-401/scheduler")
+    def api_chatgpt2api_401_scheduler_state():
+        return _chatgpt2api_401_response({
+            "ok": True,
+            "scheduler": credential_health_scheduler.state("chatgpt2api_401"),
+        })
+
+    @app.put("/api/chatgpt2api-401/scheduler")
+    def api_chatgpt2api_401_scheduler_configure():
+        data = request.get_json(silent=True)
+        if not isinstance(data, dict):
+            return _chatgpt2api_401_response({"ok": False, "error": "请求体必须是 JSON 对象"}, 400)
+        try:
+            scheduler_state = credential_health_scheduler.configure(
+                "chatgpt2api_401",
+                enabled=data.get("enabled"),
+                interval_minutes=data.get("interval_minutes"),
+            )
+        except (ValueError, KeyError) as exc:
+            return _chatgpt2api_401_response({"ok": False, "error": str(exc)}, 400)
+        return _chatgpt2api_401_response({"ok": True, "scheduler": scheduler_state})
 
     @app.post("/api/chatgpt2api-401/detect")
     def api_chatgpt2api_401_detect():
@@ -3688,5 +3789,180 @@ def create_app(auth_code: str | None = None) -> Flask:
                 else f"⚠️ 已写入文件但热加载失败（{reload_err}），需重启 Web 服务才能生效"
             ),
         })
+
+    def _run_sub2api_401_inspection(run_id: str) -> InspectionResult:
+        current = sub2api_401_service.state()
+        local_statuses = _sub2api_401_local_statuses()
+        retrying_items = [item for item in current.get("items", []) if item.get("state") == "retrying"]
+        active_emails = {
+            str(item.get("email") or "").strip().lower()
+            for item in retrying_items
+            if str(item.get("email") or "").strip() and codex_retry_service.is_retrying(str(item.get("email") or ""))
+        }
+        if active_emails:
+            return InspectionResult(outcome="skipped_busy", skipped=len(active_emails), error="Sub2API Codex 补跑仍在运行")
+        # A process restart cannot preserve Codex worker threads. Convert stale local
+        # `retrying` evidence to failed for this reconciliation detect, then let the
+        # existing exact-ID snapshot gates decide whether it is safely retryable.
+        for item in retrying_items:
+            email = str(item.get("email") or "").strip().lower()
+            if email and local_statuses.get(email) in {"retrying", "queued", "running"}:
+                local_statuses[email] = "failed"
+        detected = sub2api_401_service.detect(local_statuses)
+        items = list(detected.get("items") or [])
+        actionable_ids = [
+            str(item.get("account_id") or "").strip()
+            for item in items
+            if item.get("state") == "pending"
+            and item.get("health") == "unauthorized"
+            and item.get("retryable") is True
+            and str(item.get("account_id") or "").strip()
+        ]
+        selected_ids = actionable_ids[:50]
+        credential_health_scheduler.update_progress(
+            "sub2api_401",
+            run_id,
+            detected=len(items),
+            actionable=len(actionable_ids),
+            submitted=len(selected_ids),
+            skipped=max(0, len(actionable_ids) - len(selected_ids)),
+        )
+        if not selected_ids:
+            return InspectionResult(outcome="success", detected=len(items), actionable=0)
+        payload, status = _start_sub2api_401_retry(selected_ids, workers=3, background=False)
+        workflow = payload.get("workflow_result") if isinstance(payload, dict) else None
+        if status != 200 or not isinstance(workflow, dict):
+            skipped = len(payload.get("skipped") or []) if isinstance(payload, dict) else len(selected_ids)
+            return InspectionResult(
+                outcome="skipped_busy" if status == 422 else "failed",
+                detected=len(items),
+                actionable=len(actionable_ids),
+                submitted=int(payload.get("started_count") or 0) if isinstance(payload, dict) else 0,
+                failed=0 if status == 422 else 1,
+                skipped=max(skipped, len(actionable_ids) - len(selected_ids)),
+                error=str(payload.get("error") or "Sub2API 自动补跑未启动") if isinstance(payload, dict) else "Sub2API 自动补跑未启动",
+            )
+        return InspectionResult(
+            outcome=str(workflow.get("outcome") or "failed"),
+            detected=len(items),
+            actionable=len(actionable_ids),
+            submitted=int(payload.get("started_count") or 0),
+            completed=int(workflow.get("completed") or 0),
+            failed=int(workflow.get("failed") or 0),
+            skipped=len(payload.get("skipped") or []) + max(0, len(actionable_ids) - len(selected_ids)),
+            error=str(workflow.get("error") or ""),
+        )
+
+    def _run_chatgpt2api_401_inspection(run_id: str) -> InspectionResult:
+        try:
+            detected = chatgpt2api_401_service.detect()
+        except ChatGPT2API401BusyError:
+            return InspectionResult(outcome="skipped_busy", skipped=1, error="ChatGPT2API 查活写回队列仍在运行")
+        items = list(detected.get("items") or [])
+        remote_ids = [
+            str(item.get("remote_id") or "").strip()
+            for item in items
+            if item.get("state") == "pending"
+            and item.get("retryable") is True
+            and str(item.get("remote_id") or "").strip()
+        ][:CHATGPT2API_401_MAX_ITEMS]
+        credential_health_scheduler.update_progress(
+            "chatgpt2api_401",
+            run_id,
+            detected=len(items),
+            actionable=len(remote_ids),
+        )
+        if not remote_ids:
+            return InspectionResult(outcome="success", detected=len(items), actionable=0)
+        queued = chatgpt2api_401_service.refresh(
+            remote_ids,
+            opt_in=True,
+            limit=CHATGPT2API_401_MAX_ITEMS,
+        )
+        submitted_ids = [
+            str(value).strip()
+            for value in (queued.get("submitted_ids") or [])
+            if str(value).strip()
+        ]
+        submitted = len(submitted_ids)
+        initial_skipped = len(queued.get("skipped") or [])
+        credential_health_scheduler.update_progress(
+            "chatgpt2api_401",
+            run_id,
+            phase="waiting_for_queue",
+            detected=len(items),
+            actionable=len(remote_ids),
+            submitted=submitted,
+            skipped=initial_skipped,
+        )
+        if submitted <= 0:
+            return InspectionResult(
+                outcome="skipped_busy" if initial_skipped else "success",
+                detected=len(items),
+                actionable=len(remote_ids),
+                submitted=0,
+                skipped=initial_skipped,
+                error="没有可加入 ChatGPT2API 查活队列的账号" if initial_skipped else "",
+            )
+
+        target_ids = set(submitted_ids)
+        completed = failed = 0
+        last_progress = None
+        while True:
+            state = chatgpt2api_401_service.state()
+            by_id = {
+                str(item.get("remote_id") or ""): item
+                for item in state.get("items", [])
+                if str(item.get("remote_id") or "") in target_ids
+            }
+            active = sum(1 for item in by_id.values() if item.get("state") in {"queued", "refreshing", "ready"})
+            failed = sum(1 for item in by_id.values() if item.get("state") in {"failed", "conflict", "ambiguous"})
+            completed = sum(1 for item in by_id.values() if item.get("state") == "replaced")
+            missing = max(0, submitted - active - failed - completed)
+            failed += missing
+            progress = (
+                "waiting_for_queue" if active else "running",
+                completed,
+                failed,
+            )
+            if progress != last_progress:
+                credential_health_scheduler.update_progress(
+                    "chatgpt2api_401",
+                    run_id,
+                    phase=progress[0],
+                    detected=len(items),
+                    actionable=len(remote_ids),
+                    submitted=submitted,
+                    completed=completed,
+                    failed=failed,
+                    skipped=initial_skipped,
+                )
+                last_progress = progress
+            if active == 0:
+                break
+            threading.Event().wait(1.0)
+
+        outcome = "success" if failed == 0 and initial_skipped == 0 else "partial"
+        return InspectionResult(
+            outcome=outcome,
+            detected=len(items),
+            actionable=len(remote_ids),
+            submitted=submitted,
+            completed=completed,
+            failed=failed,
+            skipped=initial_skipped,
+            error="" if outcome == "success" else "部分账号未完成查活或精确远端 ID 写回",
+        )
+
+    credential_health_scheduler = CredentialHealthScheduler(
+        {
+            "sub2api_401": _run_sub2api_401_inspection,
+            "chatgpt2api_401": _run_chatgpt2api_401_inspection,
+        },
+        state_path=os.getenv("CREDENTIAL_HEALTH_SCHEDULER_PATH") or None,
+    )
+    app.extensions["credential_health_scheduler"] = credential_health_scheduler
+    credential_health_scheduler.start()
+    logger.info("凭证自动巡检调度器已启动（进程内单实例，要求 Gunicorn workers=1）")
 
     return app

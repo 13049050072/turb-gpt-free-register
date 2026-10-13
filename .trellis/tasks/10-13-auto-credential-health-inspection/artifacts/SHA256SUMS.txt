@@ -1,0 +1,4 @@
+d1c04231d422fc22b5fb358e0f489958014d02d232ca0d0388e3455494049bdf  .trellis/tasks/10-13-auto-credential-health-inspection/artifacts/MODIFIED_FILE.tar.gz
+8a675ea2e528422e469ea716ffc7d6fd200d402771247654c3fb965ea147268f  .trellis/tasks/10-13-auto-credential-health-inspection/artifacts/DIFF_FILE.patch
+e4a3b0921b5dddf7b4db5ec1b6b5e80ca0492f2102e447fd7ca8918ca81f2166  .trellis/tasks/10-13-auto-credential-health-inspection/artifacts/VERIFICATION.txt
+b5dbc098250c67d2fb0f8319a476c086451ee9d169117e18ab9e8852744602ba  .trellis/tasks/10-13-auto-credential-health-inspection/artifacts/ROLLBACK.sh

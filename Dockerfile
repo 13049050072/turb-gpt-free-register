@@ -58,7 +58,7 @@ RUN chmod 0755 /usr/local/bin/turb-entrypoint \
          "注册成功的邮箱.json" "注册成功的邮箱.txt" \
          "注册成功的token.txt" "注册任务.json" \
          "codex_导出状态.json" "sub2api_401_audit.json" \
-         "chatgpt2api_401_audit.json" accounts_viewer.html \
+         "chatgpt2api_401_audit.json" "credential_health_scheduler.json" accounts_viewer.html \
          outlook_accounts.txt outlook_accounts_used.json sub2api.json; \
        do \
          rm -rf "/app/$path"; \

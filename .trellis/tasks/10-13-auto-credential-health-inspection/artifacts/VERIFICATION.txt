@@ -1,0 +1,80 @@
+Sub2API401 / ChatGPT2API401 automatic credential health inspection verification
+Generated: 2026-10-13
+Base commit: a69150f12a8878588884993979537941b46c8d9d
+
+USER-VISIBLE GOAL
+- Add independent server-side automatic inspection to the Sub2API401 and ChatGPT2API401 pages.
+- Each job defaults disabled and supports 30 minutes, 1 hour, or a custom integer interval from 5 through 1440 minutes.
+- Enabling runs once immediately; closing the page does not stop background work.
+- Sub2API reuses exact account-ID detect -> Codex retry -> replacement verification -> exact cleanup.
+- ChatGPT2API reuses exact remote-ID detect -> five-worker liveness queue -> verified AT writeback while RT evidence remains unchanged.
+
+CHANGED PRODUCT PATHS
+.gitignore
+Dockerfile
+.trellis/spec/backend/credential-health-scheduler.md
+core/chatgpt2api_401_service.py
+core/credential_health_scheduler.py
+tests/test_chatgpt2api_401_service.py
+tests/test_chatgpt2api_401_templates.py
+tests/test_sub2api_401_templates.py
+tests/test_credential_health_scheduler.py
+tests/test_webui_credential_health_scheduler.py
+webui/app.py
+webui/auth.py
+webui/templates/chatgpt2api_401.html
+webui/templates/sub2api_401.html
+
+IMPLEMENTATION CONTRACT
+- `CredentialHealthScheduler` persists one versioned atomic JSON document with independent `sub2api_401` and `chatgpt2api_401` records.
+- The scheduler uses a process singleton keyed by the resolved state path, one coordinator, a two-slot executor, and one active future per job.
+- Persisted `running`/`waiting_for_queue` state becomes `interrupted` after restart and is due once if enabled.
+- Configuration validates literal booleans and integer intervals 5..1440; enabling sets immediate due time; completion sets the next due time.
+- Manual Sub2API retry and ChatGPT2API queue ownership cause the automatic round to return `skipped_busy`; no duplicate work starts.
+- State, audit, logs, and API responses contain only bounded operational metadata, never AT, RT, management keys, OAuth codes, cookies, authorization headers, or credential payloads.
+- Docker maps `/app/credential_health_scheduler.json` to `/data/credential_health_scheduler.json`.
+
+FOCUSED / RELATED TESTS
+Command: `.venv/bin/python -m unittest -v tests.test_credential_health_scheduler tests.test_webui_credential_health_scheduler tests.test_sub2api_401_service tests.test_chatgpt2api_401_service tests.test_webui_sub2api_401 tests.test_webui_chatgpt2api_401 tests.test_sub2api_401_templates tests.test_chatgpt2api_401_templates`
+Result: Ran 124 tests — OK (status 0).
+Logs: FOCUSED_TEST.stdout.log, FOCUSED_TEST.stderr.log.
+
+STATIC CHECKS
+- Full Python `py_compile` under `core`, `webui`, and `tests`: PASS (status 0).
+- Extracted inline JavaScript from both 401 templates and ran `node --check`: PASS (status 0).
+- Source/task staged diff check before adding evidence files: PASS (status 0).
+
+FULL REGRESSION
+Command: `.venv/bin/python -m unittest discover -s tests -v`
+Result: Ran 502 tests — 500 passed; one failure and one error (status 1).
+1. `tests.test_chatgpt_auth_context.ChatgptAuthContextTests.test_ensure_authorize_context_matches_20260914_capture_shape`
+   Exact error: `KeyError: 'ext-oai-did'`.
+2. `tests.test_remail_client.RemailClientTests.test_restore_context_requires_exact_email_match`
+   Exact failure: `AssertionError: unexpectedly None`.
+Logs: FULL_TEST.stdout.log, FULL_TEST.stderr.log.
+
+CLEAN-HEAD PROOF
+- Detached worktree at base commit ran the exact two affected modules.
+- It reproduced the same `KeyError: 'ext-oai-did'` and `AssertionError: unexpectedly None` (status 1).
+- Logs: CLEAN_HEAD_BASELINE.stdout.log, CLEAN_HEAD_BASELINE.stderr.log, CLEAN_HEAD_BASELINE.status.
+
+PATCH / ROLLBACK PROOF
+- `DIFF_FILE.patch` applied cleanly to a detached worktree at the base commit.
+- `PATCHED_MANIFEST.sha256` exactly matched `MODIFIED_MANIFEST.sha256`.
+- `ROLLBACK.sh` restored every modified tracked product file, removed newly added scheduler/test/spec/task files, and left the detached worktree clean.
+- Behavior evidence: scheduler route count was baseline 0, modified 2, patched 2, rollback 0.
+- Files: MANIFEST_DIFF.txt (empty), ROLLBACK_TREE.txt (empty), BEHAVIOR.txt, ROLLBACK.stdout.log, ROLLBACK.status.
+
+INDEPENDENT REVIEW
+- Final Trellis review inspected all changed paths and fixed shutdown ownership, run/config race, ChatGPT poll retry, and immediate-run UI polling issues.
+- Final review reported no remaining blocking correctness, confidentiality, or concurrency issue.
+- Deployment precondition remains one Gunicorn worker process.
+
+TOOL ERROR LEDGER
+- An initial shell-only secret scan had malformed quoting (`grep: parentheses not balanced`) and did not provide valid evidence.
+- It was replaced by a Python regex scan over the full diff; the corrected scan reported `no secret-like additions detected` with status 0.
+- The first evidence-inclusive `git diff --cached --check` returned status 2 because blank context lines inside `DIFF_FILE.patch` were represented as `+ `; source/task diff checking remained status 0.
+- The patch artifact was normalized, then re-applied to a clean worktree; manifest comparison and rollback remained exact before the final diff check.
+
+DEPLOYMENT STATUS AT GENERATION
+- Not yet deployed. Oracle rollout must record the old image, build the exact pushed commit, back up `compose.env`, switch only `TURB_IMAGE`, require healthy/restart=0, and roll back automatically on failure.

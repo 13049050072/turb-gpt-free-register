@@ -41,6 +41,7 @@ __pycache__/
 cpa_401_audit.json
 sub2api_401_audit.json
 chatgpt2api_401_audit.json
+credential_health_scheduler.json
 .venv/
 *.py[cod]
 *$py.class

@@ -101,6 +101,7 @@ class ChatGPT2API401ServiceTests(unittest.TestCase):
 
         queued = self.enqueue(service)
         self.assertEqual(1, queued["queued_count"])
+        self.assertEqual(["remote-old"], queued["submitted_ids"])
         self.assertEqual(CHATGPT2API_401_WORKERS, queued["workers"])
         final = self.wait_terminal(service, ["replaced"])
 

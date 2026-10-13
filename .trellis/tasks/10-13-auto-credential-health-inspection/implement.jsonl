@@ -1,0 +1,9 @@
+{"file":".trellis/spec/backend/sub2api-credential-rotation.md","reason":"Preserve Sub2API exact account-ID retry, snapshot, replacement verification, cleanup, redaction, and route contracts while adding automatic orchestration."}
+{"file":".trellis/spec/backend/chatgpt2api-credential-rotation.md","reason":"Preserve ChatGPT2API queued liveness, fixed concurrency 5, exact remote-ID writeback, evidence validation, persistence, and API contracts."}
+{"file":".trellis/spec/backend/directory-structure.md","reason":"Follow project boundaries between Flask routes, core services, templates, and tests."}
+{"file":".trellis/spec/backend/error-handling.md","reason":"Apply bounded non-sensitive API errors, validation, and cache/security response headers."}
+{"file":".trellis/spec/backend/quality-guidelines.md","reason":"Apply cross-layer testing, secret-handling, template parity, and validation requirements."}
+{"file":".trellis/spec/guides/cross-layer-thinking-guide.md","reason":"Trace scheduler state from persistence through service/API/template boundaries."}
+{"file":".trellis/spec/guides/code-reuse-thinking-guide.md","reason":"Reuse existing retry/liveness workflows instead of duplicating credential mutation logic."}
+{"file":".trellis/tasks/10-13-auto-credential-health-inspection/prd.md","reason":"Feature scope, assumptions, acceptance criteria, and selected technical approach."}
+{"file":".trellis/tasks/10-13-auto-credential-health-inspection/research/scheduler-pattern.md","reason":"Repository-backed scheduler design, lifecycle, persistence, single-flight, adapter, and deterministic test guidance."}

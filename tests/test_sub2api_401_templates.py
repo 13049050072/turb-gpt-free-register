@@ -43,6 +43,26 @@ class Sub2Api401TemplateTests(unittest.TestCase):
         self.assertIn('<option selected>3</option>', page)
         self.assertIn("workers:Number($('#workers').value || 3)", page)
 
+    def test_page_polls_retrying_state_until_terminal(self):
+        page = Path("webui/templates/sub2api_401.html").read_text(encoding="utf-8")
+        for text in (
+            "let pollTimer = null;",
+            "let stateLoading = false;",
+            "const retrying = items.some(item => item.state === 'retrying');",
+            "if (!retrying) {",
+            "clearTimeout(pollTimer);",
+            "pollTimer = setTimeout(async () => {",
+            "await loadState();",
+            "}, 3000);",
+            "String(error?.message || '状态读取失败').slice(0, 160)",
+            "schedulePolling();",
+            "if (stateLoading) return;",
+            "function applyData(data) { items = data.items || []; cleanupSupported = data.cleanup_supported !== false; updateCounts(data); render(); schedulePolling(); }",
+            "  loadState();\n})();",
+        ):
+            self.assertIn(text, page)
+        self.assertEqual(page.count("/api/sub2api-401/detect"), 1)
+
 
 if __name__ == "__main__":
     unittest.main()

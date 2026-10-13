@@ -55,6 +55,8 @@ Environment is reused from `config/sub2api.py`: `SUB2API_API_BASE`, `SUB2API_API
 
 The list adapter accepts direct payloads and standard `{code, data}` envelopes, traverses bounded pagination, deduplicates by normalized `account_id`, and retains only `platform=openai` plus `type=oauth`. Numeric IDs remain strings in audit/UI state but are sent as integers on batch-refresh requests. Email candidates are normalized; missing or conflicting candidates set `email_ambiguous` and are ineligible for retry and cleanup.
 
+The `/sub2api-401` page must poll `GET /api/sub2api-401/state` every 3000 ms while any persisted item is `retrying`. The initial state load must start the same poll when the page is reopened during an in-flight retry, and a successful state response with no `retrying` items must cancel the pending timer. There must be at most one in-flight state request; polling only reads `state` and never invokes the expensive `/detect` endpoint. A transient poll error exposes only a bounded message and schedules a later retry while retrying work remains. The page applies server rows/counts/reasons on each successful response so background progress is visible without a manual reload.
+
 `delete_account(account_id)` is the durable exact-ID cleanup primitive. It normalizes and URL-encodes the ID once, sends `PUT {"status": "inactive"}` to that exact account path, and sends DELETE to the same path only after the PUT succeeds. Both server response payloads are discarded. A deactivation failure short-circuits DELETE; a later DELETE failure remains safe to retry because the same exact ID may be deactivated again before deletion.
 
 Batch refresh returns only bounded operational fields:
@@ -124,7 +126,7 @@ All Sub2API-401 responses set `Cache-Control: no-store, max-age=0`, `Pragma: no-
 - Service tests assert health classification, persisted snapshots, unique replacement, zero/multiple candidates, missing old IDs, local retry failure, email ambiguity, stale-snapshot conflict, concurrent detect/cleanup serialization, explicit cleanup opt-in, delete verification, safe deactivation/delete failure evidence retention, repeated deactivation on retry, and historical all-unauthorized unique-latest selection/refusal, classification drift, post-delete keeper drift, exact-ID deletion, and next-detect singleton retryability.
 - Persistence tests assert atomic writes, resolved symlink target directories, preserved symlinks, mode `0600`, and no secret text.
 - API tests assert authentication, request validation, HTTP 409/422 behavior, no-store headers, worker release on failures, exact-ID selection, and remote error mapping.
-- Template tests assert modern/legacy navigation parity, all four Sub2API-401 endpoints, account ID evidence, explicit cleanup wording, and no CPA-401 links.
+- Template tests assert modern/legacy navigation parity, all four Sub2API-401 endpoints, account ID evidence, explicit cleanup wording, no CPA-401 links, and a 3000 ms single-flight state poll that starts for persisted `retrying` rows and stops at terminal state.
 - Quality gates: `py_compile`, focused `unittest`, extracted inline scripts with `node --check`, `git diff --check`, and related Codex/Sub2API regressions.
 
 ### 7. Wrong vs Correct

@@ -1,0 +1,2 @@
+{"file":"webui/templates/sub2api_401.html","reason":"Reviewed state polling for single-flight requests, retrying-only scheduling, terminal cancellation, bounded errors, and no detect calls."}
+{"file":"tests/test_sub2api_401_templates.py","reason":"Focused template assertions and related Sub2API web/service regression passed."}

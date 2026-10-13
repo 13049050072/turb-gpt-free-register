@@ -1,0 +1,24 @@
+{
+  "id": "10-13-sub2api-401-status-polling",
+  "name": "10-13-sub2api-401-status-polling",
+  "title": "Sub2API 401 补跑状态及时更新",
+  "description": "修复 Sub2API-401 补跑后台状态在页面不及时更新、必须手动刷新才显示的问题；保持现有补跑语义，补充前端状态轮询与回归验证。",
+  "status": "completed",
+  "dev_type": "bugfix",
+  "scope": "webui",
+  "package": "single-repo",
+  "priority": "P1",
+  "creator": "jiangdk",
+  "assignee": "jiangdk",
+  "createdAt": "2026-10-13",
+  "completedAt": "2026-10-13",
+  "base_branch": "main",
+  "commit": null,
+  "pr_url": null,
+  "relatedFiles": [
+    "webui/templates/sub2api_401.html",
+    "tests/test_sub2api_401_templates.py",
+    ".trellis/spec/backend/sub2api-credential-rotation.md"
+  ],
+  "notes": "Backend state persistence already worked; the page lacked state polling. Added 3000 ms single-flight polling with initial recovery and terminal stop."
+}

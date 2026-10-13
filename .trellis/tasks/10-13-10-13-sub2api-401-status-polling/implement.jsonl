@@ -1,0 +1,2 @@
+{"file":"webui/templates/sub2api_401.html","reason":"Add single-flight 3000 ms polling of persisted retrying state and automatic terminal stop."}
+{"file":"tests/test_sub2api_401_templates.py","reason":"Assert polling interval, retrying guard, initial recovery, terminal stop, and no detect polling."}

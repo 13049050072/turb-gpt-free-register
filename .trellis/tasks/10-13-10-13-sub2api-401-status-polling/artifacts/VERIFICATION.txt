@@ -1,0 +1,60 @@
+Sub2API 401 retry status polling verification
+Generated: 2026-10-13
+Base commit: 5cf517534665431f9b62fb274883be4032eedffa
+
+USER-VISIBLE GOAL
+- After Sub2API-401 Codex retry starts, the page must update persisted retrying/terminal state without a manual browser refresh.
+- Reopening the page during a retry must resume progress display.
+- Existing retry, exact-ID cleanup, selection, and API safety behavior must remain unchanged.
+
+CHANGED PATHS
+.trellis/spec/backend/sub2api-credential-rotation.md
+.trellis/tasks/10-13-10-13-sub2api-401-status-polling/check.jsonl
+.trellis/tasks/10-13-10-13-sub2api-401-status-polling/implement.jsonl
+.trellis/tasks/10-13-10-13-sub2api-401-status-polling/prd.md
+.trellis/tasks/10-13-10-13-sub2api-401-status-polling/task.json
+tests/test_sub2api_401_templates.py
+webui/templates/sub2api_401.html
+
+IMPLEMENTATION CONTRACT
+- `webui/templates/sub2api_401.html` polls only GET `/api/sub2api-401/state` every 3000 ms while any item has state `retrying`.
+- Initial `loadState()` applies server data and schedules polling, so persisted retrying rows resume after page reopen.
+- `stateLoading` prevents overlapping state requests; `pollTimer` prevents duplicate timers.
+- A successful response with no retrying rows clears the pending timer. Poll errors are bounded to 160 characters and retry later while retrying work remains.
+- The poller never calls `/api/sub2api-401/detect`; the existing detect button remains the only detect path.
+
+FOCUSED REGRESSION
+Command: `.venv/bin/python -m unittest -v tests.test_sub2api_401_service tests.test_webui_sub2api_401 tests.test_sub2api_401_templates`
+Result: Ran 55 tests — OK.
+Log: `FOCUSED_TEST.stdout.log`
+
+STATIC CHECKS
+- `.venv/bin/python -m py_compile webui/app.py core/sub2api_401_service.py core/sub2api_admin.py`: PASS (status 0).
+- Extracted `webui/templates/sub2api_401.html` inline script with `.venv/bin/python`, then `node --check`: PASS (status 0).
+- `git diff --cached --check`: PASS (status 0).
+
+FULL REGRESSION
+Command: `.venv/bin/python -m unittest discover -s tests -v`
+Result: Ran 470 tests — 468 passed, 2 unrelated failures (exit 1).
+1. `tests.test_chatgpt_auth_context.ChatgptAuthContextTests.test_ensure_authorize_context_matches_20260914_capture_shape`
+   Exact error: `KeyError: 'ext-oai-did'`.
+2. `tests.test_remail_client.RemailClientTests.test_restore_context_requires_exact_email_match`
+   Exact failure: `AssertionError: unexpectedly None`.
+Log: `FULL_TEST.stdout.log`
+
+CLEAN-HEAD PROOF
+- Detached clean worktree at commit `5cf517534665431f9b62fb274883be4032eedffa` ran the exact two modules: `tests.test_chatgpt_auth_context tests.test_remail_client`.
+- It reproduced the same `KeyError: 'ext-oai-did'` and `AssertionError: unexpectedly None`; no current change was present.
+- Log: `CLEAN_HEAD_BASELINE_FAILURES.log`; status: `CLEAN_HEAD_BASELINE.status`.
+
+PATCH / ROLLBACK PROOF
+- `DIFF_FILE.patch` applied cleanly to a detached worktree at the base commit.
+- Patched source/task/spec SHA-256 manifest matched the current modified manifest.
+- Matching inline JavaScript `node --check` passed on the patched worktree.
+- `ROLLBACK.sh` restored the three tracked source/spec files from the base commit, removed the task directory, and left the detached worktree clean.
+- Proof: `PATCH_ROLLBACK_PROOF.txt`, `PATCHED_MANIFEST.sha256`, `MODIFIED_MANIFEST.sha256`, `ROLLBACK_TREE.txt`.
+
+SECURITY / BEHAVIOR
+- No API route, credentials, account IDs, cleanup target, or secret handling changed.
+- Polling reads the existing no-store state endpoint and applies sanitized server state only.
+- No production deployment was performed in this verification transaction.

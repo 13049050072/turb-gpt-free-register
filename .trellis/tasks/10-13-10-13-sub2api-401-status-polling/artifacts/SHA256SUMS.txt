@@ -1,0 +1,3 @@
+112c8cd1bfe8ab12f81bae77bd57d0c0f7e0d9838e2874cacdb014ed5784122c  .trellis/tasks/10-13-10-13-sub2api-401-status-polling/artifacts/MODIFIED_FILE.tar.gz
+095db4eb1515319890795b510c7f242d4b3d6c229fbf45fa407034390c919255  .trellis/tasks/10-13-10-13-sub2api-401-status-polling/artifacts/DIFF_FILE.patch
+5b30ab9fa91a26b4db565a62bd905511e5995f73c47aa8c6840ff7a61036e074  .trellis/tasks/10-13-10-13-sub2api-401-status-polling/artifacts/ROLLBACK.sh

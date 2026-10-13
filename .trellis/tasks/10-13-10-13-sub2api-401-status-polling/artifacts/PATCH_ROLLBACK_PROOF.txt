@@ -1,0 +1,1 @@
+patch applied, manifest matched, node check passed, rollback restored clean HEAD

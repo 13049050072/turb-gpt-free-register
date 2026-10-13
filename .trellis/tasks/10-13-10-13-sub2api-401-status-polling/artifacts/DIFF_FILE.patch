@@ -1,0 +1,184 @@
+diff --git a/.trellis/spec/backend/sub2api-credential-rotation.md b/.trellis/spec/backend/sub2api-credential-rotation.md
+index 3c7a83d..9d92c2e 100644
+--- a/.trellis/spec/backend/sub2api-credential-rotation.md
++++ b/.trellis/spec/backend/sub2api-credential-rotation.md
+@@ -55,6 +55,8 @@ Environment is reused from `config/sub2api.py`: `SUB2API_API_BASE`, `SUB2API_API
+ 
+ The list adapter accepts direct payloads and standard `{code, data}` envelopes, traverses bounded pagination, deduplicates by normalized `account_id`, and retains only `platform=openai` plus `type=oauth`. Numeric IDs remain strings in audit/UI state but are sent as integers on batch-refresh requests. Email candidates are normalized; missing or conflicting candidates set `email_ambiguous` and are ineligible for retry and cleanup.
+ 
++The `/sub2api-401` page must poll `GET /api/sub2api-401/state` every 3000 ms while any persisted item is `retrying`. The initial state load must start the same poll when the page is reopened during an in-flight retry, and a successful state response with no `retrying` items must cancel the pending timer. There must be at most one in-flight state request; polling only reads `state` and never invokes the expensive `/detect` endpoint. A transient poll error exposes only a bounded message and schedules a later retry while retrying work remains. The page applies server rows/counts/reasons on each successful response so background progress is visible without a manual reload.
++
+ `delete_account(account_id)` is the durable exact-ID cleanup primitive. It normalizes and URL-encodes the ID once, sends `PUT {"status": "inactive"}` to that exact account path, and sends DELETE to the same path only after the PUT succeeds. Both server response payloads are discarded. A deactivation failure short-circuits DELETE; a later DELETE failure remains safe to retry because the same exact ID may be deactivated again before deletion.
+ 
+ Batch refresh returns only bounded operational fields:
+@@ -124,7 +126,7 @@ All Sub2API-401 responses set `Cache-Control: no-store, max-age=0`, `Pragma: no-
+ - Service tests assert health classification, persisted snapshots, unique replacement, zero/multiple candidates, missing old IDs, local retry failure, email ambiguity, stale-snapshot conflict, concurrent detect/cleanup serialization, explicit cleanup opt-in, delete verification, safe deactivation/delete failure evidence retention, repeated deactivation on retry, and historical all-unauthorized unique-latest selection/refusal, classification drift, post-delete keeper drift, exact-ID deletion, and next-detect singleton retryability.
+ - Persistence tests assert atomic writes, resolved symlink target directories, preserved symlinks, mode `0600`, and no secret text.
+ - API tests assert authentication, request validation, HTTP 409/422 behavior, no-store headers, worker release on failures, exact-ID selection, and remote error mapping.
+-- Template tests assert modern/legacy navigation parity, all four Sub2API-401 endpoints, account ID evidence, explicit cleanup wording, and no CPA-401 links.
++- Template tests assert modern/legacy navigation parity, all four Sub2API-401 endpoints, account ID evidence, explicit cleanup wording, no CPA-401 links, and a 3000 ms single-flight state poll that starts for persisted `retrying` rows and stops at terminal state.
+ - Quality gates: `py_compile`, focused `unittest`, extracted inline scripts with `node --check`, `git diff --check`, and related Codex/Sub2API regressions.
+ 
+ ### 7. Wrong vs Correct
+diff --git a/.trellis/tasks/10-13-10-13-sub2api-401-status-polling/check.jsonl b/.trellis/tasks/10-13-10-13-sub2api-401-status-polling/check.jsonl
+new file mode 100644
+index 0000000..51569bb
+--- /dev/null
++++ b/.trellis/tasks/10-13-10-13-sub2api-401-status-polling/check.jsonl
+@@ -0,0 +1,2 @@
++{"file":"webui/templates/sub2api_401.html","reason":"Reviewed state polling for single-flight requests, retrying-only scheduling, terminal cancellation, bounded errors, and no detect calls."}
++{"file":"tests/test_sub2api_401_templates.py","reason":"Focused template assertions and related Sub2API web/service regression passed."}
+diff --git a/.trellis/tasks/10-13-10-13-sub2api-401-status-polling/implement.jsonl b/.trellis/tasks/10-13-10-13-sub2api-401-status-polling/implement.jsonl
+new file mode 100644
+index 0000000..1ac5b2c
+--- /dev/null
++++ b/.trellis/tasks/10-13-10-13-sub2api-401-status-polling/implement.jsonl
+@@ -0,0 +1,2 @@
++{"file":"webui/templates/sub2api_401.html","reason":"Add single-flight 3000 ms polling of persisted retrying state and automatic terminal stop."}
++{"file":"tests/test_sub2api_401_templates.py","reason":"Assert polling interval, retrying guard, initial recovery, terminal stop, and no detect polling."}
+diff --git a/.trellis/tasks/10-13-10-13-sub2api-401-status-polling/prd.md b/.trellis/tasks/10-13-10-13-sub2api-401-status-polling/prd.md
+new file mode 100644
+index 0000000..4e4f92a
+--- /dev/null
++++ b/.trellis/tasks/10-13-10-13-sub2api-401-status-polling/prd.md
+@@ -0,0 +1,21 @@
++# Sub2API 401 补跑状态及时更新
++
++## Goal
++
++修复 Sub2API-401 页面在后台补跑期间不会自动显示状态变化的问题。补跑任务已经由后端异步执行并持久化状态，但页面只在初始加载或手动刷新时读取 `/api/sub2api-401/state`，导致用户误以为任务没有进展。
++
++## Requirements
++
++- 页面使用现有 `GET /api/sub2api-401/state`，每 3000 ms 轮询一次。
++- 只有存在 `retrying` 项时轮询；页面重新打开时，如果持久化状态仍为 `retrying`，自动恢复轮询。
++- 同一时间最多一个状态请求；成功读取到没有 `retrying` 项时停止定时器。
++- 轮询只读取 `state`，不得调用昂贵的 `/detect`。
++- 后端状态成功返回后，刷新页面行、计数和原因，不需要手工刷新。
++- 轮询错误只显示有界错误文本，并在仍有 `retrying` 项时稍后重试。
++- 不改变补跑、清理、选择和 API 的安全门禁。
++
++## Acceptance
++
++- 模板测试覆盖 3000 ms 定时器、`retrying` 守卫、初始加载恢复、终态停止、单飞请求和不调用 `/detect`。
++- Sub2API 相关测试、Python 编译、内联 JavaScript `node --check`、`git diff --check` 通过。
++- 全量测试中的非相关失败必须在 clean HEAD 原样复现。
+diff --git a/.trellis/tasks/10-13-10-13-sub2api-401-status-polling/task.json b/.trellis/tasks/10-13-10-13-sub2api-401-status-polling/task.json
+new file mode 100644
+index 0000000..5fe1df1
+--- /dev/null
++++ b/.trellis/tasks/10-13-10-13-sub2api-401-status-polling/task.json
+@@ -0,0 +1,24 @@
++{
++  "id": "10-13-sub2api-401-status-polling",
++  "name": "10-13-sub2api-401-status-polling",
++  "title": "Sub2API 401 补跑状态及时更新",
++  "description": "修复 Sub2API-401 补跑后台状态在页面不及时更新、必须手动刷新才显示的问题；保持现有补跑语义，补充前端状态轮询与回归验证。",
++  "status": "completed",
++  "dev_type": "bugfix",
++  "scope": "webui",
++  "package": "single-repo",
++  "priority": "P1",
++  "creator": "jiangdk",
++  "assignee": "jiangdk",
++  "createdAt": "2026-10-13",
++  "completedAt": "2026-10-13",
++  "base_branch": "main",
++  "commit": null,
++  "pr_url": null,
++  "relatedFiles": [
++    "webui/templates/sub2api_401.html",
++    "tests/test_sub2api_401_templates.py",
++    ".trellis/spec/backend/sub2api-credential-rotation.md"
++  ],
++  "notes": "Backend state persistence already worked; the page lacked state polling. Added 3000 ms single-flight polling with initial recovery and terminal stop."
++}
+diff --git a/tests/test_sub2api_401_templates.py b/tests/test_sub2api_401_templates.py
+index ed248c2..21b74d8 100644
+--- a/tests/test_sub2api_401_templates.py
++++ b/tests/test_sub2api_401_templates.py
+@@ -43,6 +43,26 @@ class Sub2Api401TemplateTests(unittest.TestCase):
+         self.assertIn('<option selected>3</option>', page)
+         self.assertIn("workers:Number($('#workers').value || 3)", page)
+ 
++    def test_page_polls_retrying_state_until_terminal(self):
++        page = Path("webui/templates/sub2api_401.html").read_text(encoding="utf-8")
++        for text in (
++            "let pollTimer = null;",
++            "let stateLoading = false;",
++            "const retrying = items.some(item => item.state === 'retrying');",
++            "if (!retrying) {",
++            "clearTimeout(pollTimer);",
++            "pollTimer = setTimeout(async () => {",
++            "await loadState();",
++            "}, 3000);",
++            "String(error?.message || '状态读取失败').slice(0, 160)",
++            "schedulePolling();",
++            "if (stateLoading) return;",
++            "function applyData(data) { items = data.items || []; cleanupSupported = data.cleanup_supported !== false; updateCounts(data); render(); schedulePolling(); }",
++            "  loadState();\n})();",
++        ):
++            self.assertIn(text, page)
++        self.assertEqual(page.count("/api/sub2api-401/detect"), 1)
++
+ 
+ if __name__ == "__main__":
+     unittest.main()
+diff --git a/webui/templates/sub2api_401.html b/webui/templates/sub2api_401.html
+index 051d963..78da14f 100644
+--- a/webui/templates/sub2api_401.html
++++ b/webui/templates/sub2api_401.html
+@@ -54,6 +54,8 @@
+   const selected = new Set();
+   let items = [];
+   let cleanupSupported = true;
++  let pollTimer = null;
++  let stateLoading = false;
+   const esc = value => String(value ?? '').replace(/[&<>"']/g, ch => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch]));
+   const stateText = {pending:'待补跑',retrying:'补跑中',verified:'已验证',cleanup_ready:'待清理/可重试',cleaned:'已清理',failed:'补跑失败',ambiguous:'状态不明确'};
+   async function api(path, options={}) {
+@@ -94,10 +96,33 @@
+     $('#selectAll').checked = actionable.length > 0 && actionable.every(item => selected.has(item.account_id));
+     $('#selectAll').indeterminate = selected.size > 0 && !$('#selectAll').checked;
+   }
+-  function applyData(data) { items = data.items || []; cleanupSupported = data.cleanup_supported !== false; updateCounts(data); render(); }
++  function schedulePolling() {
++    const retrying = items.some(item => item.state === 'retrying');
++    if (!retrying) {
++      if (pollTimer) {
++        clearTimeout(pollTimer);
++        pollTimer = null;
++      }
++      return;
++    }
++    if (!pollTimer) {
++      pollTimer = setTimeout(async () => {
++        pollTimer = null;
++        await loadState();
++      }, 3000);
++    }
++  }
++  function applyData(data) { items = data.items || []; cleanupSupported = data.cleanup_supported !== false; updateCounts(data); render(); schedulePolling(); }
+   async function loadState() {
++    if (stateLoading) return;
++    stateLoading = true;
+     try { applyData(await api('/api/sub2api-401/state')); }
+-    catch (error) { message(error.message, 'error'); }
++    catch (error) {
++      const detail = String(error?.message || '状态读取失败').slice(0, 160);
++      message(`状态读取失败：${detail}`, 'error');
++      schedulePolling();
++    }
++    finally { stateLoading = false; }
+   }
+   async function detect() {
+     $('#detectBtn').disabled = true; message('正在读取账号并调用 Sub2API batch-refresh…'); $('#cleanupQueue').classList.add('hidden');
+@@ -120,7 +145,7 @@
+         if (item) { item.pre_retry_account_ids = [...(item.observed_account_ids || [accountId])]; item.state='retrying'; item.reason='已启动 Codex OAuth 补跑，等待 Sub2API 新 account_id 后置验证'; item.retryable=false; }
+         selected.delete(accountId);
+       }
+-      message(data.message || '补跑已启动', 'ok'); render();
++      message(data.message || '补跑已启动', 'ok'); render(); schedulePolling();
+     } catch (error) {
+       if (error.status === 409) await loadState();
+       message(error.message, 'error'); render();

@@ -1,0 +1,7 @@
+a28f4fdae524f7ed7418cfaa8ec90a855b2b4a4640077409f2332a683779f9f5  .trellis/spec/backend/sub2api-credential-rotation.md
+3fa8c39481f89eabfb6f4cce5bb8cf8b710a8976f734eec8b17ae405c5ee3b94  .trellis/tasks/10-13-10-13-sub2api-401-status-polling/check.jsonl
+365dd37920879161604183c8a5afbdba25041a8f2006d1d7449a5a201e8e4b5c  .trellis/tasks/10-13-10-13-sub2api-401-status-polling/implement.jsonl
+f82a17512c967a06daed0c9c15c04409d13426ca680b4b7b9e0051dcf3ef2eee  .trellis/tasks/10-13-10-13-sub2api-401-status-polling/prd.md
+6d2845969349381862ca6af0c0e26e64b57d174678a2020e52c62413f7ec51ec  .trellis/tasks/10-13-10-13-sub2api-401-status-polling/task.json
+4b767f875e369a74de4b05eddf27ec13042f57c701a0271814f2f201e79a4894  tests/test_sub2api_401_templates.py
+f15e0a30ed93431c429f47c36e1feef96354cfdf0a7e5770d3efe222ad9d12f5  webui/templates/sub2api_401.html

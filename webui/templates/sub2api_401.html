@@ -54,6 +54,8 @@
   const selected = new Set();
   let items = [];
   let cleanupSupported = true;
+  let pollTimer = null;
+  let stateLoading = false;
   const esc = value => String(value ?? '').replace(/[&<>"']/g, ch => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch]));
   const stateText = {pending:'待补跑',retrying:'补跑中',verified:'已验证',cleanup_ready:'待清理/可重试',cleaned:'已清理',failed:'补跑失败',ambiguous:'状态不明确'};
   async function api(path, options={}) {
@@ -94,10 +96,33 @@
     $('#selectAll').checked = actionable.length > 0 && actionable.every(item => selected.has(item.account_id));
     $('#selectAll').indeterminate = selected.size > 0 && !$('#selectAll').checked;
   }
-  function applyData(data) { items = data.items || []; cleanupSupported = data.cleanup_supported !== false; updateCounts(data); render(); }
+  function schedulePolling() {
+    const retrying = items.some(item => item.state === 'retrying');
+    if (!retrying) {
+      if (pollTimer) {
+        clearTimeout(pollTimer);
+        pollTimer = null;
+      }
+      return;
+    }
+    if (!pollTimer) {
+      pollTimer = setTimeout(async () => {
+        pollTimer = null;
+        await loadState();
+      }, 3000);
+    }
+  }
+  function applyData(data) { items = data.items || []; cleanupSupported = data.cleanup_supported !== false; updateCounts(data); render(); schedulePolling(); }
   async function loadState() {
+    if (stateLoading) return;
+    stateLoading = true;
     try { applyData(await api('/api/sub2api-401/state')); }
-    catch (error) { message(error.message, 'error'); }
+    catch (error) {
+      const detail = String(error?.message || '状态读取失败').slice(0, 160);
+      message(`状态读取失败：${detail}`, 'error');
+      schedulePolling();
+    }
+    finally { stateLoading = false; }
   }
   async function detect() {
     $('#detectBtn').disabled = true; message('正在读取账号并调用 Sub2API batch-refresh…'); $('#cleanupQueue').classList.add('hidden');
@@ -120,7 +145,7 @@
         if (item) { item.pre_retry_account_ids = [...(item.observed_account_ids || [accountId])]; item.state='retrying'; item.reason='已启动 Codex OAuth 补跑，等待 Sub2API 新 account_id 后置验证'; item.retryable=false; }
         selected.delete(accountId);
       }
-      message(data.message || '补跑已启动', 'ok'); render();
+      message(data.message || '补跑已启动', 'ok'); render(); schedulePolling();
     } catch (error) {
       if (error.status === 409) await loadState();
       message(error.message, 'error'); render();

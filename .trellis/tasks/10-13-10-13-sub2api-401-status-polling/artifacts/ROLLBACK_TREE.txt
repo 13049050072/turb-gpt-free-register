@@ -1,0 +1,1 @@
+clean worktree after rollback

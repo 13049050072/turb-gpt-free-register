@@ -895,7 +895,10 @@ function formatTraffic(t) {
   };
   const j = t.js_coverage;
   const jsHint = j && j.enabled ? `，JS脚本 ${n(j.script_count)}（执行 ${n(j.executed_script_count)}，候选 ${n(j.candidate_script_count)}）` : '';
-  return `<span title="上传 ${fmt(t.upload_bytes)}，下载 ${fmt(t.download_bytes)}，${n(t.request_count)} 个请求${jsHint}">${fmt(t.total_bytes)}</span>`;
+  const scopeHint = t.proxy_transport && t.proxy_transport.available
+    ? `全浏览器代理传输（含TLS），页面可见 ${fmt(t.browser_observed_total_bytes)}`
+    : '页面可见流量（不含TLS，可能漏计启动及后台请求）';
+  return `<span title="${scopeHint}；上传 ${fmt(t.upload_bytes)}，下载 ${fmt(t.download_bytes)}，页面 ${n(t.request_count)} 个请求${jsHint}">${fmt(t.total_bytes)}</span>`;
 }
 function copyId(v) { if (!v) return ''; const id = 'c'+(++copySeq); copyStore.set(id, v); return id; }
 function cbtn(label, value, cls='') { const id = copyId(value); return `<button class="${cls}" data-copy-id="${id}" ${id?'':'disabled'}>${label}</button>`; }

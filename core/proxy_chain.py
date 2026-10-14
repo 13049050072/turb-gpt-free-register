@@ -7,6 +7,7 @@ import logging
 import select
 import socket
 import threading
+from urllib.parse import urlsplit
 
 from core.proxy_utils import mask_proxy_url, parse_proxy_url
 
@@ -50,14 +51,14 @@ def _read_socks_address(sock: socket.socket, atyp: int) -> tuple[str, int]:
 class ProxyChainRelay:
     """Expose a local HTTP CONNECT endpoint that reaches target through upstream."""
 
-    def __init__(self, target: str, upstream: str, *, timeout: float = 15.0):
+    def __init__(self, target: str, upstream: str = "", *, timeout: float = 15.0):
         self.target = parse_proxy_url(target)
-        self.upstream = parse_proxy_url(upstream)
+        self.upstream = parse_proxy_url(upstream) if upstream else None
         if self.target.scheme not in {"http", "socks5", "socks5h"}:
             raise ValueError("代理链目标代理必须是 http://、socks5:// 或 socks5h://")
-        if self.upstream.scheme == "https":
+        if self.upstream and self.upstream.scheme == "https":
             raise ValueError("代理链暂不支持 https:// 作为上游代理，请填写 http:// 或 socks5://")
-        if socks is None:
+        if self.upstream and socks is None:
             raise RuntimeError("代理链需要 PySocks，请先安装 requirements.txt 中的依赖")
         self.timeout = max(1.0, float(timeout or 15.0))
         self._listener: socket.socket | None = None
@@ -153,6 +154,8 @@ class ProxyChainRelay:
             threading.Thread(target=self._handle_client, args=(client,), name="proxy-chain-client", daemon=True).start()
 
     def _connect_target_through_upstream(self, host: str, port: int) -> socket.socket:
+        if self.upstream is None:
+            return socket.create_connection((host, port), timeout=self.timeout)
         proxy_type = socks.HTTP if self.upstream.scheme == "http" else socks.SOCKS5
         remote = socks.socksocket()
         remote.set_proxy(
@@ -254,7 +257,7 @@ class ProxyChainRelay:
             raise ProxyChainError(f"目标代理 CONNECT 失败（HTTP {status}）")
 
     @staticmethod
-    def _read_http_request(client: socket.socket) -> tuple[str, str, str]:
+    def _read_http_request(client: socket.socket) -> tuple[str, str, bytes]:
         request = bytearray()
         while b"\r\n\r\n" not in request:
             chunk = client.recv(4096)
@@ -267,7 +270,7 @@ class ProxyChainRelay:
         parts = first_line.split(" ", 2)
         if len(parts) != 3:
             raise ValueError("HTTP 代理请求行无效")
-        return parts[0].upper(), parts[1], parts[2]
+        return parts[0].upper(), parts[1], bytes(request)
 
     @staticmethod
     def _split_host_port(destination: str) -> tuple[str, int]:
@@ -292,18 +295,40 @@ class ProxyChainRelay:
         remote: socket.socket | None = None
         try:
             client.settimeout(self.timeout)
-            method, destination, _ = self._read_http_request(client)
-            if method != "CONNECT":
-                self._send_http_error(client)
-                return
-            host, port = self._split_host_port(destination)
+            method, destination, initial = self._read_http_request(client)
+            if method == "CONNECT":
+                host, port = self._split_host_port(destination)
+            else:
+                parsed = urlsplit(destination)
+                if parsed.scheme != "http" or not parsed.hostname:
+                    raise ValueError("HTTP 代理请求必须使用 http:// 绝对 URL")
+                host, port = parsed.hostname, parsed.port or 80
             remote = self._connect_target_through_upstream(self.target.host, self.target.port)
             if self.target.scheme in {"socks5", "socks5h"}:
                 self._target_socks_connect(remote, host, port)
-            else:
+            elif method == "CONNECT":
                 self._target_http_connect(remote, host, port)
             remote.settimeout(0.5)
-            client.sendall(b"HTTP/1.1 200 Connection Established\r\nConnection: keep-alive\r\n\r\n")
+            if method == "CONNECT":
+                client.sendall(b"HTTP/1.1 200 Connection Established\r\nConnection: keep-alive\r\n\r\n")
+                # CONNECT 头不走目标隧道；保留同一 recv 中提前到达的 TLS 数据。
+                initial = initial.split(b"\r\n\r\n", 1)[1]
+            else:
+                header, body = initial.split(b"\r\n\r\n", 1)
+                lines = header.split(b"\r\n")
+                version = lines[0].rsplit(b" ", 1)[1]
+                path = (parsed.path or "/") + ("?" + parsed.query if parsed.query else "")
+                if self.target.scheme in {"socks5", "socks5h"}:
+                    lines[0] = method.encode("ascii") + b" " + path.encode("ascii") + b" " + version
+                lines = [line for line in lines if not line.lower().startswith((b"proxy-authorization:", b"proxy-connection:"))]
+                if self.target.scheme == "http" and (self.target.username or self.target.password):
+                    credentials = f"{self.target.username or ''}:{self.target.password or ''}".encode("utf-8")
+                    lines.append(b"Proxy-Authorization: Basic " + base64.b64encode(credentials))
+                initial = b"\r\n".join(lines) + b"\r\n\r\n" + body
+            if initial:
+                remote.sendall(initial)
+                with self._traffic_lock:
+                    self._upload_bytes += len(initial)
             client.settimeout(0.5)
             self._relay(client, remote)
         except Exception as exc:
@@ -312,7 +337,7 @@ class ProxyChainRelay:
             logger.warning(
                 "代理链连接失败 target=%s upstream=%s error=%s",
                 mask_proxy_url(self.target.raw),
-                mask_proxy_url(self.upstream.raw),
+                mask_proxy_url(self.upstream.raw) if self.upstream else "direct",
                 self._last_error,
             )
             self._send_http_error(client)
@@ -358,12 +383,13 @@ def open_proxy_pool_proxy(
     selected_proxy: str | None = None,
     *,
     timeout: float = 15.0,
+    measure_transport: bool = False,
 ):
     """Resolve a proxy-pool target and optionally wrap it with its own upstream.
 
     The package/Agent upstream is intentionally not consulted here.  An empty
-    ``PROXY_POOL_UPSTREAM_PROXY`` returns the selected target unchanged and no
-    relay, so callers can use the same cleanup path for both modes.
+    ``PROXY_POOL_UPSTREAM_PROXY`` returns the selected target unchanged unless
+    ``measure_transport`` requests a local counting relay for browser traffic.
     """
     from config import proxy as proxy_cfg
 
@@ -372,7 +398,11 @@ def open_proxy_pool_proxy(
         or ""
     ).strip()
     upstream = str(getattr(proxy_cfg, "PROXY_POOL_UPSTREAM_PROXY", "") or "").strip()
-    if not target or not upstream:
+    if not target or (not upstream and not measure_transport):
+        return target, None
+
+    # 保持未支持协议的既有直连行为，不能为了统计改变出口。
+    if not upstream and parse_proxy_url(target).scheme not in {"http", "socks5", "socks5h"}:
         return target, None
 
     relay = ProxyChainRelay(target, upstream, timeout=timeout).start()

@@ -109,7 +109,9 @@ EMAIL_SOURCE = "outlook,generic_api,imap"
 - HTTP 请求数、失败/未完成请求数；
 - WebSocket 帧 payload 字节（如流程使用 WebSocket）。
 
-现代/Legacy WebUI 的注册任务列表会显示总流量，完整结构保存在任务记录的 `network_traffic` 和成功账号的 `extra_json` 中。统计为浏览器侧可观测的请求/响应流量，不包含 TLS/IP/代理隧道额外开销，也不包含邮箱 API、Roxy API 或 CDP 控制通道流量。
+现代/Legacy WebUI 的注册任务列表会显示总流量，完整结构保存在任务记录的 `network_traffic` 和成功账号的 `extra_json` 中。Roxy 新建环境使用代理池、Cloak 使用代理池或显式 HTTP/SOCKS5 代理时，通过本地代理中继统计全浏览器双向传输，包含 TLS、浏览器启动、扩展和后台请求；无须配置上游代理。页面可见的计数另存为 `browser_observed_*`，资源明细仍为页面口径，不能与传输总量直接相加。
+
+复用已有 Roxy 环境、手填 `proxyInfo`、无代理或未支持的代理协议时仍使用页面可见统计，可能漏掉其他 target 和启动阶段。所有统计均不包含 TCP/IP 包头、重传以及代理商特有的计费项，也不包含邮箱 API、Roxy API 或 CDP 控制通道流量。
 
 #### 省流量模式
 
@@ -153,7 +155,14 @@ BROWSER_TRAFFIC_DETAIL_LOG=True
 BROWSER_TRAFFIC_DETAIL_MAX_ENTRIES=2000
 ```
 
-启用统计的 Roxy/Cloak 注册任务结束后，日志会输出 `[资源明细]` 行，包含资源 URL、类型、HTTP 方法、状态码、上传大小、下载大小、响应 body/header 大小，以及 `failed`、`blocked`、`unfinished`、`cache` 状态；明细按单请求总字节从大到小排列。Browser Use/Skyvern 云端浏览器不启用该监听。`ws_upload/ws_download` 表示 WebSocket 帧 payload。Playwright 缓存状态在无法从 API 确认时显示 `unknown`，Selenium/CDP 能识别时显示 `hit` 或 `miss`。URL 查询参数值、data/blob URL 内容不会写入日志。
+启用统计的 Roxy/Cloak 注册任务结束后，日志只输出有流量消耗的 `[资源明细]` 行，被拦截、零字节、本机回环和 data/blob 访问不输出；纯本地缓存命中不消耗网络字节，也不输出。失败或未完成但已有收发字节的访问仍保留。每条包含资源 URL、类型、HTTP 方法、状态码、上传 `upload`、下载 `download`、总消耗 `total`（单位 B），以及响应 body/header 大小和失败/缓存状态；按单次总消耗从大到小排列。汇总显示全部有消耗访问的上传、下载、总字节，即使明细超过 `BROWSER_TRAFFIC_DETAIL_MAX_ENTRIES` 的输出上限，汇总也不会截断。
+
+示例：
+```text
+[资源明细] #1 xhr POST status=201 upload=12B download=28B total=40B ... size_source=playwright.sizes url=https://example.test/api
+```
+
+单访问明细采用浏览器可观察的 HTTP/WS 字节口径，不包含 TLS/IP 开销，不能把全浏览器代理传输总量直接分摊给 URL。`size_source=playwright.sizes` 表示 Playwright 返回的尺寸，`cdp.encoded+estimated_headers` 表示 CDP 传输字节配合估算请求/响应头，`estimated_upload` 表示无法取得尺寸时的上传估算（不应视为精确实测）；`resource_timing` 表示浏览器 Timing 数据。Browser Use/Skyvern 云端浏览器不启用该监听。`ws_upload/ws_download` 表示 WebSocket 帧 payload。URL 查询参数值、data/blob URL 内容不会写入日志。
 
 把一轮注册的 `[资源明细]` 日志发回后，可以按域名、路径、资源类型和实际字节量判断下一步是否适合继续拦截；`stylesheet`、`font` 等类型需要结合注册是否受影响再启用。
 

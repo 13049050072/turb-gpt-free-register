@@ -14,7 +14,7 @@ from config import roxybrowser as _cfg
 from config import twofa as _twofa_cfg
 from core.account_export import save_account_data, post_register_dwell
 from core.browser_data_saver import BrowserDataSaver
-from core.browser_traffic import SeleniumTrafficTracker
+from core.browser_traffic import SeleniumTrafficTracker, merge_proxy_transport_traffic
 from core.roxy_asset_cache import RoxyLocalAssetCache
 from core.email_provider import acquire_email_after_input, wait_for_otp, resolve_email_source
 from core.humanize import delay as human_delay
@@ -2317,29 +2317,9 @@ def run_roxy_registration(
     def _merge_proxy_transport_traffic() -> None:
         """用代理链全量计数补正仅覆盖当前页面 target 的 CDP 统计。"""
         nonlocal network_traffic
-        transport = client.proxy_transport_snapshot()
-        if not transport or not transport.get("available"):
-            return
-        if not isinstance(network_traffic, dict):
-            network_traffic = {}
-        browser_total = int(network_traffic.get("total_bytes") or 0)
-        transport_total = int(transport.get("total_bytes") or 0)
-        network_traffic["browser_observed_upload_bytes"] = int(network_traffic.get("upload_bytes") or 0)
-        network_traffic["browser_observed_download_bytes"] = int(network_traffic.get("download_bytes") or 0)
-        network_traffic["browser_observed_total_bytes"] = browser_total
-        network_traffic["proxy_transport"] = dict(transport)
-        network_traffic["upload_bytes"] = int(transport.get("upload_bytes") or 0)
-        network_traffic["download_bytes"] = int(transport.get("download_bytes") or 0)
-        network_traffic["total_bytes"] = transport_total
-        network_traffic["measurement_scope"] = "proxy_chain_all_roxy_targets"
-        if browser_total > 0 and transport_total > browser_total * 1.2:
-            logger.warning(
-                "[Roxy] CDP 当前页面统计 %.2f MiB，代理链全浏览器实际 %.2f MiB（%.2fx）；"
-                "差额来自启动阶段、扩展/Service Worker 或其他 target",
-                browser_total / 1024 / 1024,
-                transport_total / 1024 / 1024,
-                transport_total / browser_total,
-            )
+        network_traffic = merge_proxy_transport_traffic(
+            network_traffic, client.proxy_transport_snapshot(), label="Roxy",
+        )
 
     def _traffic_checkpoint() -> None:
         if traffic_tracker is not None:

@@ -116,7 +116,8 @@ BROWSER_DATA_SAVER_BLOCKED_URL_PATTERNS: list[str] = [
 ]
 
 # ---------- Roxy/Cloak 浏览器流量明细日志 ----------
-# 默认关闭；开启后在每次注册结束时按单请求总字节降序输出资源 URL、类型、状态和大小。
+# 默认关闭；开启后在注册结束时仅输出有流量消耗的访问，包含上传/下载/总字节。
+# 按单请求总消耗降序输出；跳过拦截、零字节和本地访问，估算项显式标记。
 # URL 查询参数值会脱敏，不保存请求/响应 body 或完整 Header 内容。
 BROWSER_TRAFFIC_DETAIL_LOG: bool = False
 BROWSER_TRAFFIC_DETAIL_MAX_ENTRIES: int = 2000

@@ -476,7 +476,7 @@ class RoxyBrowserClient:
             from core.proxy_chain import open_proxy_pool_proxy
 
             target_proxy = _proxy_cfg.pick_proxy()
-            proxy_url, relay = open_proxy_pool_proxy(target_proxy)
+            proxy_url, relay = open_proxy_pool_proxy(target_proxy, measure_transport=True)
             self._proxy_pool_relay = relay
             self._proxy_pool_target = str(target_proxy or "").strip()
             if proxy_url:

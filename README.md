@@ -58,6 +58,7 @@ IPWO 住宅代理提供覆盖195+国家和地区的住宅 IP 资源，支持多�
 - 通用 IMAP 邮箱池：每行 `邮箱----IMAP密码` 或 `邮箱:IMAP密码`，服务器、端口和 SSL 在导入界面统一配置
 - GPTMail 临时邮箱 API：运行时随机生成邮箱并自动收取验证码
 - Remail 开放 API：按项目下单短效邮箱并自动收取验证码（`remail`）
+- 西瓜邮箱接码平台：按项目方案下单邮箱并自动收取验证码（`xigua`）
 - `EMAIL_SOURCE` 支持多个来源组合，例如：
 
 ```python
@@ -237,6 +238,7 @@ cp .env.example .env
 - `QQ_IMAP_PASSWORD`
 - `CLOUDFLARE_API_KEY` / `CLOUDFLARE_CUSTOM_AUTH`（`EMAIL_SOURCE=cloudflare` 时）
 - `REMAIL_API_KEY`（`EMAIL_SOURCE=remail` 时）
+- `XIGUA_API_KEY`（`EMAIL_SOURCE=xigua` 时）
 - `CPA_MANAGEMENT_KEY`
 - `SMS_API_KEY`
 - `L_ADMIN_AUTH_CODE`
@@ -405,6 +407,29 @@ REMAIL_SUPPLY_POLICY=public_only
 `REMAIL_SERVICE_MODE` 默认为 `purchase`（长效购买，可重复收件），也可改为 `code`（短效接码）。
 `REMAIL_SUPPLY_POLICY` 默认为 `public_only`，也可改为 `private_first`。每个注册任务会创建一个
 对应模式的订单，验证码通过 `/v1/pickup` 获取；Remail 订单余额和对应项目库存需可用。
+
+#### 西瓜邮箱接码平台
+
+西瓜 API 文档：[https://xigua.dasiqo.com/#docs](https://xigua.dasiqo.com/#docs)。每个注册任务按项目方案
+创建一个订单，订单返回的邮箱用于注册，平台收到验证码后订单变为 `succeeded`，客户端读取订单的 `code`。
+
+在 WebUI「配置 → 邮箱 / OTP → 西瓜」填写：
+
+- `XIGUA_API_KEY`：西瓜「API 密钥」页创建的 `xg_` 开头密钥；
+- `XIGUA_PROJECT`：项目 slug/名称/ID，默认 `openai`；
+- `XIGUA_MAILBOX_TYPE`（可选）：只用某种邮箱类型的方案，例如 `iCloud`；
+- `XIGUA_OFFER_ID`（可选）：直接指定 `off_` 开头的方案 ID。
+
+```dotenv
+USE_EMAIL_SERVICE=True
+EMAIL_SOURCE=xigua
+XIGUA_API_KEY=你的_西瓜_API_Key
+XIGUA_PROJECT=openai
+```
+
+一个西瓜订单只结算一个验证码。同一邮箱再次取码（OTP 重发、Codex 登录、查活、2FA）时会调用原订单的
+`/repeat` 创建新订单，首次成功付费后再次取码免费。任务失败时仍在等待的订单会被取消以释放冻结余额。
+注册成功后订单号保存在账号记录中，服务重启后查活也能继续取码。
 
 ---
 

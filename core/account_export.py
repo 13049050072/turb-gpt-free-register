@@ -800,24 +800,29 @@ def save_account_data(
     """
     from core.db import insert_account
     extra = dict(extra or {})
-    # Remail 的 service token 只存在进程内上下文中。注册成功后把订单上下文
-    # 一并保存到账号 extra_json，服务重启时查活即可恢复，不再依赖“同一进程
-    # 中先领取邮箱”。普通账号列表不会返回 extra_json。
-    if str(email_source or "").strip().lower() == "remail":
+    # Remail 的 service token、西瓜的订单号只存在进程内上下文中。注册成功后把
+    # 订单上下文一并保存到账号 extra_json，服务重启时查活即可恢复，不再依赖
+    # “同一进程中先领取邮箱”。普通账号列表不会返回 extra_json。
+    normalized_source = str(email_source or "").strip().lower()
+    if normalized_source in ("remail", "xigua"):
         try:
-            from core.remail_client import get_account_context_metadata
+            if normalized_source == "remail":
+                from core.remail_client import get_account_context_metadata
+            else:
+                from core.xigua_client import get_account_context_metadata
 
-            remail_metadata = get_account_context_metadata(email)
-            if remail_metadata:
+            service_metadata = get_account_context_metadata(email)
+            if service_metadata:
                 existing_service = extra.get("email_service")
                 merged_service = dict(existing_service) if isinstance(existing_service, dict) else {}
-                merged_service.update(remail_metadata)
+                merged_service.update(service_metadata)
                 extra["email_service"] = merged_service
         except Exception as exc:
             # 订单上下文保存失败不应让已经完成的注册失败；后续查活仍会
-            # 尝试用 API Key 按邮箱搜索 Remail 订单恢复凭证。
+            # 尝试用 API Key 按邮箱搜索订单恢复上下文。
             logger.warning(
-                "[Save] 保存 Remail 订单上下文失败，后续将尝试按邮箱恢复：%s: %s",
+                "[Save] 保存 %s 订单上下文失败，后续将尝试按邮箱恢复：%s: %s",
+                normalized_source,
                 type(exc).__name__,
                 str(exc)[:180],
             )

@@ -351,7 +351,7 @@ EDITABLE_FIELDS = [
     },
     {
         "key": "EMAIL_SOURCE", "file": "email.py", "type": "str", "group": "邮箱 / OTP",
-        "label": "邮箱来源", "help": "可填单个或多个，逗号分隔并按顺序兜底：outlook,generic_api,imap,cloudflare_domain,cloudflare,gptmail,mailnest,cloudmail,remail,xigua",
+        "label": "邮箱来源", "help": "可填单个或多个，逗号分隔并按顺序兜底：outlook,generic_api,imap,cloudflare_domain,cloudflare,gptmail,mailnest,cloudmail,remail,xigua,mailcode",
     },
     {
         "key": "IMAP_MAILBOX", "file": "email.py", "type": "str", "group": "邮箱 / OTP",
@@ -469,6 +469,27 @@ EDITABLE_FIELDS = [
     {
         "key": "CLOUDMAIL_RANDOM_LOCAL_LENGTH", "file": "email.py", "type": "int", "group": "邮箱 / OTP",
         "label": "CloudMail随机名前缀长度", "help": "生成邮箱 local-part 的长度，建议 10-16",
+    },
+    {
+        "key": "MAILCODE_API_BASE", "file": "email.py", "type": "str", "group": "邮箱 / OTP",
+        "label": "MailCode 服务地址", "help": "可自定义服务地址，默认 https://mailcode.bzb.qzz.io；填写站点根地址或 /api/open/v1",
+    },
+    {
+        "key": "MAILCODE_API_KEY", "file": "email.py", "type": "str", "group": "邮箱 / OTP",
+        "label": "MailCode API Key", "help": "在服务端 API 密钥页面创建；需要购买和读取权限，密钥保存在 .env",
+        "storage": "env", "secret": True,
+    },
+    {
+        "key": "MAILCODE_PRODUCT_ID", "file": "email.py", "type": "str", "group": "邮箱 / OTP",
+        "label": "MailCode 商品 ID", "help": "查询 /api/open/v1/products 返回的 id；每个注册任务仅购买一个邮箱，不自动切换商品",
+    },
+    {
+        "key": "MAILCODE_REQUEST_TIMEOUT", "file": "email.py", "type": "int", "group": "邮箱 / OTP",
+        "label": "MailCode 请求超时(秒)", "help": "单次 HTTP 请求超时，默认 20 秒",
+    },
+    {
+        "key": "MAILCODE_CHANNEL_WAIT_SECONDS", "file": "email.py", "type": "int", "group": "邮箱 / OTP",
+        "label": "MailCode 通道准备超时(秒)", "help": "购买后先初始化 IMAP 并等待 READY，再将邮箱交给注册流程；默认 60 秒",
     },
     {
         "key": "REMAIL_API_BASE", "file": "email.py", "type": "str", "group": "邮箱 / OTP",

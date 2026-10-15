@@ -57,6 +57,7 @@ IPWO 住宅代理提供覆盖195+国家和地区的住宅 IP 资源，支持多�
 - 通用 API 邮箱：`email----取码地址`
 - 通用 IMAP 邮箱池：每行 `邮箱----IMAP密码` 或 `邮箱:IMAP密码`，服务器、端口和 SSL 在导入界面统一配置
 - GPTMail 临时邮箱 API：运行时随机生成邮箱并自动收取验证码
+- 域名邮箱 MailCode：自定义服务地址、幂等购买邮箱并按游标自动收码（`mailcode`）
 - Remail 开放 API：按项目下单短效邮箱并自动收取验证码（`remail`）
 - `EMAIL_SOURCE` 支持多个来源组合，例如：
 
@@ -382,6 +383,28 @@ Cloudflare Email Routing 需要把域名邮件转发到 QQ 邮箱。此模式不
 
 - `api-key`获取页面：https://mailnest.top/account
 - 项目代码获取页面：https://mailnest.top/buy-email。默认为`chatgpt001`，可以直接使用
+
+#### 域名邮箱 MailCode
+
+在「配置 → 邮箱 / OTP → 域名邮箱 MailCode」填写服务地址、API Key 和商品 ID。保存服务地址与密钥后，可点击「查询商品与余额」查看商品 ID、价格和库存（查询不会购买）。服务地址支持自建域名、IP/端口，也兼容带 `/api/open/v1` 的地址。
+
+```dotenv
+USE_EMAIL_SERVICE=True
+EMAIL_SOURCE="mailcode"
+MAILCODE_API_BASE="https://mailcode.bzb.qzz.io"
+MAILCODE_API_KEY="你的_API_KEY"
+MAILCODE_PRODUCT_ID="product_a3783a0ead074b4091631b9ad04153f9"
+MAILCODE_REQUEST_TIMEOUT=20
+MAILCODE_CHANNEL_WAIT_SECONDS=60
+```
+
+API Key 需要商品、余额、邮箱读取及 `orders:write` 等对应权限。每次任务领取一个指定商品的邮箱，购买结果从 `data.items[0]` 读取；不自动换商品、不申请退款。购买后先调用取码接口按需初始化 IMAP，通道 READY 后才返回邮箱，让注册流程触发验证码发送。
+
+网络超时、429 或服务错误重试时复用原幂等键和请求内容，遵循 `Retry-After`。待确认订单保存在 `cache/mailcode/purchases/`，重启后继续原请求，避免重复扣费；已购但通道准备失败也不会再次购买。该目录不要在订单结果未确认时删除。同一服务配置的领取流程在本进程串行执行；不要让多个进程共用同一缓存目录并同时领取。
+
+验证码按邮箱分别持久化服务端 `next_sequence`（`cache/mailcode/contexts/`），不加 1，不按验证码数字去重，保留如 `012345` 的前导零；按发送时间和过期时间过滤旧码。默认至少间隔 5 秒查询，`has_more=true` 时继续分页。重启后可从本地上下文恢复，缺少上下文时会分页查询已购邮箱，不会为查活重新购买。缓存只保存订单、邮箱和游标，不保存 API Key。
+
+客户端另提供商品、余额、订单列表/详情、已购邮箱、通道状态和取码链接导出/撤销函数，供本地集成调用。
 
 #### Remail 开放 API
 

@@ -2242,7 +2242,7 @@ async function setupAccountTotp(id, btn) {
 async function changeAccountEmails(ids) {
   ids = (ids || []).map(Number).filter(Boolean);
   if (!ids.length) { showToast('请先选择账号'); return; }
-  const source = prompt('请输入新邮箱来源：\noutlook / generic_api / imap / cloudflare_domain / cloudflare / gptmail / mailnest / cloudmail / remail / xigua', 'outlook');
+  const source = prompt('请输入新邮箱来源：\noutlook / generic_api / imap / cloudflare_domain / cloudflare / gptmail / mailnest / cloudmail / remail / mailcode / xigua', 'outlook');
   if (!source) return;
   try {
     const url = ids.length === 1 ? `/api/accounts/${ids[0]}/change-email` : '/api/accounts/change-email-bulk';
@@ -3388,9 +3388,27 @@ function renderConfigField(f) {
   const decorated = f.external_url
     ? `<div class="config-field-wrap">${field}${renderConfigExternalLink(f)}</div>`
     : field;
-  return decorated + renderConfigRecommendedLinks(f);
+  const mailCodeTools = f.key === 'MAILCODE_PRODUCT_ID'
+    ? '<div><button type="button" class="btn" onclick="loadMailCodeCatalog(this)">查询商品与余额（请先保存配置）</button><pre style="white-space:pre-wrap" hidden></pre></div>' : '';
+  return decorated + renderConfigRecommendedLinks(f) + mailCodeTools;
 }
 
+async function loadMailCodeCatalog(btn) {
+  const output = btn.nextElementSibling;
+  btn.disabled = true;
+  output.hidden = false;
+  output.textContent = '正在查询已保存的 MailCode 服务地址...';
+  try {
+    const result = await api('/api/mailcode/catalog');
+    if (!result.ok) throw new Error(result.error || '查询失败');
+    const products = (result.products || []).map(p => `${p.name} | 商品 ID: ${p.id} | 单价: ${p.price} 积分 | 库存: ${p.stock} | 启用: ${p.enabled}`);
+    output.textContent = `余额: ${result.wallet?.balance ?? '-'} 积分\n${products.join('\n') || '暂无商品'}`;
+  } catch (e) {
+    output.textContent = '查询失败：' + e.message;
+  } finally {
+    btn.disabled = false;
+  }
+}
 function renderConfigExternalLink(f) {
   const url = String(f.external_url || '').trim();
   if (!/^https?:\/\//i.test(url)) return '';
@@ -3434,6 +3452,7 @@ function emailConfigSectionForKey(key) {
   if (key.startsWith('GPTMAIL_')) return ['GPTMail', 'GPTMail 临时邮箱 API 配置'];
   if (key.startsWith('MAIL_NEST_')) return ['MailNest', 'MailNest / 迈巢临时邮箱 API 配置'];
   if (key.startsWith('CLOUDMAIL_')) return ['CloudMail', 'CloudMail 域名随机邮箱、Token 和收信 API 配置'];
+  if (key.startsWith('MAILCODE_')) return ['域名邮箱 MailCode', '自定义服务地址、商品购买与自动取码'];
   if (key.startsWith('REMAIL_')) return ['Remail', 'Remail 开放 API、项目下单和取件配置'];
   if (key.startsWith('XIGUA_')) return ['西瓜', '西瓜邮箱接码 API、项目方案和取件配置'];
   if (key.startsWith('OUTLOOK_')) return ['Outlook 邮箱池', 'Outlook 邮箱池和取件模式配置'];
@@ -3508,7 +3527,7 @@ function renderConfigFields(fields) {
       CONFIG_EMAIL_ACTIVE_SECTION,
       v => { CONFIG_EMAIL_ACTIVE_SECTION = v; },
       emailConfigSectionForKey,
-      ['通用邮箱 / OTP', 'GPTMail', 'MailNest', 'CloudMail', 'Remail', '西瓜', 'Outlook 邮箱池', 'Cloudflare 域名邮箱', '其他邮箱配置'],
+      ['通用邮箱 / OTP', 'GPTMail', 'MailNest', 'CloudMail', 'Remail', '域名邮箱 MailCode', '西瓜', 'Outlook 邮箱池', 'Cloudflare 域名邮箱', '其他邮箱配置'],
       'email-config-section'
     );
   }

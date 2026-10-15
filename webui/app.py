@@ -3931,7 +3931,7 @@ def create_app(auth_code: str | None = None) -> Flask:
             }
             active = sum(1 for item in by_id.values() if item.get("state") in {"queued", "refreshing", "ready"})
             failed = sum(1 for item in by_id.values() if item.get("state") in {"failed", "conflict", "ambiguous"})
-            completed = sum(1 for item in by_id.values() if item.get("state") == "replaced")
+            completed = sum(1 for item in by_id.values() if item.get("state") in {"replaced", "deleted"})
             missing = max(0, submitted - active - failed - completed)
             failed += missing
             progress = (
@@ -3965,7 +3965,7 @@ def create_app(auth_code: str | None = None) -> Flask:
             completed=completed,
             failed=failed,
             skipped=initial_skipped,
-            error="" if outcome == "success" else "部分账号未完成查活或精确远端 ID 写回",
+            error="" if outcome == "success" else "部分账号未完成查活、精确远端 ID 写回或废号删除",
         )
 
     credential_health_scheduler = CredentialHealthScheduler(

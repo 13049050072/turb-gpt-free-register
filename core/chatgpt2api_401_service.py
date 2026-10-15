@@ -19,8 +19,8 @@ _MAX_ID = 160
 _MAX_REASON = 240
 _MAX_ITEMS = 5_000
 _WORKERS = 5
-_STATES = {"pending", "queued", "refreshing", "ready", "replaced", "failed", "ambiguous", "conflict"}
-_FAILURE_STAGES = {"", "restart", "pre_liveness", "liveness", "pre_writeback", "writeback"}
+_STATES = {"pending", "queued", "refreshing", "ready", "replaced", "deleted", "failed", "ambiguous", "conflict"}
+_FAILURE_STAGES = {"", "restart", "pre_liveness", "liveness", "pre_writeback", "writeback", "pre_delete", "delete"}
 # Only dedicated secret endpoints are authoritative for credential evidence.
 # Email is verified by list mapping; password/client_id/last_refresh/id_token are
 # sanitized or lack a supported getter and must not be guessed.
@@ -211,15 +211,17 @@ class ChatGPT2API401Service:
         list_remote_fn: Callable[[], list[dict]] | None = None,
         snapshot_fn: Callable[[str], dict] | None = None,
         patch_fn: Callable[[str, str], object] | None = None,
+        delete_fn: Callable[[str], object] | None = None,
         list_local_fn: Callable[[], list[dict]] | None = None,
         liveness_fn: Callable[[int], dict] | None = None,
         audit_path: str | Path | None = None,
     ) -> None:
-        if list_remote_fn is None or snapshot_fn is None or patch_fn is None:
+        if list_remote_fn is None or snapshot_fn is None or patch_fn is None or delete_fn is None:
             client = ChatGPT2APIAdminClient()
         self._list_remote_fn = list_remote_fn or client.list_accounts
         self._snapshot_fn = snapshot_fn or client.credential_snapshot
         self._patch_fn = patch_fn or client.patch_access_token
+        self._delete_fn = delete_fn or client.delete_account
         self._list_local_fn = list_local_fn or _default_local_accounts
         self._liveness_fn = liveness_fn or liveness_runner.run_liveness_check
         self._audit_path = Path(audit_path) if audit_path is not None else Path(__file__).resolve().parent.parent / "chatgpt2api_401_audit.json"
@@ -302,6 +304,7 @@ class ChatGPT2API401Service:
             "refresh_started_at": _text(raw.get("refresh_started_at"), 64),
             "refresh_completed_at": _text(raw.get("refresh_completed_at"), 64),
             "replaced_at": _text(raw.get("replaced_at"), 64),
+            "deleted_at": _text(raw.get("deleted_at"), 64),
             "retryable": bool(raw.get("retryable")) and state in {"pending", "failed"},
             "replaceable": bool(raw.get("replaceable")) and state == "ready",
         }
@@ -446,6 +449,7 @@ class ChatGPT2API401Service:
             "refresh_started_at": clean["refresh_started_at"],
             "refresh_completed_at": clean["refresh_completed_at"],
             "replaced_at": clean["replaced_at"],
+            "deleted_at": clean["deleted_at"],
             "retryable": clean["retryable"],
             "replaceable": clean["replaceable"],
         }
@@ -460,7 +464,7 @@ class ChatGPT2API401Service:
             "workers": _WORKERS,
             "queued": counts["queued"],
             "active": counts["refreshing"],
-            "completed": counts["replaced"],
+            "completed": counts["replaced"] + counts["deleted"],
             "failed": counts["failed"] + counts["conflict"],
         }
         return {
@@ -638,6 +642,7 @@ class ChatGPT2API401Service:
                             "refresh_started_at": "",
                             "refresh_completed_at": "",
                             "replaced_at": "",
+                            "deleted_at": "",
                             "retryable": False,
                             "replaceable": False,
                         })
@@ -752,6 +757,13 @@ class ChatGPT2API401Service:
                 })
                 return
 
+            if _text((local or {}).get("live_check_status"), 32).lower() == "deactivated":
+                # A persisted deactivated verdict is terminal; another login only
+                # repeats the OTP flow and cannot revive the account.
+                verdict = _text((local or {}).get("live_check_error"), 64) or "account_deactivated"
+                self._delete_deactivated_locked(remote_id, item, verdict)
+                return
+
             before_local_sha = _hash_token((local or {}).get("access_token"))
             self._set_item(remote_id, {
                 "state": "refreshing",
@@ -826,6 +838,10 @@ class ChatGPT2API401Service:
                     "replaceable": False,
                 })
                 return
+            if isinstance(liveness, dict) and liveness.get("status") == "deactivated":
+                verdict = _text(liveness.get("error"), 64) or "account_deactivated"
+                self._delete_deactivated_locked(remote_id, item, verdict)
+                return
             if failure:
                 self._set_item(remote_id, {
                     "state": "failed",
@@ -865,6 +881,77 @@ class ChatGPT2API401Service:
                     "retryable": False,
                     "replaceable": False,
                 })
+
+    def _delete_deactivated_locked(self, remote_id: str, item: dict, verdict: str) -> None:
+        """Delete the exact locked remote ID once the local account is confirmed deactivated.
+
+        Callers hold the operation lock. The writeback mapping and old AT/RT
+        evidence gates still apply, so a remote account rotated elsewhere is
+        never deleted.
+        """
+        email = item["email"]
+        local_id = item["local_account_id"]
+        failure = ""
+        try:
+            by_remote_id, by_remote_email = self._remote_maps(list(self._list_remote_fn() or []))
+            by_local_id, by_local_email = self._local_maps(list(self._list_local_fn() or []))
+            local_matches = by_local_id.get(local_id, [])
+            local = local_matches[0] if len(local_matches) == 1 else None
+            if len(by_remote_id.get(remote_id, [])) != 1 or len(by_remote_email.get(email, [])) != 1:
+                failure = "删除前远端 ID 或邮箱映射已变化"
+            elif local is None or _email(local.get("email")) != email or len(by_local_email.get(email, [])) != 1:
+                failure = "删除前本地账号映射已变化"
+            elif _text(local.get("live_check_status"), 32).lower() != "deactivated":
+                failure = "本地账号未持久化废号结论，禁止删除远端"
+            else:
+                snapshot = self._normalize_snapshot(self._snapshot_fn(remote_id))
+                if not self._snapshot_complete(snapshot, remote_id):
+                    failure = "删除前远端快照不完整或账号 ID 不一致"
+                elif snapshot["at_sha256"] != item["old_at_sha256"]:
+                    failure = "删除前远端旧 AT 已变化，禁止删除"
+                elif snapshot["preserved_sha256"] != item["preserved_sha256"]:
+                    failure = "删除前远端保留字段已变化，禁止删除"
+        except Exception as exc:
+            failure = _reason(exc, "删除前快照复核失败")
+        if failure:
+            self._set_item(remote_id, {
+                "state": "conflict",
+                "reason": failure,
+                "failure_stage": "pre_delete",
+                "new_at_sha256": "",
+                "refresh_completed_at": _now(),
+                "retryable": False,
+                "replaceable": False,
+            })
+            return
+
+        try:
+            self._delete_fn(remote_id)
+            after_by_id, _ = self._remote_maps(list(self._list_remote_fn() or []))
+            if after_by_id.get(remote_id):
+                raise RuntimeError("删除后锁定的远端 ID 仍然存在")
+        except Exception as exc:
+            self._set_item(remote_id, {
+                "state": "failed",
+                "reason": _reason(exc, "远端废号删除失败"),
+                "failure_stage": "delete",
+                "new_at_sha256": "",
+                "refresh_completed_at": _now(),
+                "retryable": True,
+                "replaceable": False,
+            })
+            return
+
+        self._set_item(remote_id, {
+            "state": "deleted",
+            "reason": _reason(f"查活确认废号（{verdict}），已从 ChatGPT2API 删除锁定远端 ID", "已删除废号"),
+            "failure_stage": "",
+            "new_at_sha256": "",
+            "refresh_completed_at": _now(),
+            "deleted_at": _now(),
+            "retryable": False,
+            "replaceable": False,
+        })
 
     def replace(self, values: object, *, opt_in: bool = False, limit: int = _MAX_ITEMS) -> dict:
         selected_ids = _selected_ids(values, limit=limit)

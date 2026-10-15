@@ -340,6 +340,110 @@ class ChatGPT2API401ServiceTests(unittest.TestCase):
         self.assertEqual("liveness", item["failure_stage"])
         self.assertEqual([], self.patches)
 
+    def delete_remote(self, remote_id):
+        self.deletes.append(remote_id)
+        self.remote[:] = [row for row in self.remote if row["remote_id"] != remote_id]
+        return {"ok": True, "remote_id": remote_id}
+
+    def deactivated_liveness(self, local_id):
+        self.liveness_calls.append(local_id)
+        local = next(row for row in self.local if row["id"] == local_id)
+        local["live_check_status"] = "deactivated"
+        return {"ok": False, "status": "deactivated", "error": "account_deactivated"}
+
+    def test_deactivated_liveness_deletes_exact_locked_remote_id(self):
+        self.deletes = []
+        self.remote.append({
+            "remote_id": "remote-healthy",
+            "email": "two@example.com",
+            "invalid": False,
+            "access_token": "healthy-secret",
+            "refresh_token": "healthy-refresh",
+        })
+        service = self.service(liveness_fn=self.deactivated_liveness, delete_fn=self.delete_remote)
+        service.detect()
+        self.enqueue(service)
+        final = self.wait_terminal(service, ["deleted"])
+        item = final["items"][0]
+        self.assertEqual([7], self.liveness_calls)
+        self.assertEqual(["remote-old"], self.deletes)
+        self.assertEqual([], self.patches)
+        self.assertEqual(["remote-healthy"], [row["remote_id"] for row in self.remote])
+        self.assertFalse(item["retryable"])
+        self.assertTrue(item["deleted_at"])
+        self.assertIn("account_deactivated", item["reason"])
+        self.assertEqual(1, final["progress"]["completed"])
+        self.assertEqual(0, final["progress"]["failed"])
+
+    def test_local_deactivated_account_deletes_without_new_liveness(self):
+        self.deletes = []
+        self.local[0]["live_check_status"] = "deactivated"
+        service = self.service(delete_fn=self.delete_remote)
+        service.detect()
+        self.enqueue(service)
+        self.wait_terminal(service, ["deleted"])
+        self.assertEqual([], self.liveness_calls)
+        self.assertEqual(["remote-old"], self.deletes)
+        self.assertEqual([], self.remote)
+
+    def test_deactivated_delete_blocked_when_remote_at_changed(self):
+        self.deletes = []
+
+        def rotate_during_liveness(local_id):
+            self.remote[0]["access_token"] = "rotated-elsewhere"
+            return self.deactivated_liveness(local_id)
+
+        service = self.service(liveness_fn=rotate_during_liveness, delete_fn=self.delete_remote)
+        service.detect()
+        self.enqueue(service)
+        final = self.wait_terminal(service, ["conflict"])
+        self.assertEqual("pre_delete", final["items"][0]["failure_stage"])
+        self.assertEqual([], self.deletes)
+        self.assertEqual(1, len(self.remote))
+
+    def test_delete_failure_is_retryable_and_never_claims_deleted(self):
+        self.deletes = []
+
+        def broken_delete(remote_id):
+            self.deletes.append(remote_id)
+            raise RuntimeError("ChatGPT2API 管理接口暂时不可用")
+
+        service = self.service(liveness_fn=self.deactivated_liveness, delete_fn=broken_delete)
+        service.detect()
+        self.enqueue(service)
+        final = self.wait_terminal(service, ["failed"])
+        item = final["items"][0]
+        self.assertEqual("delete", item["failure_stage"])
+        self.assertTrue(item["retryable"])
+        self.assertEqual(["remote-old"], self.deletes)
+        self.assertEqual(1, len(self.remote))
+
+    def test_delete_acknowledged_but_remote_row_remains_is_retryable_failed(self):
+        self.deletes = []
+
+        def ack_only(remote_id):
+            self.deletes.append(remote_id)
+            return {"ok": True, "remote_id": remote_id}
+
+        service = self.service(liveness_fn=self.deactivated_liveness, delete_fn=ack_only)
+        service.detect()
+        self.enqueue(service)
+        final = self.wait_terminal(service, ["failed"])
+        self.assertEqual("delete", final["items"][0]["failure_stage"])
+        self.assertTrue(final["items"][0]["retryable"])
+
+    def test_non_deactivated_liveness_failure_never_deletes(self):
+        self.deletes = []
+        service = self.service(
+            liveness_fn=lambda _local_id: {"ok": False, "status": "failed", "error": "ProxyError: timeout"},
+            delete_fn=self.delete_remote,
+        )
+        service.detect()
+        self.enqueue(service)
+        self.wait_terminal(service, ["failed"])
+        self.assertEqual([], self.deletes)
+        self.assertEqual(1, len(self.remote))
+
     def test_liveness_returned_token_must_equal_persisted_new_token(self):
         def mismatch(_local_id):
             self.local[0]["access_token"] = "persisted-token"

@@ -168,6 +168,42 @@ class ChatGPT2APIAdminTests(unittest.TestCase):
             self.assertEqual("conflict", captured.exception.category)
             self.assertEqual(409, captured.exception.status_code)
 
+    def test_delete_sends_exact_id_and_waits_until_account_is_gone(self):
+        calls = []
+        lookups = {"count": 0}
+
+        def request(method, path, body):
+            calls.append((method, path, body))
+            if method == "DELETE":
+                return {"progress_id": "progress-1", "target_ids": ["Remote-1"], "errors": []}
+            lookups["count"] += 1
+            if lookups["count"] < 2:
+                return {"item": {"id": "remote-1"}}
+            raise ChatGPT2APIAdminError("not found", status_code=404, category="not_found")
+
+        result = ChatGPT2APIAdminClient(request_fn=request).delete_account("remote-1", poll_interval=0)
+        self.assertEqual({"ok": True, "remote_id": "remote-1"}, result)
+        self.assertEqual(("DELETE", "/api/accounts", {"account_ids": ["remote-1"]}), calls[0])
+        self.assertEqual([("GET", "/api/accounts/remote-1", None)] * 2, calls[1:])
+
+    def test_delete_rejects_unconfirmed_target_or_lingering_account(self):
+        def unconfirmed(method, _path, _body):
+            if method == "DELETE":
+                return {"progress_id": "progress-1", "target_ids": ["other-id"]}
+            raise AssertionError("must not poll an unconfirmed delete")
+
+        def lingering(method, _path, _body):
+            if method == "DELETE":
+                return {"progress_id": "progress-1", "target_ids": ["remote-1"]}
+            return {"item": {"id": "remote-1"}}
+
+        for request in (unconfirmed, lingering):
+            with self.subTest(request=request.__name__), self.assertRaises(ChatGPT2APIAdminError) as captured:
+                ChatGPT2APIAdminClient(request_fn=request).delete_account(
+                    "remote-1", wait_seconds=0, poll_interval=0,
+                )
+            self.assertEqual("conflict", captured.exception.category)
+
     def test_request_failures_do_not_echo_credentials(self):
         def request(_method, _path, _body):
             raise RuntimeError("access_token=secret callback=https://example.test/cb?code=secret")

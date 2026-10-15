@@ -13,7 +13,7 @@
     .scheduler-grid{display:grid;grid-template-columns:minmax(200px,1fr) repeat(3,minmax(140px,auto));gap:12px;align-items:end}.scheduler-grid label{display:grid;gap:5px}.scheduler-meta{margin-top:12px;display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:10px}.scheduler-meta>div{border:1px solid var(--line);border-radius:7px;padding:9px 11px}.switch{display:flex!important;align-items:center;gap:9px;padding:9px 0}.switch input{width:18px;height:18px;padding:0}
     .counts{display:grid;grid-template-columns:repeat(auto-fit,minmax(105px,1fr));gap:9px;margin-top:14px}.metric{border:1px solid var(--line);border-radius:7px;padding:10px 12px}.metric b{display:block;font-size:20px}.notice{margin-top:12px;padding:10px 12px;border-left:3px solid #e2a73b;background:#fff8e8;color:#714b00}.notice.error{border-color:#e56b61;background:#fff3f2;color:var(--danger)}.notice.ok{border-color:#54b58a;background:#edfdf4;color:var(--ok)}
     .table-wrap{overflow:auto;padding:0}table{width:100%;border-collapse:collapse;min-width:1220px}th,td{border-bottom:1px solid #e9edf2;padding:11px 10px;text-align:left;vertical-align:top}th{font-size:12px;color:var(--muted);background:#f8fafc}tbody tr:last-child td{border-bottom:0}.id{max-width:260px;word-break:break-all;font:12px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace}
-    .badge{display:inline-block;padding:3px 8px;border-radius:999px;font-size:12px;font-weight:700}.pending{background:#fff5e5;color:var(--warn)}.queued,.refreshing{background:#edf4ff;color:#175cd3}.ready{background:#eef4ff;color:#3538cd}.replaced{background:#ecfdf3;color:var(--ok)}.failed,.ambiguous,.conflict{background:#fff1f0;color:var(--danger)}
+    .badge{display:inline-block;padding:3px 8px;border-radius:999px;font-size:12px;font-weight:700}.pending{background:#fff5e5;color:var(--warn)}.queued,.refreshing{background:#edf4ff;color:#175cd3}.ready{background:#eef4ff;color:#3538cd}.replaced,.deleted{background:#ecfdf3;color:var(--ok)}.failed,.ambiguous,.conflict{background:#fff1f0;color:var(--danger)}
     .preview{margin:12px 0 0;white-space:pre-wrap;word-break:break-all;background:#151b26;color:#e8edf5;border-radius:7px;padding:12px;max-height:260px;overflow:auto}.hidden{display:none}
     @media(max-width:900px){.top{flex-direction:column}.counts{grid-template-columns:repeat(2,minmax(0,1fr))}.wrap{padding:20px 12px 40px}.scheduler-grid,.scheduler-meta{grid-template-columns:1fr}}
   </style>
@@ -53,10 +53,11 @@
       <div class="metric"><span class="muted">待查活 / 重试</span><b id="pendingCount">0</b></div>
       <div class="metric"><span class="muted">历史待写回</span><b id="readyCount">0</b></div>
       <div class="metric"><span class="muted">已验证替换</span><b id="replacedCount">0</b></div>
+      <div class="metric"><span class="muted">已删除废号</span><b id="deletedCount">0</b></div>
       <div class="metric"><span class="muted">失败 / 冲突</span><b id="ambiguousCount">0</b></div>
       <div class="metric"><span class="muted">远端正常</span><b id="healthyCount">0</b></div>
     </div>
-    <div class="notice">“查活并写回”会把所有选中候选加入后台队列（固定并发 5），每个账号取得并持久化可验证的新 AT 后，自动只更新检测时锁定的 ChatGPT2API 远端 ID。RT 仅作为必须保持不变的摘要证据，不会写入远端。</div>
+    <div class="notice">“查活并写回”会把所有选中候选加入后台队列（固定并发 5），每个账号取得并持久化可验证的新 AT 后，自动只更新检测时锁定的 ChatGPT2API 远端 ID；查活确认 account_deactivated 等废号时，复核旧 AT/RT 摘要未变后删除该远端 ID。RT 仅作为必须保持不变的摘要证据，不会写入远端。</div>
     <div id="message"></div>
     <pre id="preview" class="preview hidden"></pre>
   </section>
@@ -77,7 +78,7 @@
   let pollDelay = 0;
   let stateLoading = false;
   const esc = value => String(value ?? '').replace(/[&<>"']/g, ch => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch]));
-  const labels = {pending:'待查活',queued:'队列等待',refreshing:'查活中',ready:'历史待写回',replaced:'已替换',failed:'查活失败',ambiguous:'映射不明确',conflict:'快照冲突'};
+  const labels = {pending:'待查活',queued:'队列等待',refreshing:'查活中',ready:'历史待写回',replaced:'已替换',deleted:'已删除废号',failed:'查活失败',ambiguous:'映射不明确',conflict:'快照冲突'};
   async function api(path, options={}) {
     const response = await fetch(path, {...options, headers:{'Content-Type':'application/json', ...(options.headers || {})}});
     const data = await response.json().catch(() => ({ok:false,error:`HTTP ${response.status}`}));
@@ -110,6 +111,7 @@
     $('#pendingCount').textContent = (counts.pending || 0) + (counts.failed || 0);
     $('#readyCount').textContent = counts.ready || 0;
     $('#replacedCount').textContent = counts.replaced || 0;
+    $('#deletedCount').textContent = counts.deleted || 0;
     $('#ambiguousCount').textContent = (counts.ambiguous || 0) + (counts.conflict || 0);
     $('#healthyCount').textContent = counts.healthy || 0;
     $('#checkedAt').textContent = data.checked_at ? `检测时间 ${new Date(data.checked_at).toLocaleString()} · 后台并发 ${progress.workers || 5}` : `尚未执行远端检测 · 后台并发 ${progress.workers || 5}`;
@@ -122,7 +124,7 @@
       <td class="id">${esc(item.remote_id)}</td><td>${esc(item.email || '—')}</td><td>${esc(item.local_account_id || '—')}</td>
       <td><span class="badge ${esc(item.state)}">${esc(labels[item.state] || item.state)}</span></td><td>${esc(item.reason)}</td>
       <td class="id">${esc(item.old_at_fingerprint || '—')}</td><td class="id">${esc(item.new_at_fingerprint || '—')}</td>
-      <td>${esc(item.replaced_at || item.refresh_completed_at || item.refresh_started_at || item.queued_at || item.detected_at || '—')}</td>
+      <td>${esc(item.replaced_at || item.deleted_at || item.refresh_completed_at || item.refresh_started_at || item.queued_at || item.detected_at || '—')}</td>
     </tr>`).join('') || '<tr><td colspan="9" class="muted">未发现可处理的 ChatGPT2API 失效账号。</td></tr>';
     const refreshIds = [...selected].filter(remoteId => items.some(item => item.remote_id === remoteId && item.retryable));
     const replaceIds = [...selected].filter(remoteId => items.some(item => item.remote_id === remoteId && item.replaceable));

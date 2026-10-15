@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import time
 from typing import Callable
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urlencode
@@ -182,7 +183,7 @@ class ChatGPT2APIAdminError(RuntimeError):
 
 
 class ChatGPT2APIAdminClient:
-    """List accounts, fingerprint credentials, and update one stable remote ID."""
+    """List accounts, fingerprint credentials, and update or delete one stable remote ID."""
 
     def __init__(self, request_fn: Callable[[str, str, dict | None], object] | None = None) -> None:
         self._request_fn = request_fn
@@ -393,6 +394,41 @@ class ChatGPT2APIAdminClient:
             raise ChatGPT2APIAdminError("ChatGPT2API 更新后的 RT 保留校验失败", status_code=409, category="conflict")
         self._snapshot_by_id[remote_id] = observed
         return {"ok": True, "remote_id": remote_id}
+
+    def delete_account(
+        self,
+        remote_id: str,
+        *,
+        wait_seconds: float = 15.0,
+        poll_interval: float = 0.5,
+    ) -> dict:
+        remote_id = _remote_id(remote_id)
+        if not remote_id:
+            raise ChatGPT2APIAdminError("ChatGPT2API 账号 ID 无效", status_code=400, category="validation")
+        payload = self._request("DELETE", "/api/accounts", {"account_ids": [remote_id]})
+        target_ids: list[str] = []
+        for container in _containers(payload):
+            values = container.get("target_ids")
+            if isinstance(values, list):
+                target_ids.extend(_remote_id(value).lower() for value in values)
+        if remote_id.lower() not in target_ids:
+            raise ChatGPT2APIAdminError("ChatGPT2API 未确认删除锁定账号", status_code=409, category="conflict")
+
+        # Deletion runs as a background operation upstream; success is claimed
+        # only after the exact ID detail endpoint reports 404.
+        encoded_id = quote(remote_id, safe="")
+        deadline = time.monotonic() + max(0.0, float(wait_seconds))
+        while True:
+            try:
+                self._request("GET", f"/api/accounts/{encoded_id}")
+            except ChatGPT2APIAdminError as exc:
+                if exc.category != "not_found":
+                    raise
+                self._snapshot_by_id.pop(remote_id, None)
+                return {"ok": True, "remote_id": remote_id}
+            if time.monotonic() >= deadline:
+                raise ChatGPT2APIAdminError("ChatGPT2API 删除后锁定账号仍存在", status_code=409, category="conflict")
+            time.sleep(max(0.0, float(poll_interval)))
 
 
 __all__ = ["ChatGPT2APIAdminClient", "ChatGPT2APIAdminError"]

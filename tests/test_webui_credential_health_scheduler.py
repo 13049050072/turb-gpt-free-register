@@ -282,6 +282,36 @@ class WebUICredentialHealthSchedulerTests(unittest.TestCase):
         self.assertEqual(1, result.completed)
         refresh.assert_called_once_with(["remote-exact-id"], opt_in=True, limit=5000)
 
+    def test_chatgpt2api_automatic_job_counts_deleted_deactivated_as_completed(self):
+        scheduler = self.app.extensions["credential_health_scheduler"]
+        fresh = {
+            "ok": True,
+            "items": [
+                {"remote_id": "replaced-id", "state": "pending", "retryable": True},
+                {"remote_id": "deleted-id", "state": "pending", "retryable": True},
+            ],
+        }
+        terminal = {
+            "ok": True,
+            "items": [
+                {"remote_id": "replaced-id", "state": "replaced"},
+                {"remote_id": "deleted-id", "state": "deleted"},
+            ],
+            "progress": {"queued": 0, "active": 0},
+        }
+        with patch(
+            "core.chatgpt2api_401_service.ChatGPT2API401Service.detect", return_value=fresh
+        ), patch(
+            "core.chatgpt2api_401_service.ChatGPT2API401Service.refresh",
+            return_value={"queued_count": 2, "submitted_ids": ["replaced-id", "deleted-id"], "skipped": []},
+        ), patch(
+            "core.chatgpt2api_401_service.ChatGPT2API401Service.state", return_value=terminal
+        ):
+            result = scheduler._jobs["chatgpt2api_401"]("deleted-run")
+        self.assertEqual("success", result.outcome)
+        self.assertEqual(2, result.completed)
+        self.assertEqual(0, result.failed)
+
     def test_chatgpt2api_automatic_job_observes_only_ids_accepted_by_this_round(self):
         scheduler = self.app.extensions["credential_health_scheduler"]
         fresh = {

@@ -1,0 +1,125 @@
+ChatGPT2API 401 deactivated-account deletion verification
+Generated: 2026-10-15T11:00:37Z
+Base commit: 2875c1f60ec7d7a0abce851127d6d4bc9e1dc314
+
+GOAL
+- When liveness returns status=deactivated (e.g. account_deactivated), delete the exact locked ChatGPT2API remote ID instead of leaving a retryable 'failed' entry.
+- When the local row already has live_check_status=deactivated, skip a new login and delete directly.
+- Never delete when remote AT/RT evidence or ID/email mapping drifted (conflict, stage pre_delete).
+- Delete errors / unconfirmed target / row still listed -> retryable failed, stage delete.
+
+CHANGED SYMBOLS
+- core/chatgpt2api_admin.py: ChatGPT2APIAdminClient.delete_account (new): DELETE /api/accounts {account_ids:[id]}, require id in target_ids, poll GET /api/accounts/{id} until 404
+- core/chatgpt2api_401_service.py: _STATES += deleted; _FAILURE_STAGES += pre_delete, delete; __init__(delete_fn); entry field deleted_at;
+  _refresh_and_replace: pre-liveness branch on local live_check_status=='deactivated'; post-liveness branch on liveness['status']=='deactivated';
+  _delete_deactivated_locked (new); _state_locked progress.completed = replaced + deleted
+- webui/app.py: _run_chatgpt2api_401_inspection counts state in {replaced, deleted} as completed
+- webui/templates/chatgpt2api_401.html: deleted label/badge/metric, deleted_at time column
+- tests: 6 service tests, 2 adapter tests, 1 scheduler test; spec section 4.1 + error matrix rows
+
+PRODUCTION EVIDENCE (read-only, oracle container turb-gpt-free-register, 2026-10-15)
+- /data/chatgpt2api_401_audit.json remote_counts {'total': 130, 'invalid': 63, 'healthy': 67}
+- audit states: Counter({('failed', 'liveness'): 63}); reason: 63 x 'account_deactivated'
+- local DB for those 63: live_check_status=deactivated, live_check_error=account_deactivated
+- remote list for those 63: still present (status_category=abnormal, access_token_status=invalid)
+
+BASELINE HASHES (original)
+0233965787d98d749fe26815221809eecb6151f4afc5792d2924076e948aa722  core/chatgpt2api_admin.py
+edc0a48a9a51a9e467934dba2fb42413d05893422ad2b19c55501151f91072cf  core/chatgpt2api_401_service.py
+246f6fd78e7a30661a2c00c1e64047ada173d9838b71e33cf5f7a0bfd1f24432  webui/app.py
+eba01a4ef381aa18503eb6c74ba06966dcaeb359ced1277de629b7115a9abd07  webui/templates/chatgpt2api_401.html
+77f66af094cea88eeb8b203d79982ffabd73688c65397b510d166e566577aa6f  tests/test_chatgpt2api_401_service.py
+f30e687e2cfe939e578adc70a4dae66228d1d8d65451dc6cd82f2dedafb1f045  tests/test_chatgpt2api_401_admin.py
+98549bf9dc7d21acff07541e349f6502170055b380e4da4ef91d91948e300ee8  tests/test_webui_credential_health_scheduler.py
+aa42d88f66a0f1a4b0c9d9129c0281dd52ebd59499b3c605d548b88e61fc381a  .trellis/spec/backend/chatgpt2api-credential-rotation.md
+
+MODIFIED HASHES
+d16e95965fb51f2cbce42495ca15195594cc0cb9084cb494e3f484473247e9a1  core/chatgpt2api_admin.py
+4344f8b4fb8cef6e8f82597c419a452197db8443689c8c02f9dfb957800c3514  core/chatgpt2api_401_service.py
+dc4f737971fbda01d8ee497826ce8681e949a8de84a77069b4041b5712d5d7c4  webui/app.py
+dad8501d32fcf92896bee43c84e6baf6599d6e504a30ef50f5df5a58c3107a8c  webui/templates/chatgpt2api_401.html
+8a0830c707e30e718b3e650c886600d5cd5d06c03e46012a671c47eee57fa7f6  tests/test_chatgpt2api_401_service.py
+6840d53eb626b57947eb5156ebc161aabe399e2784e31e7dda3b8a0e30819346  tests/test_chatgpt2api_401_admin.py
+de0492e9b6719d5951e2f31e05ecc7d7457d48403535448968a49bbe352af7f1  tests/test_webui_credential_health_scheduler.py
+cf7ed92409f98637dac440606c038459e9fcf39bad94e87b109dc9133f8a9b92  .trellis/spec/backend/chatgpt2api-credential-rotation.md
+
+ROLLBACK HASHES (restored copy)
+0233965787d98d749fe26815221809eecb6151f4afc5792d2924076e948aa722  core/chatgpt2api_admin.py
+edc0a48a9a51a9e467934dba2fb42413d05893422ad2b19c55501151f91072cf  core/chatgpt2api_401_service.py
+246f6fd78e7a30661a2c00c1e64047ada173d9838b71e33cf5f7a0bfd1f24432  webui/app.py
+eba01a4ef381aa18503eb6c74ba06966dcaeb359ced1277de629b7115a9abd07  webui/templates/chatgpt2api_401.html
+77f66af094cea88eeb8b203d79982ffabd73688c65397b510d166e566577aa6f  tests/test_chatgpt2api_401_service.py
+f30e687e2cfe939e578adc70a4dae66228d1d8d65451dc6cd82f2dedafb1f045  tests/test_chatgpt2api_401_admin.py
+98549bf9dc7d21acff07541e349f6502170055b380e4da4ef91d91948e300ee8  tests/test_webui_credential_health_scheduler.py
+aa42d88f66a0f1a4b0c9d9129c0281dd52ebd59499b3c605d548b88e61fc381a  .trellis/spec/backend/chatgpt2api-credential-rotation.md
+restored-hashes-equal-original
+
+SAME-INPUT PROBE COMMAND
+.venv/bin/python -I .trellis/tasks/10-15-chatgpt2api-401-deactivated-delete/artifacts/PROBE_deactivated.py <tree>
+
+BASELINE  tree=/Users/jiangdk/code/personal/turb-gpt-free-register (original code)  exit=0
+stdout: {"delete_calls": [], "delete_fn_supported": false, "failure_stage": "liveness", "liveness_calls": [7], "patch_calls": [], "progress_completed": 0, "progress_failed": 1, "reason": "account_deactivated", "remote_ids_left": ["remote-dead", "remote-ok"], "retryable": true, "state": "failed"}
+stderr: 
+
+MODIFIED  tree=/Users/jiangdk/code/personal/turb-gpt-free-register  exit=0
+stdout: {"delete_calls": ["remote-dead"], "delete_fn_supported": true, "failure_stage": "", "liveness_calls": [7], "patch_calls": [], "progress_completed": 1, "progress_failed": 0, "reason": "查活确认废号（account_deactivated），已从 ChatGPT2API 删除锁定远端 ID", "remote_ids_left": ["remote-ok"], "retryable": false, "state": "deleted"}
+stderr: 
+
+ROLLBACK  sh .trellis/tasks/10-15-chatgpt2api-401-deactivated-delete/artifacts/ROLLBACK.sh <scratchpad>/rollback-copy  exit=0
+rollback stdout: rollback complete: restored 8 paths from /Users/jiangdk/code/personal/turb-gpt-free-register/.trellis/tasks/10-15-chatgpt2api-401-deactivated-delete/artifacts/BASELINE.tar.gz
+rollback stderr: 
+probe on restored copy exit=0
+stdout: {"delete_calls": [], "delete_fn_supported": false, "failure_stage": "liveness", "liveness_calls": [7], "patch_calls": [], "progress_completed": 0, "progress_failed": 1, "reason": "account_deactivated", "remote_ids_left": ["remote-dead", "remote-ok"], "retryable": true, "state": "failed"}
+stderr: 
+restored probe output == baseline probe output: yes (diff empty)
+
+REAPPLY  patch -p1 < DIFF_FILE.patch on restored copy  exit=0
+reapplied hashes == MODIFIED HASHES: yes; reapplied probe output == MODIFIED output: yes
+
+FOCUSED TESTS (new tests on original code)  exit=1
+ERROR: test_deactivated_delete_blocked_when_remote_at_changed (tests.test_chatgpt2api_401_service.ChatGPT2API401ServiceTests.test_deactivated_delete_blocked_when_remote_at_changed)
+ERROR: test_deactivated_liveness_deletes_exact_locked_remote_id (tests.test_chatgpt2api_401_service.ChatGPT2API401ServiceTests.test_deactivated_liveness_deletes_exact_locked_remote_id)
+ERROR: test_delete_acknowledged_but_remote_row_remains_is_retryable_failed (tests.test_chatgpt2api_401_service.ChatGPT2API401ServiceTests.test_delete_acknowledged_but_remote_row_remains_is_retryable_failed)
+ERROR: test_delete_failure_is_retryable_and_never_claims_deleted (tests.test_chatgpt2api_401_service.ChatGPT2API401ServiceTests.test_delete_failure_is_retryable_and_never_claims_deleted)
+ERROR: test_local_deactivated_account_deletes_without_new_liveness (tests.test_chatgpt2api_401_service.ChatGPT2API401ServiceTests.test_local_deactivated_account_deletes_without_new_liveness)
+ERROR: test_non_deactivated_liveness_failure_never_deletes (tests.test_chatgpt2api_401_service.ChatGPT2API401ServiceTests.test_non_deactivated_liveness_failure_never_deletes)
+ERROR: test_delete_rejects_unconfirmed_target_or_lingering_account (tests.test_chatgpt2api_401_admin.ChatGPT2APIAdminTests.test_delete_rejects_unconfirmed_target_or_lingering_account) (request='unconfirmed')
+ERROR: test_delete_rejects_unconfirmed_target_or_lingering_account (tests.test_chatgpt2api_401_admin.ChatGPT2APIAdminTests.test_delete_rejects_unconfirmed_target_or_lingering_account)
+ERROR: test_delete_sends_exact_id_and_waits_until_account_is_gone (tests.test_chatgpt2api_401_admin.ChatGPT2APIAdminTests.test_delete_sends_exact_id_and_waits_until_account_is_gone)
+FAIL: test_chatgpt2api_automatic_job_counts_deleted_deactivated_as_completed (tests.test_webui_credential_health_scheduler.WebUICredentialHealthSchedulerTests.test_chatgpt2api_automatic_job_counts_deleted_deactivated_as_completed)
+Ran 57 tests in 0.837s
+FAILED (failures=1, errors=9)
+
+FOCUSED TESTS (modified)  exit=0
+Command: .venv/bin/python -m unittest tests.test_chatgpt2api_401_service tests.test_chatgpt2api_401_admin tests.test_webui_credential_health_scheduler tests.test_chatgpt2api_401_templates tests.test_webui_chatgpt2api_401
+Ran 69 tests in 1.098s
+OK
+
+FULL SUITE (modified)  exit=1
+Command: .venv/bin/python -m unittest discover -s tests
+ERROR: test_ensure_authorize_context_matches_20260914_capture_shape (test_chatgpt_auth_context.ChatgptAuthContextTests.test_ensure_authorize_context_matches_20260914_capture_shape)
+FAIL: test_restore_context_requires_exact_email_match (test_remail_client.RemailClientTests.test_restore_context_requires_exact_email_match)
+Ran 543 tests in 12.073s
+FAILED (failures=1, errors=1)
+Both failures reproduce on the pristine restored copy (pre-existing, unrelated):
+ERROR: test_ensure_authorize_context_matches_20260914_capture_shape (tests.test_chatgpt_auth_context.ChatgptAuthContextTests.test_ensure_authorize_context_matches_20260914_capture_shape)
+KeyError: 'ext-oai-did'
+FAIL: test_restore_context_requires_exact_email_match (tests.test_remail_client.RemailClientTests.test_restore_context_requires_exact_email_match)
+AssertionError: unexpectedly None
+Ran 2 tests in 0.001s
+FAILED (failures=1, errors=1)
+
+STATIC CHECKS
+- git diff --check: PASS
+- py_compile core/chatgpt2api_admin.py core/chatgpt2api_401_service.py webui/app.py: PASS
+- node --check on extracted template <script>: exit 0
+
+NOT DONE
+- No deployment to Oracle and no real remote deletion performed in this verification.
+
+ARTIFACT HASHES
+fc43bc512711a623b6030b6f0a531834282f80cffda5c84eade31a44162f99ac  MODIFIED_FILE.tar.gz
+2b916c1b732af1e55fba92dfe12c8f466c83ec75a9ba58d581ec6e0c3de82c22  DIFF_FILE.patch
+71b60fd78d42b5bb09d9f889a0f40a4dcd57a9eb46de06ff2d05528cf5042e1a  ROLLBACK.sh
+2f53e6c67014ca38e091b35667b6b6aa961fac386c5f91d6365661fd2ee3ba89  BASELINE.tar.gz
+fe2e06454ba91adbaaa2ca999179c55af55fa45bf267b29910c0ca30f459e045  PROBE_deactivated.py

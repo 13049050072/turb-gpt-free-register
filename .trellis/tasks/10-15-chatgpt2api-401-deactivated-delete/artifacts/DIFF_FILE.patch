@@ -1,0 +1,593 @@
+diff --git a/.trellis/spec/backend/chatgpt2api-credential-rotation.md b/.trellis/spec/backend/chatgpt2api-credential-rotation.md
+index 3849e98..82894dd 100644
+--- a/.trellis/spec/backend/chatgpt2api-credential-rotation.md
++++ b/.trellis/spec/backend/chatgpt2api-credential-rotation.md
+@@ -18,6 +18,7 @@ Management adapter:
+ ChatGPT2APIAdminClient.list_accounts(*, page_size: int = 500, max_pages: int = 20) -> list[dict]
+ ChatGPT2APIAdminClient.credential_snapshot(remote_id: str) -> dict
+ ChatGPT2APIAdminClient.patch_access_token(remote_id: str, access_token: str) -> dict
++ChatGPT2APIAdminClient.delete_account(remote_id: str, *, wait_seconds: float = 15.0, poll_interval: float = 0.5) -> dict
+ ```
+ 
+ Liveness adapter and service:
+@@ -57,21 +58,28 @@ GET  /api/accounts?page=<n>&page_size=<n>
+ GET  /api/accounts/{account_id}/access-token
+ GET  /api/accounts/{account_id}/refresh-token
+ POST /api/accounts/update  {"id": <exact remote ID>, "access_token": <new AT>}
++DELETE /api/accounts        {"account_ids": [<exact remote ID>]}
++GET  /api/accounts/{account_id}   # 404 confirms deletion
+ ```
+ 
+ ### 3. Queue and State Contract
+ 
+ `POST /api/chatgpt2api-401/refresh` accepts 1 through 5000 remote IDs and requires `confirm_replace is True`. A valid request persists all accepted entries as `queued`, submits them to a process-local `ThreadPoolExecutor(max_workers=5)`, and returns HTTP 202 without waiting for any liveness call. The in-process outstanding queue is bounded to 5000 jobs.
+ 
+-Only `pending` and retryable `failed` entries may be queued. `queued`, `refreshing`, `ready`, `replaced`, `ambiguous`, and `conflict` entries cannot be submitted again. Duplicate and non-actionable IDs are returned in a bounded `skipped` array without credentials. Detection returns HTTP 409 while any item is `queued` or `refreshing`, so it cannot replace active audit entries.
++Only `pending` and retryable `failed` entries may be queued. `queued`, `refreshing`, `ready`, `replaced`, `deleted`, `ambiguous`, and `conflict` entries cannot be submitted again. Duplicate and non-actionable IDs are returned in a bounded `skipped` array without credentials. Detection returns HTTP 409 while any item is `queued` or `refreshing`, so it cannot replace active audit entries.
+ 
+ The persisted state machine is:
+ 
+ ```text
+ pending -> queued -> refreshing -> ready -> replaced
+-                         |           |
+-                         v           v
+-                       failed      conflict
++             |           |           |
++             |           v           v
++             |         failed      conflict
++             |           |
++             |           +-- liveness status=deactivated --+
++             +-- local live_check_status=deactivated ------+--> deleted
++                                                           |
++                                                           +--> conflict (pre_delete) / failed (delete, retryable)
+ 
+ pending/failed -- pre-liveness snapshot drift --> conflict
+ queued/refreshing -- process restart ----------> failed (retryable)
+@@ -87,7 +95,7 @@ queued/refreshing -- process restart ----------> failed (retryable)
+     "workers": 5,
+     "queued": 0,
+     "active": 0,
+-    "completed": 0,
++    "completed": 0,  # replaced + deleted
+     "failed": 0
+   }
+ }
+@@ -125,6 +133,17 @@ After liveness, remote writeback is serialized by the shared audit-path operatio
+ 
+ Writeback acknowledgement mismatch, exceptions, or post-write evidence mismatch become `conflict` at stage `writeback`. The system never claims success from the mutation response alone.
+ 
++### 4.1 Deactivated Account Deletion
++
++A deactivated account cannot be revived by a new AT, so the locked remote ID is deleted instead of being retried forever. Two triggers exist, both under the shared operation lock:
++
++- the pre-liveness local row already has `live_check_status == "deactivated"` (a persisted verdict from an earlier liveness or Codex check): liveness is skipped;
++- liveness returns `status == "deactivated"` (for example `account_deactivated`), which `update_account_liveness` persists locally.
++
++Before deleting, the service re-lists both sides and requires the same unique remote ID/email and local ID/email mapping, the local row still `deactivated`, and the remote AT hash and RT evidence still equal to the detection lock. Any drift becomes `conflict` at stage `pre_delete` and nothing is deleted, so an account rotated elsewhere is never removed.
++
++`DELETE /api/accounts` sends exactly `{"account_ids": [id]}`. The adapter requires the exact ID in `target_ids`, then polls `GET /api/accounts/{id}` until 404 (upstream deletion is a background operation). The service re-lists once more and requires the ID to be absent. Only then does state become `deleted` with `deleted_at`. Delete errors, unconfirmed targets, or a lingering row become retryable `failed` at stage `delete`; the retry reuses the persisted local verdict and does not log in again. Non-deactivated liveness failures never delete.
++
+ ### 5. Persistence and Confidentiality
+ 
+ `chatgpt2api_401_audit.json` uses create-exclusive temporary files, `fsync`, `os.replace`, and mode `0600` where supported. A symlink audit path writes beside the resolved target and preserves the symlink. Service instances sharing an audit path share one process-level `RLock` and reload persisted state before mutations.
+@@ -154,6 +173,11 @@ All ChatGPT2API-401 responses set `Cache-Control: no-store, max-age=0`, `Pragma:
+ | Post-update ID, email, AT, or RT evidence differs | `conflict`, retain safe audit evidence |
+ | Post-update evidence matches | `replaced` |
+ | Process starts with queued/refreshing audit rows | retryable `failed`, stage `restart` |
++| Liveness returns `deactivated`, evidence unchanged | exact-ID delete, 404 readback, `deleted` |
++| Local row already `deactivated` | no liveness, exact-ID delete, `deleted` |
++| Remote AT/RT or mapping drift before delete | `conflict`, stage `pre_delete`, no delete |
++| Delete error, unconfirmed target, or row still listed | retryable `failed`, stage `delete` |
++| Liveness fails without `deactivated` | retryable `failed`, never deletes |
+ 
+ ### 7. Required Tests
+ 
+diff --git a/core/chatgpt2api_401_service.py b/core/chatgpt2api_401_service.py
+index 2ed0d58..8f8a9b4 100644
+--- a/core/chatgpt2api_401_service.py
++++ b/core/chatgpt2api_401_service.py
+@@ -19,8 +19,8 @@ _MAX_ID = 160
+ _MAX_REASON = 240
+ _MAX_ITEMS = 5_000
+ _WORKERS = 5
+-_STATES = {"pending", "queued", "refreshing", "ready", "replaced", "failed", "ambiguous", "conflict"}
+-_FAILURE_STAGES = {"", "restart", "pre_liveness", "liveness", "pre_writeback", "writeback"}
++_STATES = {"pending", "queued", "refreshing", "ready", "replaced", "deleted", "failed", "ambiguous", "conflict"}
++_FAILURE_STAGES = {"", "restart", "pre_liveness", "liveness", "pre_writeback", "writeback", "pre_delete", "delete"}
+ # Only dedicated secret endpoints are authoritative for credential evidence.
+ # Email is verified by list mapping; password/client_id/last_refresh/id_token are
+ # sanitized or lack a supported getter and must not be guessed.
+@@ -211,15 +211,17 @@ class ChatGPT2API401Service:
+         list_remote_fn: Callable[[], list[dict]] | None = None,
+         snapshot_fn: Callable[[str], dict] | None = None,
+         patch_fn: Callable[[str, str], object] | None = None,
++        delete_fn: Callable[[str], object] | None = None,
+         list_local_fn: Callable[[], list[dict]] | None = None,
+         liveness_fn: Callable[[int], dict] | None = None,
+         audit_path: str | Path | None = None,
+     ) -> None:
+-        if list_remote_fn is None or snapshot_fn is None or patch_fn is None:
++        if list_remote_fn is None or snapshot_fn is None or patch_fn is None or delete_fn is None:
+             client = ChatGPT2APIAdminClient()
+         self._list_remote_fn = list_remote_fn or client.list_accounts
+         self._snapshot_fn = snapshot_fn or client.credential_snapshot
+         self._patch_fn = patch_fn or client.patch_access_token
++        self._delete_fn = delete_fn or client.delete_account
+         self._list_local_fn = list_local_fn or _default_local_accounts
+         self._liveness_fn = liveness_fn or liveness_runner.run_liveness_check
+         self._audit_path = Path(audit_path) if audit_path is not None else Path(__file__).resolve().parent.parent / "chatgpt2api_401_audit.json"
+@@ -302,6 +304,7 @@ class ChatGPT2API401Service:
+             "refresh_started_at": _text(raw.get("refresh_started_at"), 64),
+             "refresh_completed_at": _text(raw.get("refresh_completed_at"), 64),
+             "replaced_at": _text(raw.get("replaced_at"), 64),
++            "deleted_at": _text(raw.get("deleted_at"), 64),
+             "retryable": bool(raw.get("retryable")) and state in {"pending", "failed"},
+             "replaceable": bool(raw.get("replaceable")) and state == "ready",
+         }
+@@ -446,6 +449,7 @@ class ChatGPT2API401Service:
+             "refresh_started_at": clean["refresh_started_at"],
+             "refresh_completed_at": clean["refresh_completed_at"],
+             "replaced_at": clean["replaced_at"],
++            "deleted_at": clean["deleted_at"],
+             "retryable": clean["retryable"],
+             "replaceable": clean["replaceable"],
+         }
+@@ -460,7 +464,7 @@ class ChatGPT2API401Service:
+             "workers": _WORKERS,
+             "queued": counts["queued"],
+             "active": counts["refreshing"],
+-            "completed": counts["replaced"],
++            "completed": counts["replaced"] + counts["deleted"],
+             "failed": counts["failed"] + counts["conflict"],
+         }
+         return {
+@@ -638,6 +642,7 @@ class ChatGPT2API401Service:
+                             "refresh_started_at": "",
+                             "refresh_completed_at": "",
+                             "replaced_at": "",
++                            "deleted_at": "",
+                             "retryable": False,
+                             "replaceable": False,
+                         })
+@@ -752,6 +757,13 @@ class ChatGPT2API401Service:
+                 })
+                 return
+ 
++            if _text((local or {}).get("live_check_status"), 32).lower() == "deactivated":
++                # A persisted deactivated verdict is terminal; another login only
++                # repeats the OTP flow and cannot revive the account.
++                verdict = _text((local or {}).get("live_check_error"), 64) or "account_deactivated"
++                self._delete_deactivated_locked(remote_id, item, verdict)
++                return
++
+             before_local_sha = _hash_token((local or {}).get("access_token"))
+             self._set_item(remote_id, {
+                 "state": "refreshing",
+@@ -826,6 +838,10 @@ class ChatGPT2API401Service:
+                     "replaceable": False,
+                 })
+                 return
++            if isinstance(liveness, dict) and liveness.get("status") == "deactivated":
++                verdict = _text(liveness.get("error"), 64) or "account_deactivated"
++                self._delete_deactivated_locked(remote_id, item, verdict)
++                return
+             if failure:
+                 self._set_item(remote_id, {
+                     "state": "failed",
+@@ -866,6 +882,77 @@ class ChatGPT2API401Service:
+                     "replaceable": False,
+                 })
+ 
++    def _delete_deactivated_locked(self, remote_id: str, item: dict, verdict: str) -> None:
++        """Delete the exact locked remote ID once the local account is confirmed deactivated.
++
++        Callers hold the operation lock. The writeback mapping and old AT/RT
++        evidence gates still apply, so a remote account rotated elsewhere is
++        never deleted.
++        """
++        email = item["email"]
++        local_id = item["local_account_id"]
++        failure = ""
++        try:
++            by_remote_id, by_remote_email = self._remote_maps(list(self._list_remote_fn() or []))
++            by_local_id, by_local_email = self._local_maps(list(self._list_local_fn() or []))
++            local_matches = by_local_id.get(local_id, [])
++            local = local_matches[0] if len(local_matches) == 1 else None
++            if len(by_remote_id.get(remote_id, [])) != 1 or len(by_remote_email.get(email, [])) != 1:
++                failure = "删除前远端 ID 或邮箱映射已变化"
++            elif local is None or _email(local.get("email")) != email or len(by_local_email.get(email, [])) != 1:
++                failure = "删除前本地账号映射已变化"
++            elif _text(local.get("live_check_status"), 32).lower() != "deactivated":
++                failure = "本地账号未持久化废号结论，禁止删除远端"
++            else:
++                snapshot = self._normalize_snapshot(self._snapshot_fn(remote_id))
++                if not self._snapshot_complete(snapshot, remote_id):
++                    failure = "删除前远端快照不完整或账号 ID 不一致"
++                elif snapshot["at_sha256"] != item["old_at_sha256"]:
++                    failure = "删除前远端旧 AT 已变化，禁止删除"
++                elif snapshot["preserved_sha256"] != item["preserved_sha256"]:
++                    failure = "删除前远端保留字段已变化，禁止删除"
++        except Exception as exc:
++            failure = _reason(exc, "删除前快照复核失败")
++        if failure:
++            self._set_item(remote_id, {
++                "state": "conflict",
++                "reason": failure,
++                "failure_stage": "pre_delete",
++                "new_at_sha256": "",
++                "refresh_completed_at": _now(),
++                "retryable": False,
++                "replaceable": False,
++            })
++            return
++
++        try:
++            self._delete_fn(remote_id)
++            after_by_id, _ = self._remote_maps(list(self._list_remote_fn() or []))
++            if after_by_id.get(remote_id):
++                raise RuntimeError("删除后锁定的远端 ID 仍然存在")
++        except Exception as exc:
++            self._set_item(remote_id, {
++                "state": "failed",
++                "reason": _reason(exc, "远端废号删除失败"),
++                "failure_stage": "delete",
++                "new_at_sha256": "",
++                "refresh_completed_at": _now(),
++                "retryable": True,
++                "replaceable": False,
++            })
++            return
++
++        self._set_item(remote_id, {
++            "state": "deleted",
++            "reason": _reason(f"查活确认废号（{verdict}），已从 ChatGPT2API 删除锁定远端 ID", "已删除废号"),
++            "failure_stage": "",
++            "new_at_sha256": "",
++            "refresh_completed_at": _now(),
++            "deleted_at": _now(),
++            "retryable": False,
++            "replaceable": False,
++        })
++
+     def replace(self, values: object, *, opt_in: bool = False, limit: int = _MAX_ITEMS) -> dict:
+         selected_ids = _selected_ids(values, limit=limit)
+         with self._operation_lock:
+diff --git a/core/chatgpt2api_admin.py b/core/chatgpt2api_admin.py
+index a80765f..b5490ab 100644
+--- a/core/chatgpt2api_admin.py
++++ b/core/chatgpt2api_admin.py
+@@ -5,6 +5,7 @@ from __future__ import annotations
+ import hashlib
+ import json
+ import re
++import time
+ from typing import Callable
+ from urllib.error import HTTPError, URLError
+ from urllib.parse import quote, urlencode
+@@ -182,7 +183,7 @@ class ChatGPT2APIAdminError(RuntimeError):
+ 
+ 
+ class ChatGPT2APIAdminClient:
+-    """List accounts, fingerprint credentials, and update one stable remote ID."""
++    """List accounts, fingerprint credentials, and update or delete one stable remote ID."""
+ 
+     def __init__(self, request_fn: Callable[[str, str, dict | None], object] | None = None) -> None:
+         self._request_fn = request_fn
+@@ -394,5 +395,40 @@ class ChatGPT2APIAdminClient:
+         self._snapshot_by_id[remote_id] = observed
+         return {"ok": True, "remote_id": remote_id}
+ 
++    def delete_account(
++        self,
++        remote_id: str,
++        *,
++        wait_seconds: float = 15.0,
++        poll_interval: float = 0.5,
++    ) -> dict:
++        remote_id = _remote_id(remote_id)
++        if not remote_id:
++            raise ChatGPT2APIAdminError("ChatGPT2API 账号 ID 无效", status_code=400, category="validation")
++        payload = self._request("DELETE", "/api/accounts", {"account_ids": [remote_id]})
++        target_ids: list[str] = []
++        for container in _containers(payload):
++            values = container.get("target_ids")
++            if isinstance(values, list):
++                target_ids.extend(_remote_id(value).lower() for value in values)
++        if remote_id.lower() not in target_ids:
++            raise ChatGPT2APIAdminError("ChatGPT2API 未确认删除锁定账号", status_code=409, category="conflict")
++
++        # Deletion runs as a background operation upstream; success is claimed
++        # only after the exact ID detail endpoint reports 404.
++        encoded_id = quote(remote_id, safe="")
++        deadline = time.monotonic() + max(0.0, float(wait_seconds))
++        while True:
++            try:
++                self._request("GET", f"/api/accounts/{encoded_id}")
++            except ChatGPT2APIAdminError as exc:
++                if exc.category != "not_found":
++                    raise
++                self._snapshot_by_id.pop(remote_id, None)
++                return {"ok": True, "remote_id": remote_id}
++            if time.monotonic() >= deadline:
++                raise ChatGPT2APIAdminError("ChatGPT2API 删除后锁定账号仍存在", status_code=409, category="conflict")
++            time.sleep(max(0.0, float(poll_interval)))
++
+ 
+ __all__ = ["ChatGPT2APIAdminClient", "ChatGPT2APIAdminError"]
+diff --git a/tests/test_chatgpt2api_401_admin.py b/tests/test_chatgpt2api_401_admin.py
+index d2abe74..d3c975a 100644
+--- a/tests/test_chatgpt2api_401_admin.py
++++ b/tests/test_chatgpt2api_401_admin.py
+@@ -168,6 +168,42 @@ class ChatGPT2APIAdminTests(unittest.TestCase):
+             self.assertEqual("conflict", captured.exception.category)
+             self.assertEqual(409, captured.exception.status_code)
+ 
++    def test_delete_sends_exact_id_and_waits_until_account_is_gone(self):
++        calls = []
++        lookups = {"count": 0}
++
++        def request(method, path, body):
++            calls.append((method, path, body))
++            if method == "DELETE":
++                return {"progress_id": "progress-1", "target_ids": ["Remote-1"], "errors": []}
++            lookups["count"] += 1
++            if lookups["count"] < 2:
++                return {"item": {"id": "remote-1"}}
++            raise ChatGPT2APIAdminError("not found", status_code=404, category="not_found")
++
++        result = ChatGPT2APIAdminClient(request_fn=request).delete_account("remote-1", poll_interval=0)
++        self.assertEqual({"ok": True, "remote_id": "remote-1"}, result)
++        self.assertEqual(("DELETE", "/api/accounts", {"account_ids": ["remote-1"]}), calls[0])
++        self.assertEqual([("GET", "/api/accounts/remote-1", None)] * 2, calls[1:])
++
++    def test_delete_rejects_unconfirmed_target_or_lingering_account(self):
++        def unconfirmed(method, _path, _body):
++            if method == "DELETE":
++                return {"progress_id": "progress-1", "target_ids": ["other-id"]}
++            raise AssertionError("must not poll an unconfirmed delete")
++
++        def lingering(method, _path, _body):
++            if method == "DELETE":
++                return {"progress_id": "progress-1", "target_ids": ["remote-1"]}
++            return {"item": {"id": "remote-1"}}
++
++        for request in (unconfirmed, lingering):
++            with self.subTest(request=request.__name__), self.assertRaises(ChatGPT2APIAdminError) as captured:
++                ChatGPT2APIAdminClient(request_fn=request).delete_account(
++                    "remote-1", wait_seconds=0, poll_interval=0,
++                )
++            self.assertEqual("conflict", captured.exception.category)
++
+     def test_request_failures_do_not_echo_credentials(self):
+         def request(_method, _path, _body):
+             raise RuntimeError("access_token=secret callback=https://example.test/cb?code=secret")
+diff --git a/tests/test_chatgpt2api_401_service.py b/tests/test_chatgpt2api_401_service.py
+index 6d06d9b..ff32b51 100644
+--- a/tests/test_chatgpt2api_401_service.py
++++ b/tests/test_chatgpt2api_401_service.py
+@@ -340,6 +340,110 @@ class ChatGPT2API401ServiceTests(unittest.TestCase):
+         self.assertEqual("liveness", item["failure_stage"])
+         self.assertEqual([], self.patches)
+ 
++    def delete_remote(self, remote_id):
++        self.deletes.append(remote_id)
++        self.remote[:] = [row for row in self.remote if row["remote_id"] != remote_id]
++        return {"ok": True, "remote_id": remote_id}
++
++    def deactivated_liveness(self, local_id):
++        self.liveness_calls.append(local_id)
++        local = next(row for row in self.local if row["id"] == local_id)
++        local["live_check_status"] = "deactivated"
++        return {"ok": False, "status": "deactivated", "error": "account_deactivated"}
++
++    def test_deactivated_liveness_deletes_exact_locked_remote_id(self):
++        self.deletes = []
++        self.remote.append({
++            "remote_id": "remote-healthy",
++            "email": "two@example.com",
++            "invalid": False,
++            "access_token": "healthy-secret",
++            "refresh_token": "healthy-refresh",
++        })
++        service = self.service(liveness_fn=self.deactivated_liveness, delete_fn=self.delete_remote)
++        service.detect()
++        self.enqueue(service)
++        final = self.wait_terminal(service, ["deleted"])
++        item = final["items"][0]
++        self.assertEqual([7], self.liveness_calls)
++        self.assertEqual(["remote-old"], self.deletes)
++        self.assertEqual([], self.patches)
++        self.assertEqual(["remote-healthy"], [row["remote_id"] for row in self.remote])
++        self.assertFalse(item["retryable"])
++        self.assertTrue(item["deleted_at"])
++        self.assertIn("account_deactivated", item["reason"])
++        self.assertEqual(1, final["progress"]["completed"])
++        self.assertEqual(0, final["progress"]["failed"])
++
++    def test_local_deactivated_account_deletes_without_new_liveness(self):
++        self.deletes = []
++        self.local[0]["live_check_status"] = "deactivated"
++        service = self.service(delete_fn=self.delete_remote)
++        service.detect()
++        self.enqueue(service)
++        self.wait_terminal(service, ["deleted"])
++        self.assertEqual([], self.liveness_calls)
++        self.assertEqual(["remote-old"], self.deletes)
++        self.assertEqual([], self.remote)
++
++    def test_deactivated_delete_blocked_when_remote_at_changed(self):
++        self.deletes = []
++
++        def rotate_during_liveness(local_id):
++            self.remote[0]["access_token"] = "rotated-elsewhere"
++            return self.deactivated_liveness(local_id)
++
++        service = self.service(liveness_fn=rotate_during_liveness, delete_fn=self.delete_remote)
++        service.detect()
++        self.enqueue(service)
++        final = self.wait_terminal(service, ["conflict"])
++        self.assertEqual("pre_delete", final["items"][0]["failure_stage"])
++        self.assertEqual([], self.deletes)
++        self.assertEqual(1, len(self.remote))
++
++    def test_delete_failure_is_retryable_and_never_claims_deleted(self):
++        self.deletes = []
++
++        def broken_delete(remote_id):
++            self.deletes.append(remote_id)
++            raise RuntimeError("ChatGPT2API 管理接口暂时不可用")
++
++        service = self.service(liveness_fn=self.deactivated_liveness, delete_fn=broken_delete)
++        service.detect()
++        self.enqueue(service)
++        final = self.wait_terminal(service, ["failed"])
++        item = final["items"][0]
++        self.assertEqual("delete", item["failure_stage"])
++        self.assertTrue(item["retryable"])
++        self.assertEqual(["remote-old"], self.deletes)
++        self.assertEqual(1, len(self.remote))
++
++    def test_delete_acknowledged_but_remote_row_remains_is_retryable_failed(self):
++        self.deletes = []
++
++        def ack_only(remote_id):
++            self.deletes.append(remote_id)
++            return {"ok": True, "remote_id": remote_id}
++
++        service = self.service(liveness_fn=self.deactivated_liveness, delete_fn=ack_only)
++        service.detect()
++        self.enqueue(service)
++        final = self.wait_terminal(service, ["failed"])
++        self.assertEqual("delete", final["items"][0]["failure_stage"])
++        self.assertTrue(final["items"][0]["retryable"])
++
++    def test_non_deactivated_liveness_failure_never_deletes(self):
++        self.deletes = []
++        service = self.service(
++            liveness_fn=lambda _local_id: {"ok": False, "status": "failed", "error": "ProxyError: timeout"},
++            delete_fn=self.delete_remote,
++        )
++        service.detect()
++        self.enqueue(service)
++        self.wait_terminal(service, ["failed"])
++        self.assertEqual([], self.deletes)
++        self.assertEqual(1, len(self.remote))
++
+     def test_liveness_returned_token_must_equal_persisted_new_token(self):
+         def mismatch(_local_id):
+             self.local[0]["access_token"] = "persisted-token"
+diff --git a/tests/test_webui_credential_health_scheduler.py b/tests/test_webui_credential_health_scheduler.py
+index 5481808..77e73b6 100644
+--- a/tests/test_webui_credential_health_scheduler.py
++++ b/tests/test_webui_credential_health_scheduler.py
+@@ -282,6 +282,36 @@ class WebUICredentialHealthSchedulerTests(unittest.TestCase):
+         self.assertEqual(1, result.completed)
+         refresh.assert_called_once_with(["remote-exact-id"], opt_in=True, limit=5000)
+ 
++    def test_chatgpt2api_automatic_job_counts_deleted_deactivated_as_completed(self):
++        scheduler = self.app.extensions["credential_health_scheduler"]
++        fresh = {
++            "ok": True,
++            "items": [
++                {"remote_id": "replaced-id", "state": "pending", "retryable": True},
++                {"remote_id": "deleted-id", "state": "pending", "retryable": True},
++            ],
++        }
++        terminal = {
++            "ok": True,
++            "items": [
++                {"remote_id": "replaced-id", "state": "replaced"},
++                {"remote_id": "deleted-id", "state": "deleted"},
++            ],
++            "progress": {"queued": 0, "active": 0},
++        }
++        with patch(
++            "core.chatgpt2api_401_service.ChatGPT2API401Service.detect", return_value=fresh
++        ), patch(
++            "core.chatgpt2api_401_service.ChatGPT2API401Service.refresh",
++            return_value={"queued_count": 2, "submitted_ids": ["replaced-id", "deleted-id"], "skipped": []},
++        ), patch(
++            "core.chatgpt2api_401_service.ChatGPT2API401Service.state", return_value=terminal
++        ):
++            result = scheduler._jobs["chatgpt2api_401"]("deleted-run")
++        self.assertEqual("success", result.outcome)
++        self.assertEqual(2, result.completed)
++        self.assertEqual(0, result.failed)
++
+     def test_chatgpt2api_automatic_job_observes_only_ids_accepted_by_this_round(self):
+         scheduler = self.app.extensions["credential_health_scheduler"]
+         fresh = {
+diff --git a/webui/app.py b/webui/app.py
+index 0488e35..6492676 100644
+--- a/webui/app.py
++++ b/webui/app.py
+@@ -3931,7 +3931,7 @@ def create_app(auth_code: str | None = None) -> Flask:
+             }
+             active = sum(1 for item in by_id.values() if item.get("state") in {"queued", "refreshing", "ready"})
+             failed = sum(1 for item in by_id.values() if item.get("state") in {"failed", "conflict", "ambiguous"})
+-            completed = sum(1 for item in by_id.values() if item.get("state") == "replaced")
++            completed = sum(1 for item in by_id.values() if item.get("state") in {"replaced", "deleted"})
+             missing = max(0, submitted - active - failed - completed)
+             failed += missing
+             progress = (
+@@ -3965,7 +3965,7 @@ def create_app(auth_code: str | None = None) -> Flask:
+             completed=completed,
+             failed=failed,
+             skipped=initial_skipped,
+-            error="" if outcome == "success" else "部分账号未完成查活或精确远端 ID 写回",
++            error="" if outcome == "success" else "部分账号未完成查活、精确远端 ID 写回或废号删除",
+         )
+ 
+     credential_health_scheduler = CredentialHealthScheduler(
+diff --git a/webui/templates/chatgpt2api_401.html b/webui/templates/chatgpt2api_401.html
+index 76c2109..d7d0990 100644
+--- a/webui/templates/chatgpt2api_401.html
++++ b/webui/templates/chatgpt2api_401.html
+@@ -13,7 +13,7 @@
+     .scheduler-grid{display:grid;grid-template-columns:minmax(200px,1fr) repeat(3,minmax(140px,auto));gap:12px;align-items:end}.scheduler-grid label{display:grid;gap:5px}.scheduler-meta{margin-top:12px;display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:10px}.scheduler-meta>div{border:1px solid var(--line);border-radius:7px;padding:9px 11px}.switch{display:flex!important;align-items:center;gap:9px;padding:9px 0}.switch input{width:18px;height:18px;padding:0}
+     .counts{display:grid;grid-template-columns:repeat(auto-fit,minmax(105px,1fr));gap:9px;margin-top:14px}.metric{border:1px solid var(--line);border-radius:7px;padding:10px 12px}.metric b{display:block;font-size:20px}.notice{margin-top:12px;padding:10px 12px;border-left:3px solid #e2a73b;background:#fff8e8;color:#714b00}.notice.error{border-color:#e56b61;background:#fff3f2;color:var(--danger)}.notice.ok{border-color:#54b58a;background:#edfdf4;color:var(--ok)}
+     .table-wrap{overflow:auto;padding:0}table{width:100%;border-collapse:collapse;min-width:1220px}th,td{border-bottom:1px solid #e9edf2;padding:11px 10px;text-align:left;vertical-align:top}th{font-size:12px;color:var(--muted);background:#f8fafc}tbody tr:last-child td{border-bottom:0}.id{max-width:260px;word-break:break-all;font:12px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace}
+-    .badge{display:inline-block;padding:3px 8px;border-radius:999px;font-size:12px;font-weight:700}.pending{background:#fff5e5;color:var(--warn)}.queued,.refreshing{background:#edf4ff;color:#175cd3}.ready{background:#eef4ff;color:#3538cd}.replaced{background:#ecfdf3;color:var(--ok)}.failed,.ambiguous,.conflict{background:#fff1f0;color:var(--danger)}
++    .badge{display:inline-block;padding:3px 8px;border-radius:999px;font-size:12px;font-weight:700}.pending{background:#fff5e5;color:var(--warn)}.queued,.refreshing{background:#edf4ff;color:#175cd3}.ready{background:#eef4ff;color:#3538cd}.replaced,.deleted{background:#ecfdf3;color:var(--ok)}.failed,.ambiguous,.conflict{background:#fff1f0;color:var(--danger)}
+     .preview{margin:12px 0 0;white-space:pre-wrap;word-break:break-all;background:#151b26;color:#e8edf5;border-radius:7px;padding:12px;max-height:260px;overflow:auto}.hidden{display:none}
+     @media(max-width:900px){.top{flex-direction:column}.counts{grid-template-columns:repeat(2,minmax(0,1fr))}.wrap{padding:20px 12px 40px}.scheduler-grid,.scheduler-meta{grid-template-columns:1fr}}
+   </style>
+@@ -53,10 +53,11 @@
+       <div class="metric"><span class="muted">待查活 / 重试</span><b id="pendingCount">0</b></div>
+       <div class="metric"><span class="muted">历史待写回</span><b id="readyCount">0</b></div>
+       <div class="metric"><span class="muted">已验证替换</span><b id="replacedCount">0</b></div>
++      <div class="metric"><span class="muted">已删除废号</span><b id="deletedCount">0</b></div>
+       <div class="metric"><span class="muted">失败 / 冲突</span><b id="ambiguousCount">0</b></div>
+       <div class="metric"><span class="muted">远端正常</span><b id="healthyCount">0</b></div>
+     </div>
+-    <div class="notice">“查活并写回”会把所有选中候选加入后台队列（固定并发 5），每个账号取得并持久化可验证的新 AT 后，自动只更新检测时锁定的 ChatGPT2API 远端 ID。RT 仅作为必须保持不变的摘要证据，不会写入远端。</div>
++    <div class="notice">“查活并写回”会把所有选中候选加入后台队列（固定并发 5），每个账号取得并持久化可验证的新 AT 后，自动只更新检测时锁定的 ChatGPT2API 远端 ID；查活确认 account_deactivated 等废号时，复核旧 AT/RT 摘要未变后删除该远端 ID。RT 仅作为必须保持不变的摘要证据，不会写入远端。</div>
+     <div id="message"></div>
+     <pre id="preview" class="preview hidden"></pre>
+   </section>
+@@ -77,7 +78,7 @@
+   let pollDelay = 0;
+   let stateLoading = false;
+   const esc = value => String(value ?? '').replace(/[&<>"']/g, ch => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch]));
+-  const labels = {pending:'待查活',queued:'队列等待',refreshing:'查活中',ready:'历史待写回',replaced:'已替换',failed:'查活失败',ambiguous:'映射不明确',conflict:'快照冲突'};
++  const labels = {pending:'待查活',queued:'队列等待',refreshing:'查活中',ready:'历史待写回',replaced:'已替换',deleted:'已删除废号',failed:'查活失败',ambiguous:'映射不明确',conflict:'快照冲突'};
+   async function api(path, options={}) {
+     const response = await fetch(path, {...options, headers:{'Content-Type':'application/json', ...(options.headers || {})}});
+     const data = await response.json().catch(() => ({ok:false,error:`HTTP ${response.status}`}));
+@@ -110,6 +111,7 @@
+     $('#pendingCount').textContent = (counts.pending || 0) + (counts.failed || 0);
+     $('#readyCount').textContent = counts.ready || 0;
+     $('#replacedCount').textContent = counts.replaced || 0;
++    $('#deletedCount').textContent = counts.deleted || 0;
+     $('#ambiguousCount').textContent = (counts.ambiguous || 0) + (counts.conflict || 0);
+     $('#healthyCount').textContent = counts.healthy || 0;
+     $('#checkedAt').textContent = data.checked_at ? `检测时间 ${new Date(data.checked_at).toLocaleString()} · 后台并发 ${progress.workers || 5}` : `尚未执行远端检测 · 后台并发 ${progress.workers || 5}`;
+@@ -122,7 +124,7 @@
+       <td class="id">${esc(item.remote_id)}</td><td>${esc(item.email || '—')}</td><td>${esc(item.local_account_id || '—')}</td>
+       <td><span class="badge ${esc(item.state)}">${esc(labels[item.state] || item.state)}</span></td><td>${esc(item.reason)}</td>
+       <td class="id">${esc(item.old_at_fingerprint || '—')}</td><td class="id">${esc(item.new_at_fingerprint || '—')}</td>
+-      <td>${esc(item.replaced_at || item.refresh_completed_at || item.refresh_started_at || item.queued_at || item.detected_at || '—')}</td>
++      <td>${esc(item.replaced_at || item.deleted_at || item.refresh_completed_at || item.refresh_started_at || item.queued_at || item.detected_at || '—')}</td>
+     </tr>`).join('') || '<tr><td colspan="9" class="muted">未发现可处理的 ChatGPT2API 失效账号。</td></tr>';
+     const refreshIds = [...selected].filter(remoteId => items.some(item => item.remote_id === remoteId && item.retryable));
+     const replaceIds = [...selected].filter(remoteId => items.some(item => item.remote_id === remoteId && item.replaceable));

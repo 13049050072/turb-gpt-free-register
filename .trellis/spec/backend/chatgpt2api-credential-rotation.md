@@ -18,6 +18,7 @@ Management adapter:
 ChatGPT2APIAdminClient.list_accounts(*, page_size: int = 500, max_pages: int = 20) -> list[dict]
 ChatGPT2APIAdminClient.credential_snapshot(remote_id: str) -> dict
 ChatGPT2APIAdminClient.patch_access_token(remote_id: str, access_token: str) -> dict
+ChatGPT2APIAdminClient.delete_account(remote_id: str, *, wait_seconds: float = 15.0, poll_interval: float = 0.5) -> dict
 ```
 
 Liveness adapter and service:
@@ -57,21 +58,28 @@ GET  /api/accounts?page=<n>&page_size=<n>
 GET  /api/accounts/{account_id}/access-token
 GET  /api/accounts/{account_id}/refresh-token
 POST /api/accounts/update  {"id": <exact remote ID>, "access_token": <new AT>}
+DELETE /api/accounts        {"account_ids": [<exact remote ID>]}
+GET  /api/accounts/{account_id}   # 404 confirms deletion
 ```
 
 ### 3. Queue and State Contract
 
 `POST /api/chatgpt2api-401/refresh` accepts 1 through 5000 remote IDs and requires `confirm_replace is True`. A valid request persists all accepted entries as `queued`, submits them to a process-local `ThreadPoolExecutor(max_workers=5)`, and returns HTTP 202 without waiting for any liveness call. The in-process outstanding queue is bounded to 5000 jobs.
 
-Only `pending` and retryable `failed` entries may be queued. `queued`, `refreshing`, `ready`, `replaced`, `ambiguous`, and `conflict` entries cannot be submitted again. Duplicate and non-actionable IDs are returned in a bounded `skipped` array without credentials. Detection returns HTTP 409 while any item is `queued` or `refreshing`, so it cannot replace active audit entries.
+Only `pending` and retryable `failed` entries may be queued. `queued`, `refreshing`, `ready`, `replaced`, `deleted`, `ambiguous`, and `conflict` entries cannot be submitted again. Duplicate and non-actionable IDs are returned in a bounded `skipped` array without credentials. Detection returns HTTP 409 while any item is `queued` or `refreshing`, so it cannot replace active audit entries.
 
 The persisted state machine is:
 
 ```text
 pending -> queued -> refreshing -> ready -> replaced
-                         |           |
-                         v           v
-                       failed      conflict
+             |           |           |
+             |           v           v
+             |         failed      conflict
+             |           |
+             |           +-- liveness status=deactivated --+
+             +-- local live_check_status=deactivated ------+--> deleted
+                                                           |
+                                                           +--> conflict (pre_delete) / failed (delete, retryable)
 
 pending/failed -- pre-liveness snapshot drift --> conflict
 queued/refreshing -- process restart ----------> failed (retryable)
@@ -87,7 +95,7 @@ queued/refreshing -- process restart ----------> failed (retryable)
     "workers": 5,
     "queued": 0,
     "active": 0,
-    "completed": 0,
+    "completed": 0,  # replaced + deleted
     "failed": 0
   }
 }
@@ -125,6 +133,17 @@ After liveness, remote writeback is serialized by the shared audit-path operatio
 
 Writeback acknowledgement mismatch, exceptions, or post-write evidence mismatch become `conflict` at stage `writeback`. The system never claims success from the mutation response alone.
 
+### 4.1 Deactivated Account Deletion
+
+A deactivated account cannot be revived by a new AT, so the locked remote ID is deleted instead of being retried forever. Two triggers exist, both under the shared operation lock:
+
+- the pre-liveness local row already has `live_check_status == "deactivated"` (a persisted verdict from an earlier liveness or Codex check): liveness is skipped;
+- liveness returns `status == "deactivated"` (for example `account_deactivated`), which `update_account_liveness` persists locally.
+
+Before deleting, the service re-lists both sides and requires the same unique remote ID/email and local ID/email mapping, the local row still `deactivated`, and the remote AT hash and RT evidence still equal to the detection lock. Any drift becomes `conflict` at stage `pre_delete` and nothing is deleted, so an account rotated elsewhere is never removed.
+
+`DELETE /api/accounts` sends exactly `{"account_ids": [id]}`. The adapter requires the exact ID in `target_ids`, then polls `GET /api/accounts/{id}` until 404 (upstream deletion is a background operation). The service re-lists once more and requires the ID to be absent. Only then does state become `deleted` with `deleted_at`. Delete errors, unconfirmed targets, or a lingering row become retryable `failed` at stage `delete`; the retry reuses the persisted local verdict and does not log in again. Non-deactivated liveness failures never delete.
+
 ### 5. Persistence and Confidentiality
 
 `chatgpt2api_401_audit.json` uses create-exclusive temporary files, `fsync`, `os.replace`, and mode `0600` where supported. A symlink audit path writes beside the resolved target and preserves the symlink. Service instances sharing an audit path share one process-level `RLock` and reload persisted state before mutations.
@@ -154,6 +173,11 @@ All ChatGPT2API-401 responses set `Cache-Control: no-store, max-age=0`, `Pragma:
 | Post-update ID, email, AT, or RT evidence differs | `conflict`, retain safe audit evidence |
 | Post-update evidence matches | `replaced` |
 | Process starts with queued/refreshing audit rows | retryable `failed`, stage `restart` |
+| Liveness returns `deactivated`, evidence unchanged | exact-ID delete, 404 readback, `deleted` |
+| Local row already `deactivated` | no liveness, exact-ID delete, `deleted` |
+| Remote AT/RT or mapping drift before delete | `conflict`, stage `pre_delete`, no delete |
+| Delete error, unconfirmed target, or row still listed | retryable `failed`, stage `delete` |
+| Liveness fails without `deactivated` | retryable `failed`, never deletes |
 
 ### 7. Required Tests
 

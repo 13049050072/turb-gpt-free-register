@@ -44,18 +44,22 @@ class MailCodeClientTests(unittest.TestCase):
         client._CONTEXT_CACHE.clear()
         self.addCleanup(client._CONTEXT_CACHE.clear)
 
+    def test_service_base_ignores_legacy_custom_configuration(self):
+        with patch.object(cfg, "MAILCODE_API_BASE", "https://custom.example.test"):
+            self.assertEqual(client._base(), "https://mailcode.bzb.qzz.io")
+
     def order(self):
         return {"order_id": "order-1", "status": "COMPLETED", "count": 1, "points_charged": "100",
                 "items": [{"item_id": "item-1", "email": "a@mail.test", "mailbox_id": "mailbox-1", "status": "ACTIVE"}]}
 
     @patch.object(client.requests, "request")
-    def test_purchase_headers_custom_base_and_ready_baseline(self, request):
+    def test_purchase_headers_fixed_base_and_ready_baseline(self, request):
         request.side_effect = [response(self.order(), 201), response(codes(cursor="9"))]
         account = client.pick_account()
         self.assertEqual(account.email, "a@mail.test")
         self.assertEqual(account.next_sequence, "9")
         args, kwargs = request.call_args_list[0]
-        self.assertEqual(args, ("POST", "http://mail.test:18080/api/open/v1/orders"))
+        self.assertEqual(args, ("POST", "https://mailcode.bzb.qzz.io/api/open/v1/orders"))
         self.assertEqual(kwargs["json"], {"product_id": "product-1", "count": 1})
         self.assertEqual(kwargs["headers"]["Authorization"], "Bearer test-key")
         self.assertTrue(kwargs["headers"]["Idempotency-Key"].startswith("turb-mailcode-"))

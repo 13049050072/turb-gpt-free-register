@@ -57,7 +57,7 @@ IPWO 住宅代理提供覆盖195+国家和地区的住宅 IP 资源，支持多�
 - 通用 API 邮箱：`email----取码地址`
 - 通用 IMAP 邮箱池：每行 `邮箱----IMAP密码` 或 `邮箱:IMAP密码`，服务器、端口和 SSL 在导入界面统一配置
 - GPTMail 临时邮箱 API：运行时随机生成邮箱并自动收取验证码
-- 域名邮箱 MailCode：自定义服务地址、幂等购买邮箱并按游标自动收码（`mailcode`）
+- 域名邮箱 MailCode：官方服务、幂等购买邮箱并按游标自动收码（`mailcode`）
 - Remail 开放 API：按项目下单短效邮箱并自动收取验证码（`remail`）
 - `EMAIL_SOURCE` 支持多个来源组合，例如：
 
@@ -415,12 +415,11 @@ Cloudflare Email Routing 需要把域名邮件转发到 QQ 邮箱。此模式不
 
 #### 域名邮箱 MailCode
 
-在「配置 → 邮箱 / OTP → 域名邮箱 MailCode」填写服务地址、API Key 和商品 ID。保存服务地址与密钥后，可点击「查询商品与余额」查看商品 ID、价格和库存（查询不会购买）。服务地址支持自建域名、IP/端口，也兼容带 `/api/open/v1` 的地址。
+在「配置 → 邮箱 / OTP → 域名邮箱 MailCode」填写 API Key 和商品 ID，点击「打开官网」可前往 https://mailcode.bzb.qzz.io。服务地址固定使用该官网，不显示地址配置，也不接受旧 `MAILCODE_API_BASE` 环境变量覆盖。保存密钥后，可点击「查询商品与余额」查看商品 ID、价格和库存（查询不会购买）。
 
 ```dotenv
 USE_EMAIL_SERVICE=True
 EMAIL_SOURCE="mailcode"
-MAILCODE_API_BASE="https://mailcode.bzb.qzz.io"
 MAILCODE_API_KEY="你的_API_KEY"
 MAILCODE_PRODUCT_ID="product_a3783a0ead074b4091631b9ad04153f9"
 MAILCODE_REQUEST_TIMEOUT=20

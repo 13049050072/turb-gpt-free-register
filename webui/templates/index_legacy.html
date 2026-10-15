@@ -3389,7 +3389,7 @@ function renderConfigField(f) {
     ? `<div class="config-field-wrap">${field}${renderConfigExternalLink(f)}</div>`
     : field;
   const mailCodeTools = f.key === 'MAILCODE_PRODUCT_ID'
-    ? '<div><button type="button" class="btn" onclick="loadMailCodeCatalog(this)">查询商品与余额（请先保存配置）</button><pre style="white-space:pre-wrap" hidden></pre></div>' : '';
+    ? '<div><button type="button" class="btn" onclick="loadMailCodeCatalog(this)">查询商品与余额（请先保存密钥）</button><pre style="white-space:pre-wrap" hidden></pre></div>' : '';
   return decorated + renderConfigRecommendedLinks(f) + mailCodeTools;
 }
 
@@ -3397,7 +3397,7 @@ async function loadMailCodeCatalog(btn) {
   const output = btn.nextElementSibling;
   btn.disabled = true;
   output.hidden = false;
-  output.textContent = '正在查询已保存的 MailCode 服务地址...';
+  output.textContent = '正在查询 MailCode 官网商品与余额...';
   try {
     const result = await api('/api/mailcode/catalog');
     if (!result.ok) throw new Error(result.error || '查询失败');
@@ -3452,7 +3452,7 @@ function emailConfigSectionForKey(key) {
   if (key.startsWith('GPTMAIL_')) return ['GPTMail', 'GPTMail 临时邮箱 API 配置'];
   if (key.startsWith('MAIL_NEST_')) return ['MailNest', 'MailNest / 迈巢临时邮箱 API 配置'];
   if (key.startsWith('CLOUDMAIL_')) return ['CloudMail', 'CloudMail 域名随机邮箱、Token 和收信 API 配置'];
-  if (key.startsWith('MAILCODE_')) return ['域名邮箱 MailCode', '自定义服务地址、商品购买与自动取码'];
+  if (key.startsWith('MAILCODE_')) return ['域名邮箱 MailCode', '官方服务、商品购买与自动取码'];
   if (key.startsWith('REMAIL_')) return ['Remail', 'Remail 开放 API、项目下单和取件配置'];
   if (key.startsWith('XIGUA_')) return ['西瓜', '西瓜邮箱接码 API、项目方案和取件配置'];
   if (key.startsWith('OUTLOOK_')) return ['Outlook 邮箱池', 'Outlook 邮箱池和取件模式配置'];

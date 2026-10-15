@@ -12,9 +12,11 @@ class MailCodeWebUiTests(unittest.TestCase):
         self.client = create_app(auth_code="test-auth").test_client()
         self.client.environ_base["HTTP_X_AUTH_CODE"] = "test-auth"
 
-    def test_config_schema_exposes_base_and_secret_key(self):
+    def test_config_schema_hides_base_and_links_official_site(self):
         fields = {f["key"]: f for f in EDITABLE_FIELDS}
-        self.assertEqual(fields["MAILCODE_API_BASE"]["group"], "邮箱 / OTP")
+        self.assertNotIn("MAILCODE_API_BASE", fields)
+        self.assertEqual(fields["MAILCODE_API_KEY"]["external_url"], "https://mailcode.bzb.qzz.io")
+        self.assertEqual(fields["MAILCODE_API_KEY"]["external_label"], "打开官网")
         self.assertEqual(fields["MAILCODE_API_KEY"]["storage"], "env")
         self.assertTrue(fields["MAILCODE_API_KEY"]["secret"])
         self.assertIn("mailcode", fields["EMAIL_SOURCE"]["help"])

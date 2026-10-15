@@ -11,7 +11,7 @@ import time
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
-from urllib.parse import quote, urlsplit
+from urllib.parse import quote
 
 import requests
 
@@ -32,13 +32,8 @@ class MailCodeError(RuntimeError):
 
 
 def _base():
-    base = str(getattr(_cfg, "MAILCODE_API_BASE", "https://mailcode.bzb.qzz.io") or "").strip().rstrip("/")
-    if base.endswith(_PREFIX):
-        base = base[:-len(_PREFIX)]
-    parsed = urlsplit(base)
-    if parsed.scheme not in {"http", "https"} or not parsed.netloc or parsed.query or parsed.fragment:
-        raise MailCodeError("MailCode 服务地址无效，请配置 MAILCODE_API_BASE")
-    return base
+    # 固定官方服务；不接受旧 .env 或运行时配置重定向 API Key。
+    return "https://mailcode.bzb.qzz.io"
 
 
 def _key():

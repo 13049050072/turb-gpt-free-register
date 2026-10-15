@@ -2620,7 +2620,7 @@ def create_app(auth_code: str | None = None) -> Flask:
             if not xigua_key:
                 return jsonify({"ok": False, "error": "已选择 xigua 邮箱来源，请填写西瓜 API Key（配置 → 邮箱 / OTP）。"}), 400
         if "mailcode" in sources:
-            for key, label in (("MAILCODE_API_BASE", "服务地址"), ("MAILCODE_API_KEY", "API Key"), ("MAILCODE_PRODUCT_ID", "商品 ID")):
+            for key, label in (("MAILCODE_API_KEY", "API Key"), ("MAILCODE_PRODUCT_ID", "商品 ID")):
                 if not str(getattr(_email_cfg, key, "") or "").strip():
                     return jsonify({"ok": False, "error": f"已选择 mailcode 邮箱来源，请填写域名邮箱 MailCode {label}（配置 → 邮箱 / OTP）。"}), 400
         if "remail" in sources:

@@ -471,12 +471,10 @@ EDITABLE_FIELDS = [
         "label": "CloudMail随机名前缀长度", "help": "生成邮箱 local-part 的长度，建议 10-16",
     },
     {
-        "key": "MAILCODE_API_BASE", "file": "email.py", "type": "str", "group": "邮箱 / OTP",
-        "label": "MailCode 服务地址", "help": "可自定义服务地址，默认 https://mailcode.bzb.qzz.io；填写站点根地址或 /api/open/v1",
-    },
-    {
         "key": "MAILCODE_API_KEY", "file": "email.py", "type": "str", "group": "邮箱 / OTP",
-        "label": "MailCode API Key", "help": "在服务端 API 密钥页面创建；需要购买和读取权限，密钥保存在 .env",
+        "label": "MailCode API Key", "help": "在官网 API 密钥页面创建；需要购买和读取权限，密钥保存在 .env；服务地址固定使用官网",
+        "external_url": "https://mailcode.bzb.qzz.io",
+        "external_label": "打开官网",
         "storage": "env", "secret": True,
     },
     {

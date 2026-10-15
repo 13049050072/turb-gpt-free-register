@@ -484,7 +484,7 @@ class RoxyBrowserClient:
                 body["proxyInfo"] = proxy_info
                 logger.info(
                     "[Roxy] 创建环境启用代理池：target=%s transport=%s type=%s host=%s port=%s",
-                    str(target_proxy or "").strip(), str(proxy_url or "").strip(),
+                    _mask_proxy(target_proxy), _mask_proxy(proxy_url),
                     proxy_info.get("protocol") or proxy_info.get("proxyCategory"),
                     proxy_info.get("host"),
                     proxy_info.get("port"),

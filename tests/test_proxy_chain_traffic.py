@@ -4,7 +4,7 @@ import threading
 import unittest
 from unittest.mock import patch
 
-from core.proxy_chain import ProxyChainRelay, open_proxy_pool_proxy
+from core.proxy_chain import ProxyChainRelay, open_proxy_pool_proxy, _read_exact
 from core.browser_traffic import merge_proxy_transport_traffic
 
 
@@ -42,7 +42,7 @@ class ProxyChainTrafficTests(unittest.TestCase):
         server.settimeout(2)
         browser.settimeout(2)
         request = b"POST http://example.test/test?q=1 HTTP/1.1\r\nHost: example.test\r\nContent-Length: 4\r\nProxy-Authorization: secret\r\n\r\nbody"
-        expected = b"POST /test?q=1 HTTP/1.1\r\nHost: example.test\r\nContent-Length: 4\r\n\r\nbody"
+        expected = b"POST /test?q=1 HTTP/1.1\r\nHost: example.test\r\nContent-Length: 4\r\nConnection: close\r\n\r\nbody"
         response = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK"
         with patch.object(relay, "_connect_target_through_upstream", return_value=remote), patch.object(relay, "_target_socks_connect") as tunnel:
             thread = threading.Thread(target=relay._handle_client, args=(client,))
@@ -59,13 +59,15 @@ class ProxyChainTrafficTests(unittest.TestCase):
                 thread.join(timeout=3)
                 server.close()
         self.assertEqual(relay.traffic_snapshot()["total_bytes"], len(expected) + len(response))
+        destination = relay.traffic_snapshot()["destinations"][0]
+        self.assertEqual(destination["host"], "example.test")
+        self.assertEqual(destination["port"], 80)
+        self.assertEqual(destination["connection_count"], 1)
+        self.assertEqual(destination["upload_bytes"], len(expected))
+        self.assertEqual(destination["download_bytes"], len(response))
 
     def test_relay_counts_both_directions(self):
-        relay = object.__new__(ProxyChainRelay)
-        relay._stop = threading.Event()
-        relay._traffic_lock = threading.Lock()
-        relay._upload_bytes = 0
-        relay._download_bytes = 0
+        relay = ProxyChainRelay("http://127.0.0.1:8888")
 
         browser, relay_client = socket.socketpair()
         relay_remote, upstream = socket.socketpair()
@@ -84,12 +86,104 @@ class ProxyChainTrafficTests(unittest.TestCase):
             relay_client.close()
             relay_remote.close()
 
-        self.assertEqual(relay.traffic_snapshot(), {
+        snapshot = relay.traffic_snapshot()
+        self.assertEqual({key: snapshot[key] for key in ("available", "upload_bytes", "download_bytes", "total_bytes")}, {
             "available": True,
             "upload_bytes": 6,
             "download_bytes": 8,
             "total_bytes": 14,
         })
+        self.assertEqual(snapshot["destinations"][0]["host"], "<unknown>")
+        self.assertEqual(snapshot["destinations"][0]["total_bytes"], 14)
+
+    def test_connect_attributes_tls_and_early_data_before_connection_closes(self):
+        relay = ProxyChainRelay("socks5://127.0.0.1:8888")
+        browser, client = socket.socketpair()
+        remote, server = socket.socketpair()
+        browser.settimeout(2)
+        server.settimeout(2)
+        early = b"early-tls-data"
+        browser.sendall(b"CONNECT ChatGPT.COM:443 HTTP/1.1\r\nHost: chatgpt.com\r\n\r\n" + early)
+        with patch.object(relay, "_connect_target_through_upstream", return_value=remote), patch.object(relay, "_target_socks_connect"):
+            thread = threading.Thread(target=relay._handle_client, args=(client,))
+            thread.start()
+            try:
+                self.assertIn(b"200 Connection Established", browser.recv(4096))
+                self.assertEqual(_read_exact(server, len(early)), early)
+                server.sendall(b"tls-response")
+                self.assertEqual(_read_exact(browser, 12), b"tls-response")
+                # 用锁确保转发后的计数写入已经完成，不要求关闭长连接才拿到明细。
+                import time
+                deadline = time.monotonic() + 2
+                while relay.traffic_snapshot()["download_bytes"] != 12 and time.monotonic() < deadline:
+                    time.sleep(0.001)
+                snapshot = relay.traffic_snapshot()
+                item = snapshot["destinations"][0]
+                self.assertEqual((item["host"], item["port"]), ("chatgpt.com", 443))
+                self.assertEqual(item["upload_bytes"], len(early))
+                self.assertEqual(item["download_bytes"], 12)
+                self.assertEqual(item["total_bytes"], snapshot["total_bytes"])
+            finally:
+                relay._stop.set()
+                browser.close()
+                thread.join(timeout=3)
+                server.close()
+
+    def test_destination_totals_are_atomic_sorted_and_snapshot_is_independent(self):
+        relay = ProxyChainRelay("http://127.0.0.1:8888")
+        def transfer():
+            for _ in range(300):
+                relay._record_transfer(("chatgpt.com", 443), upload=2, download=3)
+                relay._record_transfer(("auth.openai.com", 443), upload=1, download=2)
+        threads = [threading.Thread(target=transfer) for _ in range(4)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        result = relay.traffic_snapshot()
+        self.assertEqual(result["destinations"][0]["host"], "chatgpt.com")
+        for field in ("upload_bytes", "download_bytes", "total_bytes"):
+            self.assertEqual(result[field], sum(item[field] for item in result["destinations"]))
+        result["destinations"][0]["upload_bytes"] = -1
+        self.assertEqual(relay.traffic_snapshot()["destinations"][0]["upload_bytes"], 2400)
+
+    def test_failed_connection_records_target_without_fabricating_bytes(self):
+        relay = ProxyChainRelay("socks5://127.0.0.1:8888")
+        browser, client = socket.socketpair()
+        browser.sendall(b"CONNECT AUTH.OPENAI.COM.:443 HTTP/1.1\r\nHost: auth.openai.com\r\n\r\n")
+        try:
+            with patch.object(relay, "_connect_target_through_upstream", side_effect=ConnectionError("test")):
+                with self.assertLogs("core.proxy_chain", level="WARNING") as captured:
+                    relay._handle_client(client)
+            self.assertIn("destination=auth.openai.com:443", captured.output[0])
+            result = relay.traffic_snapshot()
+            self.assertEqual(result["total_bytes"], 0)
+            self.assertEqual(result["destinations"][0]["failed_connection_count"], 1)
+            self.assertEqual(result["destinations"][0]["connection_count"], 1)
+        finally:
+            browser.close()
+
+    def test_merge_logs_destination_ranking_and_keeps_data_for_job(self):
+        relay = ProxyChainRelay("http://127.0.0.1:8888")
+        relay._record_transfer(("chatgpt.com", 443), upload=10, download=190)
+        relay._record_transfer(("cdn.example.test", 443), upload=10, download=790)
+        relay._record_transfer(("2001:db8::1", 443), download=10)
+        with self.assertLogs("core.browser_traffic", level="INFO") as captured:
+            result = merge_proxy_transport_traffic({"total_bytes": 50}, relay.traffic_snapshot(), label="Roxy")
+        lines = [line for line in captured.output if "[代理目标]" in line]
+        self.assertEqual(len(lines), 3)
+        self.assertIn("target=cdn.example.test:443", lines[0])
+        self.assertIn("total=800B", lines[0])
+        self.assertIn("share=79.21%", lines[0])
+        self.assertIn("target=[2001:db8::1]:443", lines[-1])
+        self.assertEqual(len(result["proxy_transport"]["destinations"]), 3)
+        self.assertEqual(result["total_bytes"], 1010)
+
+    def test_destination_validation_rejects_credentials_and_log_injection(self):
+        self.assertEqual(ProxyChainRelay._destination_key("Example.COM.", 443), ("example.com", 443))
+        for host in ("user:secret@example.com", "example.com\nforged", "example.com/path", ""):
+            with self.assertRaises(ValueError):
+                ProxyChainRelay._destination_key(host, 443)
 
 
 if __name__ == "__main__":

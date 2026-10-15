@@ -40,6 +40,20 @@ def merge_proxy_transport_traffic(observed: dict | None, transport: dict | None,
     browser_total = result["browser_observed_total_bytes"]
     logger.info("[%s] 代理传输流量：上传 %.2f MiB，下载 %.2f MiB，总计 %.2f MiB；页面可见 %.2f MiB",
                 label, upload / 1048576, download / 1048576, (upload + download) / 1048576, browser_total / 1048576)
+    destinations = transport.get("destinations") or []
+    consuming = sorted((item for item in destinations if _non_negative_int(item.get("total_bytes")) > 0),
+                       key=lambda item: _non_negative_int(item.get("total_bytes")), reverse=True)
+    if destinations:
+        logger.info("[%s] 代理目标流量归因：有消耗目标 %s 个（按隧道目标 host:port；含启动和后台流量，不能区分页面/扩展发起者）",
+                    label, len(consuming))
+    for index, item in enumerate(consuming, 1):
+        host = str(item.get("host") or "<unknown>")
+        endpoint = f"[{host}]:{item.get('port', 0)}" if ":" in host else f"{host}:{item.get('port', 0)}"
+        total = _non_negative_int(item.get("total_bytes"))
+        logger.info("[%s] [代理目标] #%s target=%s upload=%sB download=%sB total=%sB (%.2f MiB) share=%.2f%% connections=%s failed=%s",
+                    label, index, endpoint, item.get("upload_bytes", 0), item.get("download_bytes", 0),
+                    total, total / 1048576, total * 100 / (upload + download) if upload + download else 0,
+                    item.get("connection_count", 0), item.get("failed_connection_count", 0))
     return result
 
 

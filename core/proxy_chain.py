@@ -7,6 +7,7 @@ import logging
 import select
 import socket
 import threading
+from typing import Any
 from urllib.parse import urlsplit
 
 from core.proxy_utils import mask_proxy_url, parse_proxy_url
@@ -70,6 +71,7 @@ class ProxyChainRelay:
         self._traffic_lock = threading.Lock()
         self._upload_bytes = 0
         self._download_bytes = 0
+        self._traffic_by_destination: dict[tuple[str, int], dict[str, Any]] = {}
 
     @property
     def last_error(self) -> str:
@@ -81,17 +83,47 @@ class ProxyChainRelay:
             raise RuntimeError("代理链尚未启动")
         return f"http://127.0.0.1:{self._listener.getsockname()[1]}"
 
-    def traffic_snapshot(self) -> dict[str, int | bool]:
+    def traffic_snapshot(self) -> dict[str, Any]:
         """返回整个代理链隧道的实际传输字节数。"""
         with self._traffic_lock:
             upload = int(self._upload_bytes)
             download = int(self._download_bytes)
+            destinations = [dict(item, total_bytes=item["upload_bytes"] + item["download_bytes"])
+                            for item in self._traffic_by_destination.values()]
+            destinations.sort(key=lambda item: (-item["total_bytes"], item["host"], item["port"]))
         return {
             "available": True,
             "upload_bytes": upload,
             "download_bytes": download,
             "total_bytes": upload + download,
+            "destinations": destinations,
+            "attribution": "proxy_connection_destination",
         }
+
+    @staticmethod
+    def _destination_key(host: str, port: int) -> tuple[str, int]:
+        host = str(host).strip().lower().rstrip(".")
+        if not host or len(host) > 253 or any(char.isspace() or char in "/\\@?#" or ord(char) < 32 for char in host):
+            raise ValueError("代理请求目标主机无效")
+        if not 1 <= int(port) <= 65535:
+            raise ValueError("代理请求目标端口无效")
+        return host, int(port)
+
+    def _destination_stats(self, destination: tuple[str, int] | None) -> dict[str, Any]:
+        """调用方持有 _traffic_lock；直接调用 _relay 的测试/工具也可归入 unknown。"""
+        host, port = destination or ("<unknown>", 0)
+        return self._traffic_by_destination.setdefault((host, port), {
+            "host": host, "port": port, "connection_count": 0, "failed_connection_count": 0,
+            "upload_bytes": 0, "download_bytes": 0,
+        })
+
+    def _record_transfer(self, destination: tuple[str, int] | None, *, upload: int = 0, download: int = 0) -> None:
+        with self._traffic_lock:
+            self._upload_bytes += upload
+            self._download_bytes += download
+            stats = self._destination_stats(destination)
+            stats["upload_bytes"] += upload
+            stats["download_bytes"] += download
 
     def start(self) -> "ProxyChainRelay":
         if self._listener is not None:
@@ -293,6 +325,7 @@ class ProxyChainRelay:
 
     def _handle_client(self, client: socket.socket) -> None:
         remote: socket.socket | None = None
+        destination_key: tuple[str, int] | None = None
         try:
             client.settimeout(self.timeout)
             method, destination, initial = self._read_http_request(client)
@@ -303,7 +336,11 @@ class ProxyChainRelay:
                 if parsed.scheme != "http" or not parsed.hostname:
                     raise ValueError("HTTP 代理请求必须使用 http:// 绝对 URL")
                 host, port = parsed.hostname, parsed.port or 80
+            destination_key = self._destination_key(host, port)
+            with self._traffic_lock:
+                self._destination_stats(destination_key)["connection_count"] += 1
             remote = self._connect_target_through_upstream(self.target.host, self.target.port)
+            self._track(remote, True)
             if self.target.scheme in {"socks5", "socks5h"}:
                 self._target_socks_connect(remote, host, port)
             elif method == "CONNECT":
@@ -321,23 +358,31 @@ class ProxyChainRelay:
                 if self.target.scheme in {"socks5", "socks5h"}:
                     lines[0] = method.encode("ascii") + b" " + path.encode("ascii") + b" " + version
                 lines = [line for line in lines if not line.lower().startswith((b"proxy-authorization:", b"proxy-connection:"))]
+                # 普通 HTTP 禁止跨目标复用同一代理连接，保证域名归因准确。
+                # Upgrade 流量仍保留 Connection/Upgrade，以便透传升级连接。
+                if not any(line.lower().startswith(b"upgrade:") for line in lines):
+                    lines = [line for line in lines if not line.lower().startswith(b"connection:")]
+                    lines.append(b"Connection: close")
                 if self.target.scheme == "http" and (self.target.username or self.target.password):
                     credentials = f"{self.target.username or ''}:{self.target.password or ''}".encode("utf-8")
                     lines.append(b"Proxy-Authorization: Basic " + base64.b64encode(credentials))
                 initial = b"\r\n".join(lines) + b"\r\n\r\n" + body
             if initial:
                 remote.sendall(initial)
-                with self._traffic_lock:
-                    self._upload_bytes += len(initial)
+                self._record_transfer(destination_key, upload=len(initial))
             client.settimeout(0.5)
-            self._relay(client, remote)
+            self._relay(client, remote, destination=destination_key)
         except Exception as exc:
             detail = str(exc or "").strip()
             self._last_error = f"{type(exc).__name__}: {detail[:240]}" if detail else type(exc).__name__
+            if destination_key is not None:
+                with self._traffic_lock:
+                    self._destination_stats(destination_key)["failed_connection_count"] += 1
             logger.warning(
-                "代理链连接失败 target=%s upstream=%s error=%s",
+                "代理链连接失败 target=%s upstream=%s destination=%s error=%s",
                 mask_proxy_url(self.target.raw),
                 mask_proxy_url(self.upstream.raw) if self.upstream else "direct",
+                "%s:%s" % destination_key if destination_key else "unknown",
                 self._last_error,
             )
             self._send_http_error(client)
@@ -350,7 +395,7 @@ class ProxyChainRelay:
                     except OSError:
                         pass
 
-    def _relay(self, client: socket.socket, remote: socket.socket) -> None:
+    def _relay(self, client: socket.socket, remote: socket.socket, *, destination: tuple[str, int] | None = None) -> None:
         sockets = [client, remote]
         while not self._stop.is_set():
             try:
@@ -370,13 +415,12 @@ class ProxyChainRelay:
                     continue
                 if not data:
                     return
-                destination = remote if source is client else client
-                destination.sendall(data)
-                with self._traffic_lock:
-                    if source is client:
-                        self._upload_bytes += len(data)
-                    else:
-                        self._download_bytes += len(data)
+                recipient = remote if source is client else client
+                recipient.sendall(data)
+                if source is client:
+                    self._record_transfer(destination, upload=len(data))
+                else:
+                    self._record_transfer(destination, download=len(data))
 
 
 def open_proxy_pool_proxy(

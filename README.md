@@ -147,6 +147,19 @@ BROWSER_DATA_SAVER_BLOCKED_RESOURCE_TYPES=["image", "media", "stylesheet"]
 
 CSS 通常不是注册接口必需，但会影响隐藏元素、布局和可见性判断，建议先单独测试；出现元素找不到或点击异常时移除 `stylesheet`。
 
+#### 阻止 Google 后台组件下载
+
+开启本地浏览器省流量模式后，Roxy/Cloak 使用的本地代理中继会在**连接上游代理之前**拒绝 `dl.google.com`、`gvt1.com` 及其子域名（含 `redirector.gvt1.com` 和 `rr8---*.gvt1.com`），覆盖浏览器启动及后台下载，不依赖 Selenium/Playwright 页面拦截。按域名边界匹配，不会误拦 `notgvt1.com`、`gvt1.com.example.org`；不会因此屏蔽 ChatGPT/OpenAI 域名。
+
+```dotenv
+BROWSER_DATA_SAVER_MODE=True
+BROWSER_DATA_SAVER_BLOCKED_PROXY_HOSTS="dl.google.com\ngvt1.com"
+```
+
+WebUI「浏览器画像 → 省流量代理域名屏蔽」可修改域名，每行一个（不要填写 URL/路径）。填写 `[]` 可单独关闭这组规则；关闭省流量模式也会停用。保存并重启服务后，新建浏览器代理中继使用新规则；现有已建立的连接不受追溯影响。仅对经过本地中继的请求生效，复用已有 Roxy 环境或未经过中继的代理不能保证拦截。
+
+命中后返回本地 HTTP 403，不连接远端、不产生该次代理传输字节；浏览器可能重试，重试也会被本地拒绝。首次命中记录 `[代理省流量]`，任务结束输出 `[代理拦截] target=dl.google.com:443 blocked=...`，累计次数保存在 `network_traffic.proxy_transport.blocked_connection_count` 和各目标的 `blocked_connection_count`。拦截不计入失败连接，也不根据未知下载大小虚构“节省字节”。该规则会阻止匹配域名的组件/扩展下载；需要这些功能时可移除相应域名。
+
 #### 资源明细日志
 
 **定位页面统计之外的流量：** 使用本地代理中继的 Roxy/Cloak 任务会自动输出 `[代理目标]` 汇总，不依赖资源明细开关。按代理连接的目标域名/IP 和端口统计上传、下载、总字节、占比、连接数及失败数，并按消耗从大到小排列；浏览器启动和后台连接也计入。例如：

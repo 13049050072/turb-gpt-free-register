@@ -422,11 +422,11 @@ def build_cloak_driver(proxy: str | None = None) -> tuple[CloakSeleniumDriver, C
             proxy_pool_target = str(pick_proxy() or "").strip()
             proxy, proxy_relay = open_proxy_pool_proxy(proxy_pool_target, measure_transport=True)
     elif proxy and bool(getattr(_cfg, "CLOAK_USE_PROXY", True)):
-        from core.proxy_chain import ProxyChainRelay
+        from core.proxy_chain import ProxyChainRelay, browser_blocked_proxy_hosts
         from core.proxy_utils import parse_proxy_url
         proxy_pool_target = proxy
         if parse_proxy_url(proxy).scheme in {"http", "socks5", "socks5h"}:
-            proxy_relay = ProxyChainRelay(proxy).start()
+            proxy_relay = ProxyChainRelay(proxy, blocked_hosts=browser_blocked_proxy_hosts()).start()
             proxy = proxy_relay.proxy_url
     try:
         from cloakbrowser import launch, launch_persistent_context

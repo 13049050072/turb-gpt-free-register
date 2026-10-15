@@ -565,7 +565,11 @@ EDITABLE_FIELDS = [
     },
     {
         "key": "BROWSER_DATA_SAVER_MODE", "file": "browser.py", "type": "bool", "group": "浏览器画像",
-        "label": "本地浏览器省流量模式", "help": "仅 Roxy/Cloak 本地浏览器拦截图片和媒体等可选资源；Browser Use/Skyvern 云端浏览器不启用；默认关闭",
+        "label": "本地浏览器省流量模式", "help": "仅 Roxy/Cloak 拦截可选资源，并通过本地代理中继阻断配置的后台下载域名；Browser Use/Skyvern 不启用；默认关闭",
+    },
+    {
+        "key": "BROWSER_DATA_SAVER_BLOCKED_PROXY_HOSTS", "file": "browser.py", "type": "list_str_multiline", "group": "浏览器画像",
+        "label": "省流量代理域名屏蔽", "help": "仅开启省流量模式且使用本地浏览器代理中继时生效；连接上游前阻断启动/后台下载。每行一个域名（包含子域名），默认 dl.google.com、gvt1.com；填 [] 关闭，不填 URL 或路径",
     },
     {
         "key": "BROWSER_DATA_SAVER_BLOCKED_RESOURCE_TYPES", "file": "browser.py", "type": "list_str_multiline", "group": "浏览器画像",

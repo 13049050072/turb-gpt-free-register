@@ -52,7 +52,7 @@ def _read_socks_address(sock: socket.socket, atyp: int) -> tuple[str, int]:
 class ProxyChainRelay:
     """Expose a local HTTP CONNECT endpoint that reaches target through upstream."""
 
-    def __init__(self, target: str, upstream: str = "", *, timeout: float = 15.0):
+    def __init__(self, target: str, upstream: str = "", *, timeout: float = 15.0, blocked_hosts=()):
         self.target = parse_proxy_url(target)
         self.upstream = parse_proxy_url(upstream) if upstream else None
         if self.target.scheme not in {"http", "socks5", "socks5h"}:
@@ -72,6 +72,8 @@ class ProxyChainRelay:
         self._upload_bytes = 0
         self._download_bytes = 0
         self._traffic_by_destination: dict[tuple[str, int], dict[str, Any]] = {}
+        self._blocked_hosts = tuple(sorted({self._destination_key(str(host).removeprefix("*."), 443)[0]
+                                           for host in blocked_hosts}))
 
     @property
     def last_error(self) -> str:
@@ -98,6 +100,8 @@ class ProxyChainRelay:
             "total_bytes": upload + download,
             "destinations": destinations,
             "attribution": "proxy_connection_destination",
+            "blocked_hosts": list(self._blocked_hosts),
+            "blocked_connection_count": sum(item["blocked_connection_count"] for item in destinations),
         }
 
     @staticmethod
@@ -114,6 +118,7 @@ class ProxyChainRelay:
         host, port = destination or ("<unknown>", 0)
         return self._traffic_by_destination.setdefault((host, port), {
             "host": host, "port": port, "connection_count": 0, "failed_connection_count": 0,
+            "blocked_connection_count": 0,
             "upload_bytes": 0, "download_bytes": 0,
         })
 
@@ -339,6 +344,19 @@ class ProxyChainRelay:
             destination_key = self._destination_key(host, port)
             with self._traffic_lock:
                 self._destination_stats(destination_key)["connection_count"] += 1
+            normalized_host = destination_key[0]
+            if any(normalized_host == rule or normalized_host.endswith("." + rule) for rule in self._blocked_hosts):
+                with self._traffic_lock:
+                    stats = self._destination_stats(destination_key)
+                    stats["blocked_connection_count"] += 1
+                    first_block = stats["blocked_connection_count"] == 1
+                if first_block:
+                    logger.info("[代理省流量] 已在连接上游前拦截 target=%s:%s（后续重试仅累计次数）", *destination_key)
+                try:
+                    client.sendall(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                except OSError:
+                    pass
+                return
             remote = self._connect_target_through_upstream(self.target.host, self.target.port)
             self._track(remote, True)
             if self.target.scheme in {"socks5", "socks5h"}:
@@ -423,6 +441,17 @@ class ProxyChainRelay:
                     self._record_transfer(destination, download=len(data))
 
 
+def browser_blocked_proxy_hosts() -> tuple[str, ...]:
+    """只由本地浏览器调用；协议请求、邮箱 API 等代理链不自动套用规则。"""
+    from config import browser as browser_cfg
+    if not bool(getattr(browser_cfg, "BROWSER_DATA_SAVER_MODE", False)):
+        return ()
+    hosts = getattr(browser_cfg, "BROWSER_DATA_SAVER_BLOCKED_PROXY_HOSTS", ["dl.google.com", "gvt1.com"])
+    if isinstance(hosts, str):
+        hosts = hosts.replace(",", "\n").splitlines()
+    return tuple(str(host).strip() for host in (hosts or []) if str(host).strip())
+
+
 def open_proxy_pool_proxy(
     selected_proxy: str | None = None,
     *,
@@ -449,5 +478,8 @@ def open_proxy_pool_proxy(
     if not upstream and parse_proxy_url(target).scheme not in {"http", "socks5", "socks5h"}:
         return target, None
 
-    relay = ProxyChainRelay(target, upstream, timeout=timeout).start()
+    options = {"timeout": timeout}
+    if measure_transport:
+        options["blocked_hosts"] = browser_blocked_proxy_hosts()
+    relay = ProxyChainRelay(target, upstream, **options).start()
     return relay.proxy_url, relay

@@ -50,10 +50,11 @@ def merge_proxy_transport_traffic(observed: dict | None, transport: dict | None,
         host = str(item.get("host") or "<unknown>")
         endpoint = f"[{host}]:{item.get('port', 0)}" if ":" in host else f"{host}:{item.get('port', 0)}"
         total = _non_negative_int(item.get("total_bytes"))
-        logger.info("[%s] [代理目标] #%s target=%s upload=%sB download=%sB total=%sB (%.2f MiB) share=%.2f%% connections=%s failed=%s",
+        logger.info("[%s] [代理目标] #%s target=%s upload=%sB download=%sB total=%sB (%.2f MiB) share=%.2f%% connections=%s failed=%s retries=%s recovered=%s",
                     label, index, endpoint, item.get("upload_bytes", 0), item.get("download_bytes", 0),
                     total, total / 1048576, total * 100 / (upload + download) if upload + download else 0,
-                    item.get("connection_count", 0), item.get("failed_connection_count", 0))
+                    item.get("connection_count", 0), item.get("failed_connection_count", 0),
+                    item.get("connect_retry_count", 0), item.get("recovered_connection_count", 0))
     for item in destinations:
         if _non_negative_int(item.get("blocked_connection_count")):
             logger.info("[%s] [代理拦截] target=%s:%s blocked=%s（上游连接前拒绝，未产生代理传输流量）",

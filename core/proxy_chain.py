@@ -25,6 +25,20 @@ class ProxyChainError(ConnectionError):
     """A user-facing error from the outer proxy hop."""
 
 
+class SocksConnectError(ProxyChainError):
+    """SOCKS5 代理已返回的 CONNECT 错误，不代表账号密码错误。"""
+
+    def __init__(self, code: int):
+        self.code = code
+        reasons = {1: "代理服务器一般性失败", 2: "代理规则拒绝", 3: "网络不可达", 4: "目标主机不可达",
+                   5: "目标端口拒绝连接", 6: "连接 TTL 超时", 7: "不支持 CONNECT 命令", 8: "不支持目标地址类型"}
+        super().__init__(f"动态代理 CONNECT 失败（SOCKS5 code {code}：{reasons.get(code, '未知错误')}）")
+
+    @property
+    def retryable(self) -> bool:
+        return self.code in {1, 3, 4, 6}
+
+
 def _read_exact(sock: socket.socket, size: int) -> bytes:
     chunks = bytearray()
     while len(chunks) < size:
@@ -119,6 +133,7 @@ class ProxyChainRelay:
         return self._traffic_by_destination.setdefault((host, port), {
             "host": host, "port": port, "connection_count": 0, "failed_connection_count": 0,
             "blocked_connection_count": 0,
+            "connect_retry_count": 0, "recovered_connection_count": 0,
             "upload_bytes": 0, "download_bytes": 0,
         })
 
@@ -204,7 +219,11 @@ class ProxyChainRelay:
             rdns=self.upstream.scheme == "socks5h",
         )
         remote.settimeout(self.timeout)
-        remote.connect((host, port))
+        try:
+            remote.connect((host, port))
+        except Exception:
+            remote.close()
+            raise
         return remote
 
     @staticmethod
@@ -259,7 +278,43 @@ class ProxyChainRelay:
         remote.sendall(b"\x05\x01\x00" + self._pack_socks_address(host, port))
         reply_code = self._read_socks_reply(remote)
         if reply_code:
-            raise ConnectionError(f"动态代理 CONNECT 失败（SOCKS5 code {reply_code}）")
+            raise SocksConnectError(reply_code)
+
+    def _open_target_tunnel(self, host: str, port: int, method: str, destination: tuple[str, int]) -> socket.socket:
+        """仅在转发浏览器数据前重试握手；绝不重放 HTTP 请求或 TLS 数据。"""
+        for attempt in range(1, 4):
+            remote = None
+            try:
+                if self._stop.is_set():
+                    raise ConnectionAbortedError("代理中继正在关闭")
+                remote = self._connect_target_through_upstream(self.target.host, self.target.port)
+                self._track(remote, True)
+                if self.target.scheme in {"socks5", "socks5h"}:
+                    self._target_socks_connect(remote, host, port)
+                elif method == "CONNECT":
+                    self._target_http_connect(remote, host, port)
+                if attempt > 1:
+                    with self._traffic_lock:
+                        self._destination_stats(destination)["recovered_connection_count"] += 1
+                    logger.info("代理重连已恢复 destination=%s:%s attempts=%s", *destination, attempt)
+                return remote
+            except Exception as exc:
+                if remote is not None:
+                    self._track(remote, False)
+                    try:
+                        remote.close()
+                    except OSError:
+                        pass
+                if not isinstance(exc, SocksConnectError) or not exc.retryable or attempt == 3 or self._stop.is_set():
+                    raise
+                with self._traffic_lock:
+                    self._destination_stats(destination)["connect_retry_count"] += 1
+                delay = 0.25 * attempt
+                logger.info("代理临时建连失败 destination=%s:%s code=%s，%.2fs 后重试（%s/3）",
+                            *destination, exc.code, delay, attempt + 1)
+                if self._stop.wait(delay):
+                    raise
+        raise AssertionError("unreachable")
 
     def _target_http_connect(self, remote: socket.socket, host: str, port: int) -> None:
         """经上游连接到 HTTP 目标代理，并在目标代理上建立 CONNECT 隧道。"""
@@ -331,6 +386,7 @@ class ProxyChainRelay:
     def _handle_client(self, client: socket.socket) -> None:
         remote: socket.socket | None = None
         destination_key: tuple[str, int] | None = None
+        connect_response_sent = False
         try:
             client.settimeout(self.timeout)
             method, destination, initial = self._read_http_request(client)
@@ -357,15 +413,11 @@ class ProxyChainRelay:
                 except OSError:
                     pass
                 return
-            remote = self._connect_target_through_upstream(self.target.host, self.target.port)
-            self._track(remote, True)
-            if self.target.scheme in {"socks5", "socks5h"}:
-                self._target_socks_connect(remote, host, port)
-            elif method == "CONNECT":
-                self._target_http_connect(remote, host, port)
+            remote = self._open_target_tunnel(host, port, method, destination_key)
             remote.settimeout(0.5)
             if method == "CONNECT":
                 client.sendall(b"HTTP/1.1 200 Connection Established\r\nConnection: keep-alive\r\n\r\n")
+                connect_response_sent = True
                 # CONNECT 头不走目标隧道；保留同一 recv 中提前到达的 TLS 数据。
                 initial = initial.split(b"\r\n\r\n", 1)[1]
             else:
@@ -391,6 +443,9 @@ class ProxyChainRelay:
             client.settimeout(0.5)
             self._relay(client, remote, destination=destination_key)
         except Exception as exc:
+            if self._stop.is_set():
+                logger.debug("代理中继关闭时连接终止 destination=%s", destination_key)
+                return
             detail = str(exc or "").strip()
             self._last_error = f"{type(exc).__name__}: {detail[:240]}" if detail else type(exc).__name__
             if destination_key is not None:
@@ -403,7 +458,8 @@ class ProxyChainRelay:
                 "%s:%s" % destination_key if destination_key else "unknown",
                 self._last_error,
             )
-            self._send_http_error(client)
+            if not connect_response_sent:
+                self._send_http_error(client)
         finally:
             for conn in (client, remote):
                 if conn is not None:

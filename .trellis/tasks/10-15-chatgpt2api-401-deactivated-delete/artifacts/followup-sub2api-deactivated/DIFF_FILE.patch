@@ -1,0 +1,846 @@
+diff --git a/.trellis/spec/backend/sub2api-credential-rotation.md b/.trellis/spec/backend/sub2api-credential-rotation.md
+index 2a6230a..3faea6a 100644
+--- a/.trellis/spec/backend/sub2api-credential-rotation.md
++++ b/.trellis/spec/backend/sub2api-credential-rotation.md
+@@ -80,7 +80,7 @@ retry_started_at, retry_batch_id, local_codex_status,
+ retryable, cleanup_supported, manual_action
+ ```
+ 
+-Allowed states are `pending`, `retrying`, `verified`, `cleanup_ready`, `cleaned`, `failed`, and `ambiguous`. `replacement_health` is empty without a keeper and otherwise records only the cleanup invariant `healthy` or `unauthorized`; audits created before this field existed default to `healthy` so deployed replacement cleanup remains restart-safe. Management keys, access/refresh tokens, OAuth codes, callback URLs, cookies, and credential JSON must never be logged, persisted, or returned. Reasons are bounded and secret-like text is redacted.
++Allowed states are `pending`, `retrying`, `verified`, `cleanup_ready`, `cleaned`, `failed`, `ambiguous`, `deactivated`, and `deleted`. `replacement_health` is empty without a keeper and otherwise records only the cleanup invariant `healthy` or `unauthorized`; audits created before this field existed default to `healthy` so deployed replacement cleanup remains restart-safe. Management keys, access/refresh tokens, OAuth codes, callback URLs, cookies, and credential JSON must never be logged, persisted, or returned. Reasons are bounded and secret-like text is redacted.
+ 
+ `sub2api_401_audit.json` is persisted atomically. If the configured audit path is a symlink, create the temporary file beside the resolved target so `os.replace()` remains on the writable data volume and preserves the symlink. Use mode `0600` where supported.
+ 
+@@ -118,6 +118,10 @@ All Sub2API-401 responses set `Cache-Control: no-store, max-age=0`, `Pragma: no-
+ | Detect lists an `error` account, an account without `status`, a same-email sibling of a probed account, or an ID in the email group of a retry row whose old ID still exists | Send it to batch-refresh and classify from the refresh result as before; with no such IDs, send no refresh request |
+ | A retry row's locked old ID is absent on a later detect and no local Codex retry is running | Release its same-email IDs to normal per-account detection; keep the row only when it is `cleaned`, otherwise drop it. A revoked replacement becomes its own retryable `pending` row |
+ | A retry row's locked old ID is absent while local Codex retry is `retrying`/`queued`/`running` | Keep the row and its same-email ID lock until the retry finishes |
++| Local account is dead: `codex_status=deactivated`, `live_check_status=deactivated`, or the stored Codex error matches `detect_account_unusable_text` (e.g. MFA 403 "has been deleted or deactivated"), and no retry is running | `local_retry_status()` reports `deactivated`; a retry row or an unauthorized singleton becomes `deactivated` (not `failed`/`pending`), `retryable=false`, `cleanup_account_id` = the exact ID |
++| `delete_deactivated(ids, opt_in=True)` | Re-list; require the exact ID listed with the locked email and a fresh batch-refresh still `unauthorized`; then PUT `inactive` + DELETE that ID only; re-list: absent → `deleted`, still listed or delete error → stay `deactivated` (retryable), refresh not 401 or email drift → `ambiguous` with no request |
++| Retry batch post-detect, scheduled inspection, or the cleanup endpoint sees `deactivated` rows | Call `delete_deactivated` for those exact IDs; `deleted` counts as completed. `deleted` rows stay as history after the ID leaves Sub2API |
++| Codex OAuth raises any stage error whose text marks a dead account | `run_codex_oauth` returns `status=deactivated` instead of `failed` |
+ 
+ ### 5. Good/Base/Bad Cases
+ 
+diff --git a/core/codex_oauth.py b/core/codex_oauth.py
+index ad354ed..ff6bffa 100644
+--- a/core/codex_oauth.py
++++ b/core/codex_oauth.py
+@@ -42,6 +42,7 @@ from core.openai_auth import (
+     _reset_retryable_circuit,
+     _extract_error_code,
+     detect_account_unusable_response_body,
++    detect_account_unusable_text,
+     AccountUnusableError,
+     request_sentinel_token,
+     build_sentinel_header,
+@@ -2066,6 +2067,16 @@ def run_codex_oauth(
+                 force=force,
+                 _cpa_reauth_round=_cpa_reauth_round + 1,
+             )
++        # Stages other than email OTP (password, MFA) raise plain errors that
++        # still carry the OpenAI dead-account body; classify them the same way.
++        dead_code = detect_account_unusable_text(str(exc))
++        if dead_code:
++            logger.warning(f"[Codex] 账号已废（{dead_code}）：{email}")
++            return _codex_result(
++                status="deactivated",
++                email=email,
++                message=f"账号已废（{dead_code}）",
++            )
+         logger.warning("[Codex] 失败：%s，%s: %s", email, type(exc).__name__, _safe_sensitive_text(exc, limit=200))
+         logger.debug("[Codex] 失败详情:", exc_info=True)
+         return _codex_result(
+diff --git a/core/openai_auth.py b/core/openai_auth.py
+index 45ef820..197003c 100644
+--- a/core/openai_auth.py
++++ b/core/openai_auth.py
+@@ -79,6 +79,8 @@ _ACCOUNT_DEAD_TEXT_MARKERS = (
+     "your account has been deleted",
+     "your account was deactivated",
+     "your account was deleted",
++    # Codex MFA/password 403: "You do not have an account because it has been deleted or deactivated."
++    "has been deleted or deactivated",
+     "账号已停用",
+     "账号已禁用",
+     "账号已删除",
+diff --git a/core/sub2api_401_service.py b/core/sub2api_401_service.py
+index 38c7507..08f1289 100644
+--- a/core/sub2api_401_service.py
++++ b/core/sub2api_401_service.py
+@@ -15,10 +15,13 @@ from core.sub2api_admin import Sub2ApiAdminClient
+ _MAX_REASON = 180
+ _MAX_ID = 160
+ _MAX_NAME = 240
+-_STATES = {"pending", "retrying", "verified", "cleanup_ready", "cleaned", "failed", "ambiguous"}
++_STATES = {"pending", "retrying", "verified", "cleanup_ready", "cleaned", "failed", "ambiguous", "deactivated", "deleted"}
+ _HEALTH_STATES = {"healthy", "unauthorized", "timeout", "unknown"}
+ _RUNNING_LOCAL_STATES = {"retrying", "queued", "running"}
+ _FAILED_LOCAL_STATES = {"failed", "stopped", "cancelled", "canceled", "error"}
++_DEAD_LOCAL_STATES = {"deactivated"}
++# Rows kept as history after their account ID left Sub2API.
++_HISTORY_STATES = {"cleaned", "deleted"}
+ # Detection refreshes only accounts Sub2API itself marks with these statuses.
+ _PROBE_STATUSES = {"error"}
+ _UNAUTHORIZED_RE = re.compile(r"(?:\b401\b|unauthori[sz]ed|invalid[_ -]?grant|invalid[_ -]?token)", re.I)
+@@ -111,6 +114,27 @@ def _health_from_error(value: object) -> str:
+     return "unknown"
+ 
+ 
++def local_retry_status(account: dict) -> str:
++    """Map a local account row to the Codex retry status detection uses.
++
++    A running retry wins. Otherwise a persisted deactivated verdict, or a stored
++    Codex error in which OpenAI says the account was deleted or deactivated,
++    marks the account dead so it is deleted instead of retried again.
++    """
++    from core.openai_auth import detect_account_unusable_text
++
++    status = _text(account.get("codex_status"), 64).lower()
++    if status in _RUNNING_LOCAL_STATES:
++        return status
++    if (
++        status in _DEAD_LOCAL_STATES
++        or _text(account.get("live_check_status"), 32).lower() in _DEAD_LOCAL_STATES
++        or detect_account_unusable_text(str(account.get("codex_error") or ""))
++    ):
++        return "deactivated"
++    return status
++
++
+ class Sub2ApiSnapshotConflict(RuntimeError):
+     """The live Sub2API account IDs no longer match the persisted selection."""
+ 
+@@ -246,7 +270,8 @@ class Sub2Api401Service:
+             "cleanup_supported": self.cleanup_supported,
+             "manual_action": (
+                 "历史重复项或自动清理失败时，确认后仅按锁定的旧 account_id 重试清理"
+-                if state == "cleanup_ready" else ""
++                if state == "cleanup_ready"
++                else "确认后仅删除锁定的废号 account_id" if state == "deactivated" else ""
+             ),
+         }
+ 
+@@ -363,6 +388,14 @@ class Sub2Api401Service:
+             "cleanup_account_id": "",
+         }
+ 
++        if old.get("state") == "deleted" and not old_exists:
++            return self._sanitize_entry({
++                **base,
++                "state": "deleted",
++                "reason": old.get("reason") or "废号 account_id 已从 Sub2API 删除",
++                "cleanup_account_id": old_id,
++            })
++
+         if old.get("state") == "cleaned" and replacement:
+             if old_id not in by_id:
+                 # Cleanup is finished history. The replacement is no longer
+@@ -428,6 +461,13 @@ class Sub2Api401Service:
+             return self._sanitize_entry({**base, "state": "ambiguous", "reason": "已记录的替代 account_id 不再满足健康与邮箱一致性条件", "replacement_account_id": ""})
+ 
+         new_ids = [account_id for account_id in current_ids if account_id not in set(pre_ids)]
++        if local_status in _DEAD_LOCAL_STATES:
++            return self._sanitize_entry({
++                **base,
++                "state": "deactivated",
++                "reason": "Codex 确认账号已删除或停用；待删除锁定的旧 Sub2API account_id",
++                "cleanup_account_id": old_id,
++            })
+         if local_status in _FAILED_LOCAL_STATES:
+             return self._sanitize_entry({
+                 **base,
+@@ -541,6 +581,9 @@ class Sub2Api401Service:
+                 probe.add(account_id)
+         with self._lock:
+             for old_id, item in self._tracked.items():
++                dead_id = _account_id(item.get("cleanup_account_id")) or old_id
++                if item.get("state") == "deactivated" and dead_id in listed:
++                    probe.add(dead_id)
+                 if item.get("pre_retry_account_ids") and old_id in listed:
+                     probe.add(old_id)
+                     probe.update(ids_by_email.get(_email(item.get("email")), set()))
+@@ -587,6 +630,8 @@ class Sub2Api401Service:
+ 
+             for account_id, old in previous.items():
+                 if not old.get("pre_retry_account_ids"):
++                    if old.get("state") == "deleted" and account_id not in by_id:
++                        next_tracked[account_id] = self._sanitize_entry({**old, "checked_at": checked_at})
+                     continue
+                 retry_status = local_status.get(_email(old.get("email")), "")
+                 item = self._evaluate_after_retry(
+@@ -602,7 +647,7 @@ class Sub2Api401Service:
+                     # The locked old ID is gone, so this retry row can no longer
+                     # act. Release same-email IDs to normal per-account
+                     # detection; a revoked replacement then becomes `pending`.
+-                    if item.get("state") == "cleaned":
++                    if item.get("state") in _HISTORY_STATES:
+                         next_tracked[account_id] = item
+                     continue
+                 next_tracked[account_id] = item
+@@ -634,6 +679,10 @@ class Sub2Api401Service:
+                     else:
+                         state, reason, retryable = "ambiguous", keeper_reason, False
+                         replacement_id, cleanup_id = "", ""
++                elif health == "unauthorized" and local_status.get(email) in _DEAD_LOCAL_STATES:
++                    state, reason, retryable = "deactivated", "本地已确认账号已删除或停用；待删除 Sub2API account_id", False
++                    cleanup_id = account_id
++                    preserve_decision_reason = True
+                 elif health == "unauthorized":
+                     state, reason, retryable = "pending", "Sub2API 刷新返回 unauthorized/401", True
+                 elif health in {"timeout", "unknown"}:
+@@ -655,7 +704,7 @@ class Sub2Api401Service:
+                     "post_retry_account_ids": [],
+                     "replacement_account_id": replacement_id if len(group) != 1 and keeper else "",
+                     "replacement_health": keeper_health if len(group) != 1 and keeper else "",
+-                    "cleanup_account_id": cleanup_id if len(group) != 1 and keeper else "",
++                    "cleanup_account_id": cleanup_id if (len(group) != 1 and keeper) or state == "deactivated" else "",
+                     "candidate_count": len(group) if email else 1,
+                     "checked_at": checked_at,
+                     "retryable": retryable,
+@@ -775,6 +824,86 @@ class Sub2Api401Service:
+                 })
+             self._persist_locked()
+ 
++    def delete_deactivated(self, values: list[object], *, opt_in: bool = False, limit: int = 50) -> dict:
++        """Delete exact `deactivated` account IDs after re-list and a 401 refresh."""
++        with self._operation_lock:
++            return self._delete_deactivated_locked(values, opt_in=opt_in, limit=limit)
++
++    def _delete_deactivated_locked(self, values: list[object], *, opt_in: bool, limit: int) -> dict:
++        selected = _dedupe_ids(values, limit=limit)
++        with self._lock:
++            targets = [
++                self._sanitize_entry(self._tracked[account_id])
++                for account_id in selected
++                if account_id in self._tracked and self._tracked[account_id].get("state") == "deactivated"
++            ]
++        review = [
++            {
++                "account_id": item["account_id"],
++                "email": item["email"],
++                "cleanup_account_id": item["cleanup_account_id"] or item["account_id"],
++                "manual_action": "仅删除锁定的废号 account_id",
++            }
++            for item in targets
++        ]
++        if not opt_in or not targets or not self.cleanup_supported:
++            return {"ok": True, "deletion_performed": False, "items": review, "deleted_count": 0}
++
++        # Delete only while Sub2API still lists the exact ID with the locked
++        # email and its credential still refreshes as 401.
++        by_id, _ = self._account_maps(self._list_fn())
++        dead_ids = _dedupe_ids([entry["cleanup_account_id"] for entry in review if entry["cleanup_account_id"] in by_id])
++        kinds, _reasons = self._refresh_maps(
++            dead_ids,
++            self._refresh_fn(dead_ids) if dead_ids else {"total": 0, "success": 0, "failed": 0, "errors": []},
++        )
++        attempted: dict[str, str] = {}
++        outcomes: dict[str, tuple[str, str]] = {}
++        for item, entry in zip(targets, review):
++            dead_id = entry["cleanup_account_id"]
++            row = by_id.get(dead_id)
++            if row is None:
++                outcomes[item["account_id"]] = ("deleted", "废号 account_id 已不在 Sub2API")
++            elif row.get("email") != item["email"]:
++                outcomes[item["account_id"]] = ("ambiguous", "删除前 Sub2API 邮箱已变化，禁止删除")
++            elif kinds.get(dead_id) != "unauthorized":
++                outcomes[item["account_id"]] = ("ambiguous", "删除前 Sub2API 刷新未返回 401，禁止按废号删除")
++            else:
++                try:
++                    self._delete_fn(dead_id)
++                except Exception as exc:
++                    outcomes[item["account_id"]] = ("deactivated", _reason(exc, "Sub2API 删除失败，可重试"))
++                else:
++                    attempted[item["account_id"]] = dead_id
++        if attempted:
++            after_by_id, _ = self._account_maps(self._list_fn())
++            for account_id, dead_id in attempted.items():
++                outcomes[account_id] = (
++                    ("deactivated", "删除后 Sub2API 仍列出该 account_id，可重试")
++                    if dead_id in after_by_id
++                    else ("deleted", "账号已删除或停用，已从 Sub2API 删除锁定的 account_id")
++                )
++
++        results: list[dict] = []
++        with self._lock:
++            for item in targets:
++                state, reason = outcomes[item["account_id"]]
++                self._tracked[item["account_id"]] = self._sanitize_entry({
++                    **item,
++                    "state": state,
++                    "reason": reason,
++                    "checked_at": _now(),
++                    "retryable": False,
++                })
++                results.append({"account_id": item["account_id"], "ok": state == "deleted", "state": state, "reason": reason})
++            self._persist_locked()
++        return {
++            "ok": True,
++            "deletion_performed": bool(attempted),
++            "items": results,
++            "deleted_count": sum(1 for entry in results if entry["ok"]),
++        }
++
+     def cleanup(self, values: list[object], *, opt_in: bool = False, limit: int = 50) -> dict:
+         with self._operation_lock:
+             return self._cleanup_locked(values, opt_in=opt_in, limit=limit)
+diff --git a/tests/test_codex_dead_account_detection.py b/tests/test_codex_dead_account_detection.py
+index 1a6285a..367c50a 100644
+--- a/tests/test_codex_dead_account_detection.py
++++ b/tests/test_codex_dead_account_detection.py
+@@ -1,7 +1,7 @@
+ # -*- coding: utf-8 -*-
+ import unittest
+ 
+-from core.openai_auth import detect_account_unusable_response_body
++from core.openai_auth import detect_account_unusable_response_body, detect_account_unusable_text
+ from core.browser_use_codex_oauth import _wait_after_email_submit
+ 
+ 
+@@ -17,6 +17,36 @@ class CodexDeadAccountDetectionTests(unittest.TestCase):
+         )
+         self.assertEqual(detect_account_unusable_response_body('Your account has been deactivated.'), "")
+ 
++    def test_codex_mfa_403_deleted_or_deactivated_text_is_dead_account(self):
++        text = (
++            'RuntimeError: [Codex] MFA 验证失败 status=403: { "error": { "message": "You do not have an account '
++            'because it has been deleted or deactivated. If you believe this was an error, please contact us'
++        )
++        self.assertTrue(detect_account_unusable_text(text))
++        self.assertEqual("", detect_account_unusable_text("RuntimeError: [Codex] MFA 验证失败 status=401: invalid code"))
++
++    def test_run_codex_oauth_maps_dead_account_error_from_any_stage_to_deactivated(self):
++        from unittest.mock import patch
++
++        import core.codex_oauth as codex_oauth
++
++        error = RuntimeError(
++            '[Codex] MFA 验证失败 status=403: { "error": { "message": "You do not have an account because it '
++            'has been deleted or deactivated."'
++        )
++        from unittest.mock import MagicMock
++
++        from config import codex as codex_cfg
++
++        with patch.object(codex_cfg, "CODEX_OAUTH_DRIVER", "protocol", create=True), patch.object(
++            codex_oauth, "_resolve_codex_proxy", return_value=None
++        ), patch.object(codex_oauth, "BrowserSession", MagicMock()), patch.object(
++            codex_oauth, "_codex_auth_url_source", side_effect=error
++        ):
++            result = codex_oauth.run_codex_oauth("dead@example.com", otp_provider=lambda *_: "", force=True)
++        self.assertEqual("deactivated", result["status"])
++        self.assertFalse(result["ok"])
++
+     def test_browser_use_email_submit_returns_deactivated_from_response_tracker(self):
+         class Body:
+             def inner_text(self, timeout=1000):
+diff --git a/tests/test_sub2api_401_service.py b/tests/test_sub2api_401_service.py
+index 3165d35..9781198 100644
+--- a/tests/test_sub2api_401_service.py
++++ b/tests/test_sub2api_401_service.py
+@@ -6,7 +6,7 @@ import unittest
+ from pathlib import Path
+ 
+ from core.sub2api_admin import Sub2ApiAdminClient
+-from core.sub2api_401_service import Sub2Api401Service, Sub2ApiSnapshotConflict
++from core.sub2api_401_service import Sub2Api401Service, Sub2ApiSnapshotConflict, local_retry_status
+ 
+ 
+ class Sub2Api401ServiceTests(unittest.TestCase):
+@@ -828,6 +828,95 @@ class Sub2Api401ServiceTests(unittest.TestCase):
+         self.assertEqual("unauthorized", by_id["new"]["health"])
+         self.assertTrue(by_id["new"]["retryable"])
+ 
++    def dead_service(self, rows, deleted, *, failing=("old",)):
++        def refresh(ids):
++            errors = [{"account_id": value, "error": "Token revoked (401)"} for value in ids if value in failing]
++            return {"total": len(ids), "success": len(ids) - len(errors), "failed": len(errors), "errors": errors}
++
++        def delete(account_id):
++            deleted.append(account_id)
++            rows[:] = [row for row in rows if row["account_id"] != account_id]
++            return {"ok": True}
++
++        return self.service(rows=rows, refresh=refresh, delete=delete)
++
++    def test_dead_codex_retry_becomes_deactivated_then_deletes_exact_old_id(self):
++        rows = [
++            {"account_id": "old", "email": "one@example.com", "status": "error"},
++            {"account_id": "other", "email": "two@example.com", "status": "active"},
++        ]
++        deleted = []
++        service = self.dead_service(rows, deleted)
++        service.detect()
++        service.mark_retrying(["old"])
++        item = service.detect({"one@example.com": "deactivated"})["items"][0]
++        self.assertEqual("deactivated", item["state"])
++        self.assertFalse(item["retryable"])
++        self.assertEqual("old", item["cleanup_account_id"])
++
++        preview = service.delete_deactivated(["old"])
++        self.assertFalse(preview["deletion_performed"])
++        self.assertEqual([], deleted)
++
++        result = service.delete_deactivated(["old"], opt_in=True)
++        self.assertEqual(1, result["deleted_count"])
++        self.assertEqual(["old"], deleted)
++        self.assertEqual(["other"], [row["account_id"] for row in rows])
++        self.assertEqual("deleted", service.state()["items"][0]["state"])
++
++        items = service.detect({"one@example.com": "deactivated"})["items"]
++        self.assertEqual([("old", "deleted")], [(entry["account_id"], entry["state"]) for entry in items])
++
++    def test_dead_singleton_without_retry_is_deactivated_not_pending(self):
++        rows = [{"account_id": "old", "email": "one@example.com", "status": "error"}]
++        deleted = []
++        service = self.dead_service(rows, deleted)
++        item = service.detect({"one@example.com": "deactivated"})["items"][0]
++        self.assertEqual("deactivated", item["state"])
++        self.assertFalse(item["retryable"])
++        self.assertEqual("old", item["cleanup_account_id"])
++        service.delete_deactivated(["old"], opt_in=True)
++        self.assertEqual(["old"], deleted)
++        items = service.detect({"one@example.com": "deactivated"})["items"]
++        self.assertEqual([("old", "deleted")], [(entry["account_id"], entry["state"]) for entry in items])
++
++    def test_delete_deactivated_refuses_when_refresh_is_not_401(self):
++        rows = [{"account_id": "old", "email": "one@example.com", "status": "error"}]
++        deleted = []
++        service = self.dead_service(rows, deleted)
++        service.detect({"one@example.com": "deactivated"})
++        recovered = self.dead_service(rows, deleted, failing=())
++        result = recovered.delete_deactivated(["old"], opt_in=True)
++        self.assertEqual([], deleted)
++        self.assertEqual("ambiguous", result["items"][0]["state"])
++
++    def test_delete_deactivated_failure_stays_deactivated_for_retry(self):
++        rows = [{"account_id": "old", "email": "one@example.com", "status": "error"}]
++
++        def refresh(ids):
++            return {"total": len(ids), "success": 0, "failed": len(ids), "errors": [{"account_id": value, "error": "401"} for value in ids]}
++
++        def delete(_account_id):
++            raise RuntimeError("Sub2API 管理接口请求失败")
++
++        service = self.service(rows=rows, refresh=refresh, delete=delete)
++        service.detect({"one@example.com": "deactivated"})
++        result = service.delete_deactivated(["old"], opt_in=True)
++        self.assertFalse(result["items"][0]["ok"])
++        self.assertEqual("deactivated", service.state()["items"][0]["state"])
++
++    def test_local_retry_status_marks_dead_accounts_and_keeps_running_retries(self):
++        dead_error = (
++            'RuntimeError: [Codex] MFA 验证失败 status=403: { "error": { "message": "You do not have an account '
++            'because it has been deleted or deactivated.'
++        )
++        self.assertEqual("deactivated", local_retry_status({"codex_status": "failed", "codex_error": dead_error}))
++        self.assertEqual("deactivated", local_retry_status({"codex_status": "failed", "live_check_status": "deactivated"}))
++        self.assertEqual("deactivated", local_retry_status({"codex_status": "deactivated"}))
++        self.assertEqual("running", local_retry_status({"codex_status": "running", "codex_error": dead_error}))
++        self.assertEqual("failed", local_retry_status({"codex_status": "failed", "codex_error": "ProxyError: timeout"}))
++        self.assertEqual("", local_retry_status({}))
++
+     def test_stuck_audit_row_with_missing_old_id_releases_current_id(self):
+         self.audit_path.write_text(json.dumps({"version": 2, "items": {"1": {
+             "account_id": "1", "email": "one@example.com", "state": "ambiguous", "health": "unauthorized",
+diff --git a/tests/test_sub2api_401_templates.py b/tests/test_sub2api_401_templates.py
+index c3fc48a..3e9abf6 100644
+--- a/tests/test_sub2api_401_templates.py
++++ b/tests/test_sub2api_401_templates.py
+@@ -54,6 +54,22 @@ class Sub2Api401TemplateTests(unittest.TestCase):
+             self.assertIn(text, page)
+         self.assertNotIn("批量刷新 OpenAI OAuth 账号", page)
+ 
++    def test_page_filters_rows_and_offers_dead_account_deletion(self):
++        page = Path("webui/templates/sub2api_401.html").read_text(encoding="utf-8")
++        for text in (
++            '<select id="stateFilter">',
++            '<option value="deactivated">废号待删除</option>',
++            '<option value="deleted">已删除废号</option>',
++            "deactivated:'废号待删除',deleted:'已删除废号'",
++            "const visible = items.filter(item => inFilter(item));",
++            "if (actionableRow(item) && inFilter(item)) selected.add(item.account_id);",
++            "const cleanable = item => item.state === 'cleanup_ready' || item.state === 'deactivated';",
++            '<b id="deactivatedCount">0</b>',
++            '<b id="deletedCount">0</b>',
++            "localStorage.setItem(filterStorageKey, stateFilter)",
++        ):
++            self.assertIn(text, page)
++
+     def test_page_polls_retrying_state_until_terminal(self):
+         page = Path("webui/templates/sub2api_401.html").read_text(encoding="utf-8")
+         for text in (
+diff --git a/tests/test_webui_credential_health_scheduler.py b/tests/test_webui_credential_health_scheduler.py
+index 77e73b6..6d9a3c6 100644
+--- a/tests/test_webui_credential_health_scheduler.py
++++ b/tests/test_webui_credential_health_scheduler.py
+@@ -197,6 +197,21 @@ class WebUICredentialHealthSchedulerTests(unittest.TestCase):
+         mark_retrying.assert_called_once_with(["old-exact-id"], batch_id=ANY)
+         cleanup.assert_called_once_with(["old-exact-id"], opt_in=True, limit=50)
+ 
++    def test_sub2api_automatic_job_deletes_deactivated_rows(self):
++        scheduler = self.app.extensions["credential_health_scheduler"]
++        fresh = {"ok": True, "items": [{"account_id": "dead-id", "email": "dead@example.com", "state": "deactivated"}]}
++        with patch("core.sub2api_401_service.Sub2Api401Service.state", return_value={"items": []}), patch(
++            "core.sub2api_401_service.Sub2Api401Service.detect", return_value=fresh
++        ), patch(
++            "core.sub2api_401_service.Sub2Api401Service.delete_deactivated",
++            return_value={"items": [{"account_id": "dead-id", "ok": True}], "deleted_count": 1},
++        ) as delete_deactivated, patch("webui.app.db.list_accounts", return_value=[]):
++            result = scheduler._jobs["sub2api_401"]("dead-run")
++        delete_deactivated.assert_called_once_with(["dead-id"], opt_in=True, limit=50)
++        self.assertEqual("success", result.outcome)
++        self.assertEqual(1, result.completed)
++        self.assertEqual(0, result.failed)
++
+     def test_sub2api_automatic_job_counts_unverified_retry_as_failed(self):
+         scheduler = self.app.extensions["credential_health_scheduler"]
+         candidate = {
+diff --git a/tests/test_webui_sub2api_401.py b/tests/test_webui_sub2api_401.py
+index fecf1d7..fdff7c9 100644
+--- a/tests/test_webui_sub2api_401.py
++++ b/tests/test_webui_sub2api_401.py
+@@ -232,6 +232,67 @@ class WebuiSub2Api401Tests(unittest.TestCase):
+         detect_mock.assert_called_once_with({})
+         cleanup_mock.assert_called_once_with(["old-a"], opt_in=True, limit=50)
+ 
++    def test_retry_runner_deletes_rows_codex_confirmed_dead(self):
++        candidates = [{"account_id": "old-a", "email": "a@example.com", "retryable": True, "state": "pending"}]
++        batch_ids = []
++
++        def detect(_local_status):
++            return {"items": [{"account_id": "old-a", "state": "deactivated", "retry_batch_id": batch_ids[0]}]}
++
++        with tempfile.TemporaryDirectory() as tmp, patch(
++            "core.sub2api_401_service.Sub2Api401Service.select_retryable", return_value=(candidates, [])
++        ), patch(
++            "core.sub2api_401_service.Sub2Api401Service.mark_retrying",
++            side_effect=lambda _ids, *, batch_id: batch_ids.append(batch_id),
++        ), patch(
++            "core.sub2api_401_service.Sub2Api401Service.detect", side_effect=detect
++        ), patch(
++            "core.sub2api_401_service.Sub2Api401Service.delete_deactivated",
++            return_value={"items": [{"account_id": "old-a", "ok": True, "state": "deleted"}], "deleted_count": 1},
++        ) as delete_deactivated, patch(
++            "core.sub2api_401_service.Sub2Api401Service.cleanup"
++        ) as cleanup, patch(
++            "webui.app.db.get_account_by_email", side_effect=lambda email: {"id": email, "email": email}
++        ), patch(
++            "webui.app.codex_retry_service.reserve", return_value=True
++        ), patch(
++            "webui.app.db.update_account_codex_status"
++        ), patch(
++            "webui.app.codex_retry_service.log_path", side_effect=lambda email: Path(tmp) / f"{email}.log"
++        ), patch(
++            "webui.app.db.list_accounts", return_value=[]
++        ), patch(
++            "webui.app.codex_retry_service.run_worker"
++        ):
++            with patch("webui.app.threading.Thread") as thread:
++                self.client.post("/api/sub2api-401/retry", headers=self.headers, json={"account_ids": ["old-a"]})
++                runner = thread.call_args.kwargs["target"]
++                runner_args = thread.call_args.kwargs["args"]
++            workflow = runner(*runner_args)
++
++        delete_deactivated.assert_called_once_with(["old-a"], opt_in=True, limit=50)
++        cleanup.assert_not_called()
++        self.assertEqual("success", workflow["outcome"])
++        self.assertEqual(1, workflow["completed"])
++
++    def test_cleanup_endpoint_also_deletes_selected_deactivated_rows(self):
++        dead = {"items": [{"account_id": "dead-id", "ok": True, "state": "deleted"}], "deleted_count": 1}
++        ready = {"ok": True, "cleanup_supported": True, "items": [{"account_id": "old-id", "ok": True}]}
++        with patch(
++            "core.sub2api_401_service.Sub2Api401Service.delete_deactivated", return_value=dead
++        ) as delete_deactivated, patch(
++            "core.sub2api_401_service.Sub2Api401Service.cleanup", return_value=ready
++        ):
++            response = self.client.post(
++                "/api/sub2api-401/cleanup",
++                headers=self.headers,
++                json={"account_ids": ["dead-id", "old-id"], "confirm_cleanup": True},
++            )
++        self.assertEqual(200, response.status_code)
++        delete_deactivated.assert_called_once_with(["dead-id", "old-id"], opt_in=True, limit=50)
++        self.assertEqual(["dead-id", "old-id"], [item["account_id"] for item in response.get_json()["items"]])
++        self.assertEqual(1, response.get_json()["deleted_count"])
++
+     def test_retry_rejects_non_integer_workers(self):
+         for workers in (True, False, "3", 3.5, None):
+             with self.subTest(workers=workers):
+diff --git a/webui/app.py b/webui/app.py
+index 6492676..be4eac6 100644
+--- a/webui/app.py
++++ b/webui/app.py
+@@ -30,7 +30,7 @@ from core.chatgpt2api_401_service import (
+ )
+ from core.chatgpt2api_admin import ChatGPT2APIAdminError
+ from core.credential_health_scheduler import CredentialHealthScheduler, InspectionResult
+-from core.sub2api_401_service import Sub2Api401Service, Sub2ApiSnapshotConflict
++from core.sub2api_401_service import Sub2Api401Service, Sub2ApiSnapshotConflict, local_retry_status
+ from core.sub2api_admin import Sub2ApiAdminError
+ from webui.auth import init_auth, register_auth_routes
+ from core import registration_service as svc
+@@ -2768,11 +2768,30 @@ def create_app(auth_code: str | None = None) -> Flask:
+ 
+     def _sub2api_401_local_statuses() -> dict[str, str]:
+         return {
+-            str(row.get("email") or "").strip().lower(): str(row.get("codex_status") or "").strip().lower()
++            str(row.get("email") or "").strip().lower(): local_retry_status(row)
+             for row in db.list_accounts(limit=100_000)
+             if str(row.get("email") or "").strip()
+         }
+ 
++    def _sub2api_401_delete_deactivated(account_ids: list[str], label: str) -> tuple[set[str], int]:
++        """Delete exact `deactivated` rows; return deleted row IDs and failure count."""
++        if not account_ids:
++            return set(), 0
++        try:
++            result = sub2api_401_service.delete_deactivated(account_ids, opt_in=True, limit=50)
++        except Exception as exc:
++            logger.warning("Sub2API 401 废号删除异常 %s error=%s；保留 deactivated", label, type(exc).__name__)
++            return set(), len(account_ids)
++        deleted = {
++            str(item.get("account_id") or "")
++            for item in result.get("items") or []
++            if item.get("ok") and str(item.get("account_id") or "") in account_ids
++        }
++        failures = len(set(account_ids) - deleted)
++        if failures:
++            logger.warning("Sub2API 401 废号删除未完成 %s count=%s", label, failures)
++        return deleted, failures
++
+     def _sub2api_401_response(payload: dict, status: int = 200) -> Response:
+         response = make_response(jsonify(payload), status)
+         response.headers["Cache-Control"] = "no-store, max-age=0"
+@@ -2879,8 +2898,14 @@ def create_app(auth_code: str | None = None) -> Flask:
+         }
+         completed_ids = {
+             account_id for account_id, item in post_items.items()
+-            if item.get("state") == "cleaned"
++            if item.get("state") in {"cleaned", "deleted"}
+         }
++        dead_ids = [
++            account_id for account_id, item in post_items.items()
++            if item.get("retry_batch_id") == batch and item.get("state") == "deactivated"
++        ]
++        deleted_ids, _dead_failures = _sub2api_401_delete_deactivated(dead_ids, f"batch={batch}")
++        completed_ids.update(deleted_ids)
+         cleanup_ids = [
+             account_id for account_id, item in post_items.items()
+             if item.get("retry_batch_id") == batch and item.get("state") == "cleanup_ready"
+@@ -3035,11 +3060,11 @@ def create_app(auth_code: str | None = None) -> Flask:
+         if len(account_ids) > 50:
+             return _sub2api_401_response({"ok": False, "error": "单次最多选择 50 个账号"}, 400)
+         try:
+-            result = sub2api_401_service.cleanup(
+-                account_ids,
+-                opt_in=data.get("confirm_cleanup") is True,
+-                limit=50,
+-            )
++            opt_in = data.get("confirm_cleanup") is True
++            dead = sub2api_401_service.delete_deactivated(account_ids, opt_in=opt_in, limit=50)
++            result = sub2api_401_service.cleanup(account_ids, opt_in=opt_in, limit=50)
++            result["items"] = list(dead.get("items") or []) + list(result.get("items") or [])
++            result["deleted_count"] = int(dead.get("deleted_count") or 0)
+             return _sub2api_401_response(result)
+         except Exception as exc:
+             error, status = _sub2api_401_remote_error(exc)
+@@ -3824,6 +3849,12 @@ def create_app(auth_code: str | None = None) -> Flask:
+                 local_statuses[email] = "failed"
+         detected = sub2api_401_service.detect(local_statuses)
+         items = list(detected.get("items") or [])
++        dead_ids = [
++            str(item.get("account_id") or "").strip()
++            for item in items
++            if item.get("state") == "deactivated" and str(item.get("account_id") or "").strip()
++        ][:50]
++        deleted_ids, dead_failures = _sub2api_401_delete_deactivated(dead_ids, f"run={run_id}")
+         actionable_ids = [
+             str(item.get("account_id") or "").strip()
+             for item in items
+@@ -3842,7 +3873,14 @@ def create_app(auth_code: str | None = None) -> Flask:
+             skipped=max(0, len(actionable_ids) - len(selected_ids)),
+         )
+         if not selected_ids:
+-            return InspectionResult(outcome="success", detected=len(items), actionable=0)
++            return InspectionResult(
++                outcome="partial" if dead_failures else "success",
++                detected=len(items),
++                actionable=0,
++                completed=len(deleted_ids),
++                failed=dead_failures,
++                error="部分废号未能从 Sub2API 删除" if dead_failures else "",
++            )
+         payload, status = _start_sub2api_401_retry(selected_ids, workers=3, background=False)
+         workflow = payload.get("workflow_result") if isinstance(payload, dict) else None
+         if status != 200 or not isinstance(workflow, dict):
+@@ -3856,13 +3894,14 @@ def create_app(auth_code: str | None = None) -> Flask:
+                 skipped=max(skipped, len(actionable_ids) - len(selected_ids)),
+                 error=str(payload.get("error") or "Sub2API 自动补跑未启动") if isinstance(payload, dict) else "Sub2API 自动补跑未启动",
+             )
++        outcome = str(workflow.get("outcome") or "failed")
+         return InspectionResult(
+-            outcome=str(workflow.get("outcome") or "failed"),
++            outcome="partial" if dead_failures and outcome == "success" else outcome,
+             detected=len(items),
+             actionable=len(actionable_ids),
+             submitted=int(payload.get("started_count") or 0),
+-            completed=int(workflow.get("completed") or 0),
+-            failed=int(workflow.get("failed") or 0),
++            completed=int(workflow.get("completed") or 0) + len(deleted_ids),
++            failed=int(workflow.get("failed") or 0) + dead_failures,
+             skipped=len(payload.get("skipped") or []) + max(0, len(actionable_ids) - len(selected_ids)),
+             error=str(workflow.get("error") or ""),
+         )
+diff --git a/webui/templates/sub2api_401.html b/webui/templates/sub2api_401.html
+index 0392045..7934799 100644
+--- a/webui/templates/sub2api_401.html
++++ b/webui/templates/sub2api_401.html
+@@ -14,7 +14,7 @@
+     .counts{display:grid;grid-template-columns:repeat(6,minmax(105px,1fr));gap:10px;margin-top:14px}.metric{border:1px solid var(--line);border-radius:10px;padding:10px 12px}.metric b{display:block;font-size:20px}
+     .notice{margin-top:12px;padding:10px 12px;border-radius:9px;background:#fff7ed;color:#9a3412}.notice.error{background:#fef2f2;color:var(--danger)}.notice.ok{background:#ecfdf3;color:var(--ok)}
+     .table-wrap{overflow:auto}table{width:100%;border-collapse:collapse;min-width:1450px}th,td{border-bottom:1px solid #edf1f7;padding:11px 9px;text-align:left;vertical-align:top}th{font-size:12px;text-transform:uppercase;letter-spacing:.03em;color:var(--muted);background:#f8fafc}.ids{max-width:280px;word-break:break-all;color:var(--muted);font-size:12px}
+-    .badge{display:inline-block;padding:3px 8px;border-radius:999px;font-size:12px;font-weight:700}.pending{background:#fff7ed;color:var(--warn)}.retrying{background:#eff6ff;color:#1d4ed8}.verified,.cleaned{background:#ecfdf3;color:var(--ok)}.cleanup_ready{background:#eef2ff;color:#4338ca}.failed,.ambiguous{background:#fef2f2;color:var(--danger)}
++    .badge{display:inline-block;padding:3px 8px;border-radius:999px;font-size:12px;font-weight:700}.pending{background:#fff7ed;color:var(--warn)}.retrying{background:#eff6ff;color:#1d4ed8}.verified,.cleaned{background:#ecfdf3;color:var(--ok)}.cleanup_ready{background:#eef2ff;color:#4338ca}.failed,.ambiguous,.deactivated{background:#fef2f2;color:var(--danger)}.deleted{background:#ecfdf3;color:var(--ok)}.filterbar{display:flex;flex-wrap:wrap;align-items:center;gap:10px;margin-bottom:12px}.filterbar select{padding:7px 11px}
+     .queue{margin:12px 0 0;white-space:pre-wrap;word-break:break-all;background:#0f172a;color:#e2e8f0;border-radius:9px;padding:12px;max-height:280px;overflow:auto}.hidden{display:none}
+     @media(max-width:900px){.counts{grid-template-columns:repeat(2,1fr)}.top{align-items:flex-start;flex-direction:column}.scheduler-grid,.scheduler-meta{grid-template-columns:1fr}}
+   </style>
+@@ -41,7 +41,7 @@
+     <div class="toolbar">
+       <button class="primary" id="detectBtn">检测 Sub2API 401</button>
+       <button id="retryBtn" disabled>补跑 Codex（已选 0）</button>
+-      <button class="danger" id="cleanupBtn" disabled>重试清理旧 ID（已选 0）</button>
++      <button class="danger" id="cleanupBtn" disabled>重试清理旧 ID / 删除废号（已选 0）</button>
+       <label>并发 <select id="workers"><option>1</option><option>2</option><option selected>3</option><option>4</option><option>6</option><option>8</option></select></label>
+       <span class="spacer"></span><span class="muted" id="checkedAt">正在读取审计状态…</span>
+     </div>
+@@ -51,14 +51,30 @@
+       <div class="metric"><span class="muted">刷新超时</span><b id="timeoutCount">0</b></div>
+       <div class="metric"><span class="muted">已验证恢复</span><b id="verifiedCount">0</b></div>
+       <div class="metric"><span class="muted">待显式清理</span><b id="cleanupReadyCount">0</b></div>
++      <div class="metric"><span class="muted">废号待删除</span><b id="deactivatedCount">0</b></div>
++      <div class="metric"><span class="muted">已删除废号</span><b id="deletedCount">0</b></div>
+       <div class="metric"><span class="muted">状态正常</span><b id="healthyCount">0</b></div>
+       <div class="metric"><span class="muted">状态未知</span><b id="unknownCount">0</b></div>
+     </div>
+-    <div class="notice">系统仅处理 platform=openai 且 type=oauth 的 Sub2API 账号。检测只刷新 Sub2API 状态为“错误”的账号，以及选 keeper 和验证补跑所需的同邮箱账号；其余账号按 Sub2API 状态计为正常。补跑验证出唯一健康替代 ID 后会自动清理锁定旧 ID；按钮仅用于历史重复项或自动清理失败重试，并且不会按邮箱批量删除。</div>
++    <div class="notice">系统仅处理 platform=openai 且 type=oauth 的 Sub2API 账号。检测只刷新 Sub2API 状态为“错误”的账号，以及选 keeper 和验证补跑所需的同邮箱账号；其余账号按 Sub2API 状态计为正常。补跑验证出唯一健康替代 ID 后会自动清理锁定旧 ID；按钮仅用于历史重复项或自动清理失败重试，并且不会按邮箱批量删除。Codex 或查活确认账号已删除/停用（deleted or deactivated）时不再补跑，复核该 ID 仍刷新 401 后删除锁定的废号 account_id。</div>
+     <div id="message"></div>
+     <pre id="cleanupQueue" class="queue hidden"></pre>
+   </section>
+   <section class="card table-wrap">
++    <div class="filterbar">
++      <label for="stateFilter" class="muted">状态筛选</label>
++      <select id="stateFilter">
++        <option value="all">全部</option>
++        <option value="todo">待补跑 / 补跑失败</option>
++        <option value="retrying">补跑中</option>
++        <option value="cleanup">待清理旧 ID</option>
++        <option value="deactivated">废号待删除</option>
++        <option value="cleaned">已清理</option>
++        <option value="deleted">已删除废号</option>
++        <option value="ambiguous">状态不明确</option>
++      </select>
++      <span class="muted" id="filterSummary"></span>
++    </div>
+     <table>
+       <thead><tr><th><input type="checkbox" id="selectAll" aria-label="全选可操作账号"></th><th>旧 account_id</th><th>邮箱 / 名称</th><th>状态</th><th>原因</th><th>补跑前 account_id</th><th>补跑后 account_id</th><th>唯一替代 account_id</th><th>锁定清理 ID</th><th>本地 Codex</th></tr></thead>
+       <tbody id="rows"><tr><td colspan="10" class="muted">正在读取最近一次审计状态…</td></tr></tbody>
+@@ -76,7 +92,14 @@
+   let pollDelay = 0;
+   let stateLoading = false;
+   const esc = value => String(value ?? '').replace(/[&<>"']/g, ch => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch]));
+-  const stateText = {pending:'待补跑',retrying:'补跑中',verified:'已验证',cleanup_ready:'待清理/可重试',cleaned:'已清理',failed:'补跑失败',ambiguous:'状态不明确'};
++  const stateText = {pending:'待补跑',retrying:'补跑中',verified:'已验证',cleanup_ready:'待清理/可重试',cleaned:'已清理',failed:'补跑失败',ambiguous:'状态不明确',deactivated:'废号待删除',deleted:'已删除废号'};
++  const filterStates = {all:null,todo:['pending','failed'],retrying:['retrying'],cleanup:['cleanup_ready'],deactivated:['deactivated'],cleaned:['cleaned','verified'],deleted:['deleted'],ambiguous:['ambiguous']};
++  const filterStorageKey = 'sub2api401.stateFilter';
++  let stateFilter = 'all';
++  try { const saved = localStorage.getItem(filterStorageKey); if (saved && saved in filterStates) stateFilter = saved; } catch (_) {}
++  const inFilter = (item, key=stateFilter) => !filterStates[key] || filterStates[key].includes(item.state);
++  const cleanable = item => item.state === 'cleanup_ready' || item.state === 'deactivated';
++  const actionableRow = item => item.retryable || cleanable(item);
+   async function api(path, options={}) {
+     const response = await fetch(path, {...options, headers:{'Content-Type':'application/json', ...(options.headers || {})}});
+     const data = await response.json().catch(() => ({ok:false,error:`HTTP ${response.status}`}));
+@@ -108,27 +131,41 @@
+     $('#timeoutCount').textContent = counts.timeout || 0;
+     $('#verifiedCount').textContent = counts.verified || 0;
+     $('#cleanupReadyCount').textContent = counts.cleanup_ready || 0;
++    $('#deactivatedCount').textContent = counts.deactivated || 0;
++    $('#deletedCount').textContent = counts.deleted || 0;
+     $('#healthyCount').textContent = counts.healthy || 0;
+     $('#unknownCount').textContent = counts.unknown || 0;
+     $('#checkedAt').textContent = data.checked_at ? `状态时间 ${new Date(data.checked_at).toLocaleString()}` : '尚未执行远端检测';
+   }
++  function renderFilter(visible) {
++    const select = $('#stateFilter');
++    select.value = stateFilter;
++    for (const option of select.options) {
++      const base = option.dataset.label || (option.dataset.label = option.textContent);
++      option.textContent = `${base}（${items.filter(item => inFilter(item, option.value)).length}）`;
++    }
++    $('#filterSummary').textContent = `显示 ${visible.length} / ${items.length} 条`;
++  }
+   function render() {
+-    const actionable = items.filter(item => item.retryable || item.state === 'cleanup_ready');
++    // Selection follows the filter so hidden rows are never submitted.
++    const visible = items.filter(item => inFilter(item));
++    const actionable = visible.filter(actionableRow);
+     for (const accountId of [...selected]) if (!actionable.some(item => item.account_id === accountId)) selected.delete(accountId);
+-    $('#rows').innerHTML = items.map(item => `<tr>
+-      <td><input type="checkbox" data-account-id="${esc(item.account_id)}" ${(item.retryable || item.state === 'cleanup_ready') ? '' : 'disabled'} ${selected.has(item.account_id) ? 'checked' : ''}></td>
++    renderFilter(visible);
++    $('#rows').innerHTML = visible.map(item => `<tr>
++      <td><input type="checkbox" data-account-id="${esc(item.account_id)}" ${actionableRow(item) ? '' : 'disabled'} ${selected.has(item.account_id) ? 'checked' : ''}></td>
+       <td class="ids">${esc(item.account_id)}</td><td>${esc(item.email || '—')}<div class="muted">${esc(item.account_name || '')}</div></td>
+       <td><span class="badge ${esc(item.state)}">${esc(stateText[item.state] || item.state)}</span><div class="muted">${esc(item.health || '')}</div></td>
+       <td>${esc(item.reason)}</td><td class="ids">${idLines(item.pre_retry_account_ids?.length ? item.pre_retry_account_ids : item.observed_account_ids)}</td>
+       <td class="ids">${idLines(item.post_retry_account_ids)}</td><td class="ids">${esc(item.replacement_account_id || '—')}</td>
+       <td class="ids">${esc(item.cleanup_account_id || '—')}</td><td>${esc(item.local_codex_status || '—')}</td>
+-    </tr>`).join('') || '<tr><td colspan="10" class="muted">未发现需要处理的 Sub2API 账号。</td></tr>';
++    </tr>`).join('') || `<tr><td colspan="10" class="muted">${items.length ? '当前筛选下没有记录。' : '未发现需要处理的 Sub2API 账号。'}</td></tr>`;
+     const retryIds = [...selected].filter(accountId => items.some(item => item.account_id === accountId && item.retryable));
+-    const cleanupIds = [...selected].filter(accountId => items.some(item => item.account_id === accountId && item.state === 'cleanup_ready'));
++    const cleanupIds = [...selected].filter(accountId => items.some(item => item.account_id === accountId && cleanable(item)));
+     $('#retryBtn').disabled = retryIds.length === 0;
+     $('#retryBtn').textContent = `补跑 Codex（已选 ${retryIds.length}）`;
+     $('#cleanupBtn').disabled = !cleanupSupported || cleanupIds.length === 0;
+-    $('#cleanupBtn').textContent = `重试清理旧 ID（已选 ${cleanupIds.length}）`;
++    $('#cleanupBtn').textContent = `重试清理旧 ID / 删除废号（已选 ${cleanupIds.length}）`;
+     $('#selectAll').checked = actionable.length > 0 && actionable.every(item => selected.has(item.account_id));
+     $('#selectAll').indeterminate = selected.size > 0 && !$('#selectAll').checked;
+   }
+@@ -208,14 +245,14 @@
+     }
+   });
+   $('#cleanupBtn').addEventListener('click', async () => {
+-    const accountIds = [...selected].filter(accountId => items.some(item => item.account_id === accountId && item.state === 'cleanup_ready'));
++    const accountIds = [...selected].filter(accountId => items.some(item => item.account_id === accountId && cleanable(item)));
+     if (!accountIds.length) return;
+     try {
+       const preview = await api('/api/sub2api-401/cleanup', {method:'POST', body:JSON.stringify({account_ids:accountIds, confirm_cleanup:false})});
+-      const lines = (preview.items || []).map(item => `${item.email || '—'}\n  旧 account_id: ${item.cleanup_account_id || '—'}\n  已验证替代: ${item.replacement_account_id || '—'}`);
++      const lines = (preview.items || []).map(item => `${item.email || '—'}\n  旧 account_id: ${item.cleanup_account_id || '—'}\n  已验证替代: ${item.replacement_account_id || '（废号，无替代）'}`);
+       $('#cleanupQueue').textContent = `${preview.manual_action || ''}\n\n${lines.join('\n\n')}`.trim();
+       $('#cleanupQueue').classList.remove('hidden');
+-      if (!confirm(`确认删除 ${accountIds.length} 个已锁定的旧 Sub2API account_id？\n\n系统不会按邮箱删除，并会在删除后重新读取账号列表确认旧 ID 消失；此按钮仅重试历史重复项或自动清理失败。`)) return;
++      if (!confirm(`确认删除 ${accountIds.length} 个已锁定的旧 Sub2API account_id？\n\n系统不会按邮箱删除，并会在删除后重新读取账号列表确认旧 ID 消失；废号删除前会复核该 ID 仍刷新 401。`)) return;
+       const result = await api('/api/sub2api-401/cleanup', {method:'POST', body:JSON.stringify({account_ids:accountIds, confirm_cleanup:true})});
+       await loadState();
+       const failed = (result.items || []).filter(item => !item.ok).length;
+@@ -230,7 +267,12 @@
+   });
+   $('#selectAll').addEventListener('change', event => {
+     selected.clear();
+-    if (event.target.checked) for (const item of items) if (item.retryable || item.state === 'cleanup_ready') selected.add(item.account_id);
++    if (event.target.checked) for (const item of items) if (actionableRow(item) && inFilter(item)) selected.add(item.account_id);
++    render();
++  });
++  $('#stateFilter').addEventListener('change', event => {
++    stateFilter = event.target.value in filterStates ? event.target.value : 'all';
++    try { localStorage.setItem(filterStorageKey, stateFilter); } catch (_) {}
+     render();
+   });
+   loadState();

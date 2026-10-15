@@ -54,6 +54,22 @@ class Sub2Api401TemplateTests(unittest.TestCase):
             self.assertIn(text, page)
         self.assertNotIn("批量刷新 OpenAI OAuth 账号", page)
 
+    def test_page_filters_rows_and_offers_dead_account_deletion(self):
+        page = Path("webui/templates/sub2api_401.html").read_text(encoding="utf-8")
+        for text in (
+            '<select id="stateFilter">',
+            '<option value="deactivated">废号待删除</option>',
+            '<option value="deleted">已删除废号</option>',
+            "deactivated:'废号待删除',deleted:'已删除废号'",
+            "const visible = items.filter(item => inFilter(item));",
+            "if (actionableRow(item) && inFilter(item)) selected.add(item.account_id);",
+            "const cleanable = item => item.state === 'cleanup_ready' || item.state === 'deactivated';",
+            '<b id="deactivatedCount">0</b>',
+            '<b id="deletedCount">0</b>',
+            "localStorage.setItem(filterStorageKey, stateFilter)",
+        ):
+            self.assertIn(text, page)
+
     def test_page_polls_retrying_state_until_terminal(self):
         page = Path("webui/templates/sub2api_401.html").read_text(encoding="utf-8")
         for text in (

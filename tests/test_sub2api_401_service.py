@@ -6,7 +6,7 @@ import unittest
 from pathlib import Path
 
 from core.sub2api_admin import Sub2ApiAdminClient
-from core.sub2api_401_service import Sub2Api401Service, Sub2ApiSnapshotConflict
+from core.sub2api_401_service import Sub2Api401Service, Sub2ApiSnapshotConflict, local_retry_status
 
 
 class Sub2Api401ServiceTests(unittest.TestCase):
@@ -827,6 +827,95 @@ class Sub2Api401ServiceTests(unittest.TestCase):
         self.assertEqual("pending", by_id["new"]["state"])
         self.assertEqual("unauthorized", by_id["new"]["health"])
         self.assertTrue(by_id["new"]["retryable"])
+
+    def dead_service(self, rows, deleted, *, failing=("old",)):
+        def refresh(ids):
+            errors = [{"account_id": value, "error": "Token revoked (401)"} for value in ids if value in failing]
+            return {"total": len(ids), "success": len(ids) - len(errors), "failed": len(errors), "errors": errors}
+
+        def delete(account_id):
+            deleted.append(account_id)
+            rows[:] = [row for row in rows if row["account_id"] != account_id]
+            return {"ok": True}
+
+        return self.service(rows=rows, refresh=refresh, delete=delete)
+
+    def test_dead_codex_retry_becomes_deactivated_then_deletes_exact_old_id(self):
+        rows = [
+            {"account_id": "old", "email": "one@example.com", "status": "error"},
+            {"account_id": "other", "email": "two@example.com", "status": "active"},
+        ]
+        deleted = []
+        service = self.dead_service(rows, deleted)
+        service.detect()
+        service.mark_retrying(["old"])
+        item = service.detect({"one@example.com": "deactivated"})["items"][0]
+        self.assertEqual("deactivated", item["state"])
+        self.assertFalse(item["retryable"])
+        self.assertEqual("old", item["cleanup_account_id"])
+
+        preview = service.delete_deactivated(["old"])
+        self.assertFalse(preview["deletion_performed"])
+        self.assertEqual([], deleted)
+
+        result = service.delete_deactivated(["old"], opt_in=True)
+        self.assertEqual(1, result["deleted_count"])
+        self.assertEqual(["old"], deleted)
+        self.assertEqual(["other"], [row["account_id"] for row in rows])
+        self.assertEqual("deleted", service.state()["items"][0]["state"])
+
+        items = service.detect({"one@example.com": "deactivated"})["items"]
+        self.assertEqual([("old", "deleted")], [(entry["account_id"], entry["state"]) for entry in items])
+
+    def test_dead_singleton_without_retry_is_deactivated_not_pending(self):
+        rows = [{"account_id": "old", "email": "one@example.com", "status": "error"}]
+        deleted = []
+        service = self.dead_service(rows, deleted)
+        item = service.detect({"one@example.com": "deactivated"})["items"][0]
+        self.assertEqual("deactivated", item["state"])
+        self.assertFalse(item["retryable"])
+        self.assertEqual("old", item["cleanup_account_id"])
+        service.delete_deactivated(["old"], opt_in=True)
+        self.assertEqual(["old"], deleted)
+        items = service.detect({"one@example.com": "deactivated"})["items"]
+        self.assertEqual([("old", "deleted")], [(entry["account_id"], entry["state"]) for entry in items])
+
+    def test_delete_deactivated_refuses_when_refresh_is_not_401(self):
+        rows = [{"account_id": "old", "email": "one@example.com", "status": "error"}]
+        deleted = []
+        service = self.dead_service(rows, deleted)
+        service.detect({"one@example.com": "deactivated"})
+        recovered = self.dead_service(rows, deleted, failing=())
+        result = recovered.delete_deactivated(["old"], opt_in=True)
+        self.assertEqual([], deleted)
+        self.assertEqual("ambiguous", result["items"][0]["state"])
+
+    def test_delete_deactivated_failure_stays_deactivated_for_retry(self):
+        rows = [{"account_id": "old", "email": "one@example.com", "status": "error"}]
+
+        def refresh(ids):
+            return {"total": len(ids), "success": 0, "failed": len(ids), "errors": [{"account_id": value, "error": "401"} for value in ids]}
+
+        def delete(_account_id):
+            raise RuntimeError("Sub2API 管理接口请求失败")
+
+        service = self.service(rows=rows, refresh=refresh, delete=delete)
+        service.detect({"one@example.com": "deactivated"})
+        result = service.delete_deactivated(["old"], opt_in=True)
+        self.assertFalse(result["items"][0]["ok"])
+        self.assertEqual("deactivated", service.state()["items"][0]["state"])
+
+    def test_local_retry_status_marks_dead_accounts_and_keeps_running_retries(self):
+        dead_error = (
+            'RuntimeError: [Codex] MFA 验证失败 status=403: { "error": { "message": "You do not have an account '
+            'because it has been deleted or deactivated.'
+        )
+        self.assertEqual("deactivated", local_retry_status({"codex_status": "failed", "codex_error": dead_error}))
+        self.assertEqual("deactivated", local_retry_status({"codex_status": "failed", "live_check_status": "deactivated"}))
+        self.assertEqual("deactivated", local_retry_status({"codex_status": "deactivated"}))
+        self.assertEqual("running", local_retry_status({"codex_status": "running", "codex_error": dead_error}))
+        self.assertEqual("failed", local_retry_status({"codex_status": "failed", "codex_error": "ProxyError: timeout"}))
+        self.assertEqual("", local_retry_status({}))
 
     def test_stuck_audit_row_with_missing_old_id_releases_current_id(self):
         self.audit_path.write_text(json.dumps({"version": 2, "items": {"1": {

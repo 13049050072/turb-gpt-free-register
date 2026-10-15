@@ -318,3 +318,118 @@ b0e36a04e580744d277dee11a3b9955beaf4059baea6584a506c29e97fff025b  DIFF_FILE.patc
 1b1ed7aa80abd0635df76ae80765911663ea956a520c02c6ba7cd39e9f43a3ff  BASELINE.tar.gz
 f8b2744af576a5de7571f7b7b1c559a76425e62875d18cd7bf079810b6c1bda4  PROBE_refresh_scope.py
 f66d2fdb33ad9fa154c62901423513b7f2080d8b6c1bc73d5765d4262bdb6b75  REPLAY_production.py
+
+==================================================================
+FOLLOW-UP 4: Sub2API dead accounts (Codex 'deleted or deactivated') are deleted, not 'retry failed'; Sub2API page state filter (base ba234fbebd4a2ae73b6cdd4e5fdd1d4464d44da3)
+Generated: 2026-10-15T12:11:33Z
+Records: .trellis/tasks/10-15-chatgpt2api-401-deactivated-delete/artifacts/followup-sub2api-deactivated/
+
+PRODUCTION EVIDENCE (read-only, after the user ran detect + retry on ba234fb)
+- sub2api audit: cleaned 15, failed 7 (#42 #43 #44 #46 #52 #55 #65), reason 'Codex 补跑失败；旧 Sub2API account_id 保持不变'
+- local codex_status=failed for all 7; codex_error: 'RuntimeError: [Codex] MFA 验证失败 status=403: { "error": { "message": "You do not have an account because it has been deleted or deactivated. ...'
+- detect_account_unusable_text(that text) == '' on base; only the email-OTP step converted dead-account responses to status=deactivated
+- real audit #65: state failed, health unauthorized at 2026-10-15T11:57:27Z (Sub2API status shows active)
+
+CHANGED
+- core/openai_auth.py: dead-account marker 'has been deleted or deactivated'
+- core/codex_oauth.py run_codex_oauth: generic stage exception whose text is a dead account -> status=deactivated
+- core/sub2api_401_service.py: states deactivated/deleted; local_retry_status(); retry row or unauthorized singleton with dead local status -> deactivated (cleanup_account_id=exact ID); delete_deactivated(): re-list, same email, fresh refresh 401, PUT inactive + DELETE, re-list -> deleted; deleted rows kept as history; deactivated IDs stay probed
+- webui/app.py: _sub2api_401_local_statuses uses local_retry_status; retry batch and scheduled inspection delete deactivated rows (counted completed); cleanup endpoint also handles deactivated rows
+- webui/templates/sub2api_401.html: state filter with counts, selection scoped to filter, deactivated/deleted labels + metrics, cleanup button also deletes dead rows
+- tests: service 6, codex detection 2, webui 2, scheduler 1, template 1; spec: states + 4 matrix rows
+
+BASELINE HASHES
+2417ab66ce4f8cd57ff4c1e66b7d540b7bf8627d3a0b68924f7520446b3645df  core/openai_auth.py
+84ecfe3f9ea231ca3b7cfdd5e6163ad92310a18f5cdbd0cf4c40f1081bc0a4a6  core/codex_oauth.py
+447f4429f8bfa464a4d2ffe5878e68c66b81ff34212d55b8d974097039195c6b  core/sub2api_401_service.py
+dc4f737971fbda01d8ee497826ce8681e949a8de84a77069b4041b5712d5d7c4  webui/app.py
+9520b87efdfc1da544ab07331e2f50a0432201c5ddf934854867d3571a653099  webui/templates/sub2api_401.html
+0d721301d7289e1f4bf07c550d4cac0a3536de6e0e58254bde491c9f8e8d1b6b  tests/test_codex_dead_account_detection.py
+93c9b277f7f8dd2f03116d05fc585127e7179bcc44d766e2c62c7ce4a1fcfd0b  tests/test_sub2api_401_service.py
+63316ff7f66884bc3010d895fa753553acedd41d5ab06a127a8f90465d65d498  tests/test_sub2api_401_templates.py
+215c95fc7fdf86b549d874b3a221312f18eedabe7c28ab82a63edbd1db74c4ff  tests/test_webui_sub2api_401.py
+de0492e9b6719d5951e2f31e05ecc7d7457d48403535448968a49bbe352af7f1  tests/test_webui_credential_health_scheduler.py
+5ad859a73a9bb33ce1369c6b171ca7c9720edb9fb9e37935378479f1a956891e  .trellis/spec/backend/sub2api-credential-rotation.md
+MODIFIED HASHES
+1ff66b3115673422dd397b5835e005b429c3f2cee2a3f6690e9dc1fa15f617e0  core/openai_auth.py
+37cda2c40de9a1b28df569193ff0d7631631b90b38ecc697ddd1270349e9fc6b  core/codex_oauth.py
+b8ac7bfa8ab12569c005242aa52d06625eb2fc7ff6fb8852d493e3112b1d4789  core/sub2api_401_service.py
+4dfc0a16110bec78a21c9d4b0ca08c48296ec1333fabfa2ce9ca78f91fe5a283  webui/app.py
+80e36a7697c3adf95ecbc82ccd0d451f9c0183853027f669cfeccfbe366e4540  webui/templates/sub2api_401.html
+5d52e9df4b80a813432fc692e0a73da69a6d7393d0d51230e69170f90dedb0a3  tests/test_codex_dead_account_detection.py
+9cc21e70c73dcc51e591ce6134aea5fce8c4d4519fa3bbb40217f78dd530f907  tests/test_sub2api_401_service.py
+96e0509dfb169cc3e4be3122b444256cfb1fba7ccb6dc119245e2c2fac3c5d75  tests/test_sub2api_401_templates.py
+e5171fd3cfd6e2b233c12c62ac8a6ff1b4697fbc797190c80d82d673e7b4c166  tests/test_webui_sub2api_401.py
+42ebf7078445fe1fee50960be2ac275400a25badf9c1d3e63e02986d958ac45b  tests/test_webui_credential_health_scheduler.py
+80f604415f33010e3df818b647e644656ed620872e7efc5e81a5cdaed582c3aa  .trellis/spec/backend/sub2api-credential-rotation.md
+ROLLBACK HASHES
+2417ab66ce4f8cd57ff4c1e66b7d540b7bf8627d3a0b68924f7520446b3645df  core/openai_auth.py
+84ecfe3f9ea231ca3b7cfdd5e6163ad92310a18f5cdbd0cf4c40f1081bc0a4a6  core/codex_oauth.py
+447f4429f8bfa464a4d2ffe5878e68c66b81ff34212d55b8d974097039195c6b  core/sub2api_401_service.py
+dc4f737971fbda01d8ee497826ce8681e949a8de84a77069b4041b5712d5d7c4  webui/app.py
+9520b87efdfc1da544ab07331e2f50a0432201c5ddf934854867d3571a653099  webui/templates/sub2api_401.html
+0d721301d7289e1f4bf07c550d4cac0a3536de6e0e58254bde491c9f8e8d1b6b  tests/test_codex_dead_account_detection.py
+93c9b277f7f8dd2f03116d05fc585127e7179bcc44d766e2c62c7ce4a1fcfd0b  tests/test_sub2api_401_service.py
+63316ff7f66884bc3010d895fa753553acedd41d5ab06a127a8f90465d65d498  tests/test_sub2api_401_templates.py
+215c95fc7fdf86b549d874b3a221312f18eedabe7c28ab82a63edbd1db74c4ff  tests/test_webui_sub2api_401.py
+de0492e9b6719d5951e2f31e05ecc7d7457d48403535448968a49bbe352af7f1  tests/test_webui_credential_health_scheduler.py
+5ad859a73a9bb33ce1369c6b171ca7c9720edb9fb9e37935378479f1a956891e  .trellis/spec/backend/sub2api-credential-rotation.md
+restored-hashes-equal-original
+
+SAME-INPUT PROBE A: .venv/bin/python -I .trellis/tasks/10-15-chatgpt2api-401-deactivated-delete/artifacts/followup-sub2api-deactivated/PROBE_deactivated.py <tree>
+BASELINE exit=0
+{"after_detect": {"account_id": "42", "reason": "Codex 补跑失败；旧 Sub2API account_id 保持不变", "retryable": true, "state": "failed"}, "delete_calls": [], "detector": "", "local_status": "failed", "remote_ids_left": ["42", "40"]}
+MODIFIED exit=0
+{"after_delete": {"account_id": "42", "reason": "账号已删除或停用，已从 Sub2API 删除锁定的 account_id", "state": "deleted"}, "after_detect": {"account_id": "42", "reason": "Codex 确认账号已删除或停用；待删除锁定的旧 Sub2API account_id", "retryable": false, "state": "deactivated"}, "delete_calls": ["42"], "detector": "account_deleted", "local_status": "deactivated", "remote_ids_left": ["40"]}
+ROLLBACK apply exit=0: rollback complete: restored 11 paths from /Users/jiangdk/code/personal/turb-gpt-free-register/.trellis/tasks/10-15-chatgpt2api-401-deactivated-delete/artifacts/followup-sub2api-deactivated/BASELINE.tar.gz
+ROLLBACK probe exit=0
+{"after_detect": {"account_id": "42", "reason": "Codex 补跑失败；旧 Sub2API account_id 保持不变", "retryable": true, "state": "failed"}, "delete_calls": [], "detector": "", "local_status": "failed", "remote_ids_left": ["42", "40"]}
+restored == baseline: yes; reapply patch exit=0, reapplied hashes == modified: yes, reapplied probe == modified: yes
+
+SAME-INPUT PROBE B (headless Chromium): .venv/bin/python -I .trellis/tasks/10-15-chatgpt2api-401-deactivated-delete/artifacts/followup-sub2api-deactivated/PROBE_filter.py <tree>
+BASELINE
+{"after_select_all_buttons": ["补跑 Codex（已选 3）", "重试清理旧 ID（已选 0）"], "deactivated_row_selectable": false, "filter_present": false, "rows_all": 8}
+MODIFIED
+{"after_select_all_buttons": ["补跑 Codex（已选 3）", "重试清理旧 ID / 删除废号（已选 0）"], "deactivated_buttons": ["补跑 Codex（已选 0）", "重试清理旧 ID / 删除废号（已选 1）"], "deactivated_row_selectable": true, "filter_options": ["全部（8）", "待补跑 / 补跑失败（3）", "补跑中（0）", "待清理旧 ID（0）", "废号待删除（1）", "已清理（1）", "已删除废号（2）", "状态不明确（1）"], "filter_present": true, "rows_all": 8, "rows_deleted": 2}
+ROLLBACK
+{"after_select_all_buttons": ["补跑 Codex（已选 3）", "重试清理旧 ID（已选 0）"], "deactivated_row_selectable": false, "filter_present": false, "rows_all": 8}
+restored == baseline: yes
+
+PRODUCTION REPLAY (sanitized list + audit + local codex status/error; refresh simulated from Sub2API status=error, so #65 (status active) is refused here)
+== baseline (restored copy)
+after detect: {'cleaned': 15, 'failed': 7}
+deactivated: []
+delete calls: [] remaining listed: 41
+== modified
+after detect: {'cleaned': 15, 'deactivated': 7}
+deactivated: ['42', '43', '44', '46', '52', '55', '65']
+after delete: {'cleaned': 15, 'deleted': 6, 'ambiguous': 1}
+delete calls: ['42', '43', '44', '46', '52', '55'] remaining listed: 35
+
+TESTS new-on-baseline exit=1:
+ERROR: test_sub2api_401_service (unittest.loader._FailedTest.test_sub2api_401_service)
+ERROR: test_cleanup_endpoint_also_deletes_selected_deactivated_rows (tests.test_webui_sub2api_401.WebuiSub2Api401Tests.test_cleanup_endpoint_also_deletes_selected_deactivated_rows)
+ERROR: test_retry_runner_deletes_rows_codex_confirmed_dead (tests.test_webui_sub2api_401.WebuiSub2Api401Tests.test_retry_runner_deletes_rows_codex_confirmed_dead)
+ERROR: test_sub2api_automatic_job_deletes_deactivated_rows (tests.test_webui_credential_health_scheduler.WebUICredentialHealthSchedulerTests.test_sub2api_automatic_job_deletes_deactivated_rows)
+FAIL: test_codex_mfa_403_deleted_or_deactivated_text_is_dead_account (tests.test_codex_dead_account_detection.CodexDeadAccountDetectionTests.test_codex_mfa_403_deleted_or_deactivated_text_is_dead_account)
+FAIL: test_run_codex_oauth_maps_dead_account_error_from_any_stage_to_deactivated (tests.test_codex_dead_account_detection.CodexDeadAccountDetectionTests.test_run_codex_oauth_maps_dead_account_error_from_any_stage_to_deactivated)
+FAIL: test_page_filters_rows_and_offers_dead_account_deletion (tests.test_sub2api_401_templates.Sub2Api401TemplateTests.test_page_filters_rows_and_offers_dead_account_deletion)
+Ran 42 tests in 1.534s
+FAILED (failures=3, errors=4)
+TESTS focused focused exit=0: Ran 145 tests in 2.228s OK
+FULL full exit=1:
+ERROR: test_ensure_authorize_context_matches_20260914_capture_shape (test_chatgpt_auth_context.ChatgptAuthContextTests.test_ensure_authorize_context_matches_20260914_capture_shape)
+FAIL: test_restore_context_requires_exact_email_match (test_remail_client.RemailClientTests.test_restore_context_requires_exact_email_match)
+Ran 563 tests in 8.774s
+FAILED (failures=1, errors=1)
+(same 2 pre-existing failures)
+STATIC: py_compile PASS; git diff --check PASS; node --check sub2api_401.html script exit 0
+NOT DONE: not committed, not deployed; production untouched.
+ARTIFACT HASHES
+598fece10333b823e16f0ffbda762977800223ae2c068468103cfbb2db7d15b3  MODIFIED_FILE.tar.gz
+31f42270715401a9399d3e60816873d1619cc0e6b20701bb5faae8a405ec53f2  DIFF_FILE.patch
+a7136a7bf504257b6a523aef391602eb1a15112268e4dcdc8361eec7536c1180  ROLLBACK.sh
+fd1174dd3870a5344f01d6800c7b9c9b6e7c5215d4ef03dbb1393e42f7ccdc9e  BASELINE.tar.gz
+5a1c837bf382aa7340432337624ce3c084692e9a1df46c3bda516a319b7b579f  PROBE_deactivated.py
+1383122ac556f227625e760107b25ea1b3eb6de485f00cdff6731c1c36389704  PROBE_filter.py
+115c0987e3aa9df8f70bd7195accbc7e3c236c0efcd53149472f981855365d93  REPLAY_production.py

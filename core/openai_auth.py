@@ -79,6 +79,8 @@ _ACCOUNT_DEAD_TEXT_MARKERS = (
     "your account has been deleted",
     "your account was deactivated",
     "your account was deleted",
+    # Codex MFA/password 403: "You do not have an account because it has been deleted or deactivated."
+    "has been deleted or deactivated",
     "账号已停用",
     "账号已禁用",
     "账号已删除",

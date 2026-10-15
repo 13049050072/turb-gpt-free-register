@@ -15,10 +15,13 @@ from core.sub2api_admin import Sub2ApiAdminClient
 _MAX_REASON = 180
 _MAX_ID = 160
 _MAX_NAME = 240
-_STATES = {"pending", "retrying", "verified", "cleanup_ready", "cleaned", "failed", "ambiguous"}
+_STATES = {"pending", "retrying", "verified", "cleanup_ready", "cleaned", "failed", "ambiguous", "deactivated", "deleted"}
 _HEALTH_STATES = {"healthy", "unauthorized", "timeout", "unknown"}
 _RUNNING_LOCAL_STATES = {"retrying", "queued", "running"}
 _FAILED_LOCAL_STATES = {"failed", "stopped", "cancelled", "canceled", "error"}
+_DEAD_LOCAL_STATES = {"deactivated"}
+# Rows kept as history after their account ID left Sub2API.
+_HISTORY_STATES = {"cleaned", "deleted"}
 # Detection refreshes only accounts Sub2API itself marks with these statuses.
 _PROBE_STATUSES = {"error"}
 _UNAUTHORIZED_RE = re.compile(r"(?:\b401\b|unauthori[sz]ed|invalid[_ -]?grant|invalid[_ -]?token)", re.I)
@@ -109,6 +112,27 @@ def _health_from_error(value: object) -> str:
     if "timeout" in text.lower() or "timed out" in text.lower():
         return "timeout"
     return "unknown"
+
+
+def local_retry_status(account: dict) -> str:
+    """Map a local account row to the Codex retry status detection uses.
+
+    A running retry wins. Otherwise a persisted deactivated verdict, or a stored
+    Codex error in which OpenAI says the account was deleted or deactivated,
+    marks the account dead so it is deleted instead of retried again.
+    """
+    from core.openai_auth import detect_account_unusable_text
+
+    status = _text(account.get("codex_status"), 64).lower()
+    if status in _RUNNING_LOCAL_STATES:
+        return status
+    if (
+        status in _DEAD_LOCAL_STATES
+        or _text(account.get("live_check_status"), 32).lower() in _DEAD_LOCAL_STATES
+        or detect_account_unusable_text(str(account.get("codex_error") or ""))
+    ):
+        return "deactivated"
+    return status
 
 
 class Sub2ApiSnapshotConflict(RuntimeError):
@@ -246,7 +270,8 @@ class Sub2Api401Service:
             "cleanup_supported": self.cleanup_supported,
             "manual_action": (
                 "历史重复项或自动清理失败时，确认后仅按锁定的旧 account_id 重试清理"
-                if state == "cleanup_ready" else ""
+                if state == "cleanup_ready"
+                else "确认后仅删除锁定的废号 account_id" if state == "deactivated" else ""
             ),
         }
 
@@ -363,6 +388,14 @@ class Sub2Api401Service:
             "cleanup_account_id": "",
         }
 
+        if old.get("state") == "deleted" and not old_exists:
+            return self._sanitize_entry({
+                **base,
+                "state": "deleted",
+                "reason": old.get("reason") or "废号 account_id 已从 Sub2API 删除",
+                "cleanup_account_id": old_id,
+            })
+
         if old.get("state") == "cleaned" and replacement:
             if old_id not in by_id:
                 # Cleanup is finished history. The replacement is no longer
@@ -428,6 +461,13 @@ class Sub2Api401Service:
             return self._sanitize_entry({**base, "state": "ambiguous", "reason": "已记录的替代 account_id 不再满足健康与邮箱一致性条件", "replacement_account_id": ""})
 
         new_ids = [account_id for account_id in current_ids if account_id not in set(pre_ids)]
+        if local_status in _DEAD_LOCAL_STATES:
+            return self._sanitize_entry({
+                **base,
+                "state": "deactivated",
+                "reason": "Codex 确认账号已删除或停用；待删除锁定的旧 Sub2API account_id",
+                "cleanup_account_id": old_id,
+            })
         if local_status in _FAILED_LOCAL_STATES:
             return self._sanitize_entry({
                 **base,
@@ -541,6 +581,9 @@ class Sub2Api401Service:
                 probe.add(account_id)
         with self._lock:
             for old_id, item in self._tracked.items():
+                dead_id = _account_id(item.get("cleanup_account_id")) or old_id
+                if item.get("state") == "deactivated" and dead_id in listed:
+                    probe.add(dead_id)
                 if item.get("pre_retry_account_ids") and old_id in listed:
                     probe.add(old_id)
                     probe.update(ids_by_email.get(_email(item.get("email")), set()))
@@ -587,6 +630,8 @@ class Sub2Api401Service:
 
             for account_id, old in previous.items():
                 if not old.get("pre_retry_account_ids"):
+                    if old.get("state") == "deleted" and account_id not in by_id:
+                        next_tracked[account_id] = self._sanitize_entry({**old, "checked_at": checked_at})
                     continue
                 retry_status = local_status.get(_email(old.get("email")), "")
                 item = self._evaluate_after_retry(
@@ -602,7 +647,7 @@ class Sub2Api401Service:
                     # The locked old ID is gone, so this retry row can no longer
                     # act. Release same-email IDs to normal per-account
                     # detection; a revoked replacement then becomes `pending`.
-                    if item.get("state") == "cleaned":
+                    if item.get("state") in _HISTORY_STATES:
                         next_tracked[account_id] = item
                     continue
                 next_tracked[account_id] = item
@@ -634,6 +679,10 @@ class Sub2Api401Service:
                     else:
                         state, reason, retryable = "ambiguous", keeper_reason, False
                         replacement_id, cleanup_id = "", ""
+                elif health == "unauthorized" and local_status.get(email) in _DEAD_LOCAL_STATES:
+                    state, reason, retryable = "deactivated", "本地已确认账号已删除或停用；待删除 Sub2API account_id", False
+                    cleanup_id = account_id
+                    preserve_decision_reason = True
                 elif health == "unauthorized":
                     state, reason, retryable = "pending", "Sub2API 刷新返回 unauthorized/401", True
                 elif health in {"timeout", "unknown"}:
@@ -655,7 +704,7 @@ class Sub2Api401Service:
                     "post_retry_account_ids": [],
                     "replacement_account_id": replacement_id if len(group) != 1 and keeper else "",
                     "replacement_health": keeper_health if len(group) != 1 and keeper else "",
-                    "cleanup_account_id": cleanup_id if len(group) != 1 and keeper else "",
+                    "cleanup_account_id": cleanup_id if (len(group) != 1 and keeper) or state == "deactivated" else "",
                     "candidate_count": len(group) if email else 1,
                     "checked_at": checked_at,
                     "retryable": retryable,
@@ -774,6 +823,86 @@ class Sub2Api401Service:
                     "retryable": False,
                 })
             self._persist_locked()
+
+    def delete_deactivated(self, values: list[object], *, opt_in: bool = False, limit: int = 50) -> dict:
+        """Delete exact `deactivated` account IDs after re-list and a 401 refresh."""
+        with self._operation_lock:
+            return self._delete_deactivated_locked(values, opt_in=opt_in, limit=limit)
+
+    def _delete_deactivated_locked(self, values: list[object], *, opt_in: bool, limit: int) -> dict:
+        selected = _dedupe_ids(values, limit=limit)
+        with self._lock:
+            targets = [
+                self._sanitize_entry(self._tracked[account_id])
+                for account_id in selected
+                if account_id in self._tracked and self._tracked[account_id].get("state") == "deactivated"
+            ]
+        review = [
+            {
+                "account_id": item["account_id"],
+                "email": item["email"],
+                "cleanup_account_id": item["cleanup_account_id"] or item["account_id"],
+                "manual_action": "仅删除锁定的废号 account_id",
+            }
+            for item in targets
+        ]
+        if not opt_in or not targets or not self.cleanup_supported:
+            return {"ok": True, "deletion_performed": False, "items": review, "deleted_count": 0}
+
+        # Delete only while Sub2API still lists the exact ID with the locked
+        # email and its credential still refreshes as 401.
+        by_id, _ = self._account_maps(self._list_fn())
+        dead_ids = _dedupe_ids([entry["cleanup_account_id"] for entry in review if entry["cleanup_account_id"] in by_id])
+        kinds, _reasons = self._refresh_maps(
+            dead_ids,
+            self._refresh_fn(dead_ids) if dead_ids else {"total": 0, "success": 0, "failed": 0, "errors": []},
+        )
+        attempted: dict[str, str] = {}
+        outcomes: dict[str, tuple[str, str]] = {}
+        for item, entry in zip(targets, review):
+            dead_id = entry["cleanup_account_id"]
+            row = by_id.get(dead_id)
+            if row is None:
+                outcomes[item["account_id"]] = ("deleted", "废号 account_id 已不在 Sub2API")
+            elif row.get("email") != item["email"]:
+                outcomes[item["account_id"]] = ("ambiguous", "删除前 Sub2API 邮箱已变化，禁止删除")
+            elif kinds.get(dead_id) != "unauthorized":
+                outcomes[item["account_id"]] = ("ambiguous", "删除前 Sub2API 刷新未返回 401，禁止按废号删除")
+            else:
+                try:
+                    self._delete_fn(dead_id)
+                except Exception as exc:
+                    outcomes[item["account_id"]] = ("deactivated", _reason(exc, "Sub2API 删除失败，可重试"))
+                else:
+                    attempted[item["account_id"]] = dead_id
+        if attempted:
+            after_by_id, _ = self._account_maps(self._list_fn())
+            for account_id, dead_id in attempted.items():
+                outcomes[account_id] = (
+                    ("deactivated", "删除后 Sub2API 仍列出该 account_id，可重试")
+                    if dead_id in after_by_id
+                    else ("deleted", "账号已删除或停用，已从 Sub2API 删除锁定的 account_id")
+                )
+
+        results: list[dict] = []
+        with self._lock:
+            for item in targets:
+                state, reason = outcomes[item["account_id"]]
+                self._tracked[item["account_id"]] = self._sanitize_entry({
+                    **item,
+                    "state": state,
+                    "reason": reason,
+                    "checked_at": _now(),
+                    "retryable": False,
+                })
+                results.append({"account_id": item["account_id"], "ok": state == "deleted", "state": state, "reason": reason})
+            self._persist_locked()
+        return {
+            "ok": True,
+            "deletion_performed": bool(attempted),
+            "items": results,
+            "deleted_count": sum(1 for entry in results if entry["ok"]),
+        }
 
     def cleanup(self, values: list[object], *, opt_in: bool = False, limit: int = 50) -> dict:
         with self._operation_lock:

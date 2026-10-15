@@ -30,7 +30,7 @@ from core.chatgpt2api_401_service import (
 )
 from core.chatgpt2api_admin import ChatGPT2APIAdminError
 from core.credential_health_scheduler import CredentialHealthScheduler, InspectionResult
-from core.sub2api_401_service import Sub2Api401Service, Sub2ApiSnapshotConflict
+from core.sub2api_401_service import Sub2Api401Service, Sub2ApiSnapshotConflict, local_retry_status
 from core.sub2api_admin import Sub2ApiAdminError
 from webui.auth import init_auth, register_auth_routes
 from core import registration_service as svc
@@ -2768,10 +2768,29 @@ def create_app(auth_code: str | None = None) -> Flask:
 
     def _sub2api_401_local_statuses() -> dict[str, str]:
         return {
-            str(row.get("email") or "").strip().lower(): str(row.get("codex_status") or "").strip().lower()
+            str(row.get("email") or "").strip().lower(): local_retry_status(row)
             for row in db.list_accounts(limit=100_000)
             if str(row.get("email") or "").strip()
         }
+
+    def _sub2api_401_delete_deactivated(account_ids: list[str], label: str) -> tuple[set[str], int]:
+        """Delete exact `deactivated` rows; return deleted row IDs and failure count."""
+        if not account_ids:
+            return set(), 0
+        try:
+            result = sub2api_401_service.delete_deactivated(account_ids, opt_in=True, limit=50)
+        except Exception as exc:
+            logger.warning("Sub2API 401 废号删除异常 %s error=%s；保留 deactivated", label, type(exc).__name__)
+            return set(), len(account_ids)
+        deleted = {
+            str(item.get("account_id") or "")
+            for item in result.get("items") or []
+            if item.get("ok") and str(item.get("account_id") or "") in account_ids
+        }
+        failures = len(set(account_ids) - deleted)
+        if failures:
+            logger.warning("Sub2API 401 废号删除未完成 %s count=%s", label, failures)
+        return deleted, failures
 
     def _sub2api_401_response(payload: dict, status: int = 200) -> Response:
         response = make_response(jsonify(payload), status)
@@ -2879,8 +2898,14 @@ def create_app(auth_code: str | None = None) -> Flask:
         }
         completed_ids = {
             account_id for account_id, item in post_items.items()
-            if item.get("state") == "cleaned"
+            if item.get("state") in {"cleaned", "deleted"}
         }
+        dead_ids = [
+            account_id for account_id, item in post_items.items()
+            if item.get("retry_batch_id") == batch and item.get("state") == "deactivated"
+        ]
+        deleted_ids, _dead_failures = _sub2api_401_delete_deactivated(dead_ids, f"batch={batch}")
+        completed_ids.update(deleted_ids)
         cleanup_ids = [
             account_id for account_id, item in post_items.items()
             if item.get("retry_batch_id") == batch and item.get("state") == "cleanup_ready"
@@ -3035,11 +3060,11 @@ def create_app(auth_code: str | None = None) -> Flask:
         if len(account_ids) > 50:
             return _sub2api_401_response({"ok": False, "error": "单次最多选择 50 个账号"}, 400)
         try:
-            result = sub2api_401_service.cleanup(
-                account_ids,
-                opt_in=data.get("confirm_cleanup") is True,
-                limit=50,
-            )
+            opt_in = data.get("confirm_cleanup") is True
+            dead = sub2api_401_service.delete_deactivated(account_ids, opt_in=opt_in, limit=50)
+            result = sub2api_401_service.cleanup(account_ids, opt_in=opt_in, limit=50)
+            result["items"] = list(dead.get("items") or []) + list(result.get("items") or [])
+            result["deleted_count"] = int(dead.get("deleted_count") or 0)
             return _sub2api_401_response(result)
         except Exception as exc:
             error, status = _sub2api_401_remote_error(exc)
@@ -3824,6 +3849,12 @@ def create_app(auth_code: str | None = None) -> Flask:
                 local_statuses[email] = "failed"
         detected = sub2api_401_service.detect(local_statuses)
         items = list(detected.get("items") or [])
+        dead_ids = [
+            str(item.get("account_id") or "").strip()
+            for item in items
+            if item.get("state") == "deactivated" and str(item.get("account_id") or "").strip()
+        ][:50]
+        deleted_ids, dead_failures = _sub2api_401_delete_deactivated(dead_ids, f"run={run_id}")
         actionable_ids = [
             str(item.get("account_id") or "").strip()
             for item in items
@@ -3842,7 +3873,14 @@ def create_app(auth_code: str | None = None) -> Flask:
             skipped=max(0, len(actionable_ids) - len(selected_ids)),
         )
         if not selected_ids:
-            return InspectionResult(outcome="success", detected=len(items), actionable=0)
+            return InspectionResult(
+                outcome="partial" if dead_failures else "success",
+                detected=len(items),
+                actionable=0,
+                completed=len(deleted_ids),
+                failed=dead_failures,
+                error="部分废号未能从 Sub2API 删除" if dead_failures else "",
+            )
         payload, status = _start_sub2api_401_retry(selected_ids, workers=3, background=False)
         workflow = payload.get("workflow_result") if isinstance(payload, dict) else None
         if status != 200 or not isinstance(workflow, dict):
@@ -3856,13 +3894,14 @@ def create_app(auth_code: str | None = None) -> Flask:
                 skipped=max(skipped, len(actionable_ids) - len(selected_ids)),
                 error=str(payload.get("error") or "Sub2API 自动补跑未启动") if isinstance(payload, dict) else "Sub2API 自动补跑未启动",
             )
+        outcome = str(workflow.get("outcome") or "failed")
         return InspectionResult(
-            outcome=str(workflow.get("outcome") or "failed"),
+            outcome="partial" if dead_failures and outcome == "success" else outcome,
             detected=len(items),
             actionable=len(actionable_ids),
             submitted=int(payload.get("started_count") or 0),
-            completed=int(workflow.get("completed") or 0),
-            failed=int(workflow.get("failed") or 0),
+            completed=int(workflow.get("completed") or 0) + len(deleted_ids),
+            failed=int(workflow.get("failed") or 0) + dead_failures,
             skipped=len(payload.get("skipped") or []) + max(0, len(actionable_ids) - len(selected_ids)),
             error=str(workflow.get("error") or ""),
         )

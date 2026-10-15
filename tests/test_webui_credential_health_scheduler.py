@@ -197,6 +197,21 @@ class WebUICredentialHealthSchedulerTests(unittest.TestCase):
         mark_retrying.assert_called_once_with(["old-exact-id"], batch_id=ANY)
         cleanup.assert_called_once_with(["old-exact-id"], opt_in=True, limit=50)
 
+    def test_sub2api_automatic_job_deletes_deactivated_rows(self):
+        scheduler = self.app.extensions["credential_health_scheduler"]
+        fresh = {"ok": True, "items": [{"account_id": "dead-id", "email": "dead@example.com", "state": "deactivated"}]}
+        with patch("core.sub2api_401_service.Sub2Api401Service.state", return_value={"items": []}), patch(
+            "core.sub2api_401_service.Sub2Api401Service.detect", return_value=fresh
+        ), patch(
+            "core.sub2api_401_service.Sub2Api401Service.delete_deactivated",
+            return_value={"items": [{"account_id": "dead-id", "ok": True}], "deleted_count": 1},
+        ) as delete_deactivated, patch("webui.app.db.list_accounts", return_value=[]):
+            result = scheduler._jobs["sub2api_401"]("dead-run")
+        delete_deactivated.assert_called_once_with(["dead-id"], opt_in=True, limit=50)
+        self.assertEqual("success", result.outcome)
+        self.assertEqual(1, result.completed)
+        self.assertEqual(0, result.failed)
+
     def test_sub2api_automatic_job_counts_unverified_retry_as_failed(self):
         scheduler = self.app.extensions["credential_health_scheduler"]
         candidate = {

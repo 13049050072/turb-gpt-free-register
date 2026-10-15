@@ -42,6 +42,7 @@ from core.openai_auth import (
     _reset_retryable_circuit,
     _extract_error_code,
     detect_account_unusable_response_body,
+    detect_account_unusable_text,
     AccountUnusableError,
     request_sentinel_token,
     build_sentinel_header,
@@ -2065,6 +2066,16 @@ def run_codex_oauth(
                 proxy=proxy,
                 force=force,
                 _cpa_reauth_round=_cpa_reauth_round + 1,
+            )
+        # Stages other than email OTP (password, MFA) raise plain errors that
+        # still carry the OpenAI dead-account body; classify them the same way.
+        dead_code = detect_account_unusable_text(str(exc))
+        if dead_code:
+            logger.warning(f"[Codex] 账号已废（{dead_code}）：{email}")
+            return _codex_result(
+                status="deactivated",
+                email=email,
+                message=f"账号已废（{dead_code}）",
             )
         logger.warning("[Codex] 失败：%s，%s: %s", email, type(exc).__name__, _safe_sensitive_text(exc, limit=200))
         logger.debug("[Codex] 失败详情:", exc_info=True)

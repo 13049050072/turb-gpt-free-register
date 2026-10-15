@@ -232,6 +232,67 @@ class WebuiSub2Api401Tests(unittest.TestCase):
         detect_mock.assert_called_once_with({})
         cleanup_mock.assert_called_once_with(["old-a"], opt_in=True, limit=50)
 
+    def test_retry_runner_deletes_rows_codex_confirmed_dead(self):
+        candidates = [{"account_id": "old-a", "email": "a@example.com", "retryable": True, "state": "pending"}]
+        batch_ids = []
+
+        def detect(_local_status):
+            return {"items": [{"account_id": "old-a", "state": "deactivated", "retry_batch_id": batch_ids[0]}]}
+
+        with tempfile.TemporaryDirectory() as tmp, patch(
+            "core.sub2api_401_service.Sub2Api401Service.select_retryable", return_value=(candidates, [])
+        ), patch(
+            "core.sub2api_401_service.Sub2Api401Service.mark_retrying",
+            side_effect=lambda _ids, *, batch_id: batch_ids.append(batch_id),
+        ), patch(
+            "core.sub2api_401_service.Sub2Api401Service.detect", side_effect=detect
+        ), patch(
+            "core.sub2api_401_service.Sub2Api401Service.delete_deactivated",
+            return_value={"items": [{"account_id": "old-a", "ok": True, "state": "deleted"}], "deleted_count": 1},
+        ) as delete_deactivated, patch(
+            "core.sub2api_401_service.Sub2Api401Service.cleanup"
+        ) as cleanup, patch(
+            "webui.app.db.get_account_by_email", side_effect=lambda email: {"id": email, "email": email}
+        ), patch(
+            "webui.app.codex_retry_service.reserve", return_value=True
+        ), patch(
+            "webui.app.db.update_account_codex_status"
+        ), patch(
+            "webui.app.codex_retry_service.log_path", side_effect=lambda email: Path(tmp) / f"{email}.log"
+        ), patch(
+            "webui.app.db.list_accounts", return_value=[]
+        ), patch(
+            "webui.app.codex_retry_service.run_worker"
+        ):
+            with patch("webui.app.threading.Thread") as thread:
+                self.client.post("/api/sub2api-401/retry", headers=self.headers, json={"account_ids": ["old-a"]})
+                runner = thread.call_args.kwargs["target"]
+                runner_args = thread.call_args.kwargs["args"]
+            workflow = runner(*runner_args)
+
+        delete_deactivated.assert_called_once_with(["old-a"], opt_in=True, limit=50)
+        cleanup.assert_not_called()
+        self.assertEqual("success", workflow["outcome"])
+        self.assertEqual(1, workflow["completed"])
+
+    def test_cleanup_endpoint_also_deletes_selected_deactivated_rows(self):
+        dead = {"items": [{"account_id": "dead-id", "ok": True, "state": "deleted"}], "deleted_count": 1}
+        ready = {"ok": True, "cleanup_supported": True, "items": [{"account_id": "old-id", "ok": True}]}
+        with patch(
+            "core.sub2api_401_service.Sub2Api401Service.delete_deactivated", return_value=dead
+        ) as delete_deactivated, patch(
+            "core.sub2api_401_service.Sub2Api401Service.cleanup", return_value=ready
+        ):
+            response = self.client.post(
+                "/api/sub2api-401/cleanup",
+                headers=self.headers,
+                json={"account_ids": ["dead-id", "old-id"], "confirm_cleanup": True},
+            )
+        self.assertEqual(200, response.status_code)
+        delete_deactivated.assert_called_once_with(["dead-id", "old-id"], opt_in=True, limit=50)
+        self.assertEqual(["dead-id", "old-id"], [item["account_id"] for item in response.get_json()["items"]])
+        self.assertEqual(1, response.get_json()["deleted_count"])
+
     def test_retry_rejects_non_integer_workers(self):
         for workers in (True, False, "3", 3.5, None):
             with self.subTest(workers=workers):

@@ -80,7 +80,7 @@ retry_started_at, retry_batch_id, local_codex_status,
 retryable, cleanup_supported, manual_action
 ```
 
-Allowed states are `pending`, `retrying`, `verified`, `cleanup_ready`, `cleaned`, `failed`, and `ambiguous`. `replacement_health` is empty without a keeper and otherwise records only the cleanup invariant `healthy` or `unauthorized`; audits created before this field existed default to `healthy` so deployed replacement cleanup remains restart-safe. Management keys, access/refresh tokens, OAuth codes, callback URLs, cookies, and credential JSON must never be logged, persisted, or returned. Reasons are bounded and secret-like text is redacted.
+Allowed states are `pending`, `retrying`, `verified`, `cleanup_ready`, `cleaned`, `failed`, `ambiguous`, `deactivated`, and `deleted`. `replacement_health` is empty without a keeper and otherwise records only the cleanup invariant `healthy` or `unauthorized`; audits created before this field existed default to `healthy` so deployed replacement cleanup remains restart-safe. Management keys, access/refresh tokens, OAuth codes, callback URLs, cookies, and credential JSON must never be logged, persisted, or returned. Reasons are bounded and secret-like text is redacted.
 
 `sub2api_401_audit.json` is persisted atomically. If the configured audit path is a symlink, create the temporary file beside the resolved target so `os.replace()` remains on the writable data volume and preserves the symlink. Use mode `0600` where supported.
 
@@ -118,6 +118,10 @@ All Sub2API-401 responses set `Cache-Control: no-store, max-age=0`, `Pragma: no-
 | Detect lists an `error` account, an account without `status`, a same-email sibling of a probed account, or an ID in the email group of a retry row whose old ID still exists | Send it to batch-refresh and classify from the refresh result as before; with no such IDs, send no refresh request |
 | A retry row's locked old ID is absent on a later detect and no local Codex retry is running | Release its same-email IDs to normal per-account detection; keep the row only when it is `cleaned`, otherwise drop it. A revoked replacement becomes its own retryable `pending` row |
 | A retry row's locked old ID is absent while local Codex retry is `retrying`/`queued`/`running` | Keep the row and its same-email ID lock until the retry finishes |
+| Local account is dead: `codex_status=deactivated`, `live_check_status=deactivated`, or the stored Codex error matches `detect_account_unusable_text` (e.g. MFA 403 "has been deleted or deactivated"), and no retry is running | `local_retry_status()` reports `deactivated`; a retry row or an unauthorized singleton becomes `deactivated` (not `failed`/`pending`), `retryable=false`, `cleanup_account_id` = the exact ID |
+| `delete_deactivated(ids, opt_in=True)` | Re-list; require the exact ID listed with the locked email and a fresh batch-refresh still `unauthorized`; then PUT `inactive` + DELETE that ID only; re-list: absent → `deleted`, still listed or delete error → stay `deactivated` (retryable), refresh not 401 or email drift → `ambiguous` with no request |
+| Retry batch post-detect, scheduled inspection, or the cleanup endpoint sees `deactivated` rows | Call `delete_deactivated` for those exact IDs; `deleted` counts as completed. `deleted` rows stay as history after the ID leaves Sub2API |
+| Codex OAuth raises any stage error whose text marks a dead account | `run_codex_oauth` returns `status=deactivated` instead of `failed` |
 
 ### 5. Good/Base/Bad Cases
 

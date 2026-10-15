@@ -14,7 +14,7 @@
     .counts{display:grid;grid-template-columns:repeat(6,minmax(105px,1fr));gap:10px;margin-top:14px}.metric{border:1px solid var(--line);border-radius:10px;padding:10px 12px}.metric b{display:block;font-size:20px}
     .notice{margin-top:12px;padding:10px 12px;border-radius:9px;background:#fff7ed;color:#9a3412}.notice.error{background:#fef2f2;color:var(--danger)}.notice.ok{background:#ecfdf3;color:var(--ok)}
     .table-wrap{overflow:auto}table{width:100%;border-collapse:collapse;min-width:1450px}th,td{border-bottom:1px solid #edf1f7;padding:11px 9px;text-align:left;vertical-align:top}th{font-size:12px;text-transform:uppercase;letter-spacing:.03em;color:var(--muted);background:#f8fafc}.ids{max-width:280px;word-break:break-all;color:var(--muted);font-size:12px}
-    .badge{display:inline-block;padding:3px 8px;border-radius:999px;font-size:12px;font-weight:700}.pending{background:#fff7ed;color:var(--warn)}.retrying{background:#eff6ff;color:#1d4ed8}.verified,.cleaned{background:#ecfdf3;color:var(--ok)}.cleanup_ready{background:#eef2ff;color:#4338ca}.failed,.ambiguous{background:#fef2f2;color:var(--danger)}
+    .badge{display:inline-block;padding:3px 8px;border-radius:999px;font-size:12px;font-weight:700}.pending{background:#fff7ed;color:var(--warn)}.retrying{background:#eff6ff;color:#1d4ed8}.verified,.cleaned{background:#ecfdf3;color:var(--ok)}.cleanup_ready{background:#eef2ff;color:#4338ca}.failed,.ambiguous,.deactivated{background:#fef2f2;color:var(--danger)}.deleted{background:#ecfdf3;color:var(--ok)}.filterbar{display:flex;flex-wrap:wrap;align-items:center;gap:10px;margin-bottom:12px}.filterbar select{padding:7px 11px}
     .queue{margin:12px 0 0;white-space:pre-wrap;word-break:break-all;background:#0f172a;color:#e2e8f0;border-radius:9px;padding:12px;max-height:280px;overflow:auto}.hidden{display:none}
     @media(max-width:900px){.counts{grid-template-columns:repeat(2,1fr)}.top{align-items:flex-start;flex-direction:column}.scheduler-grid,.scheduler-meta{grid-template-columns:1fr}}
   </style>
@@ -41,7 +41,7 @@
     <div class="toolbar">
       <button class="primary" id="detectBtn">检测 Sub2API 401</button>
       <button id="retryBtn" disabled>补跑 Codex（已选 0）</button>
-      <button class="danger" id="cleanupBtn" disabled>重试清理旧 ID（已选 0）</button>
+      <button class="danger" id="cleanupBtn" disabled>重试清理旧 ID / 删除废号（已选 0）</button>
       <label>并发 <select id="workers"><option>1</option><option>2</option><option selected>3</option><option>4</option><option>6</option><option>8</option></select></label>
       <span class="spacer"></span><span class="muted" id="checkedAt">正在读取审计状态…</span>
     </div>
@@ -51,14 +51,30 @@
       <div class="metric"><span class="muted">刷新超时</span><b id="timeoutCount">0</b></div>
       <div class="metric"><span class="muted">已验证恢复</span><b id="verifiedCount">0</b></div>
       <div class="metric"><span class="muted">待显式清理</span><b id="cleanupReadyCount">0</b></div>
+      <div class="metric"><span class="muted">废号待删除</span><b id="deactivatedCount">0</b></div>
+      <div class="metric"><span class="muted">已删除废号</span><b id="deletedCount">0</b></div>
       <div class="metric"><span class="muted">状态正常</span><b id="healthyCount">0</b></div>
       <div class="metric"><span class="muted">状态未知</span><b id="unknownCount">0</b></div>
     </div>
-    <div class="notice">系统仅处理 platform=openai 且 type=oauth 的 Sub2API 账号。检测只刷新 Sub2API 状态为“错误”的账号，以及选 keeper 和验证补跑所需的同邮箱账号；其余账号按 Sub2API 状态计为正常。补跑验证出唯一健康替代 ID 后会自动清理锁定旧 ID；按钮仅用于历史重复项或自动清理失败重试，并且不会按邮箱批量删除。</div>
+    <div class="notice">系统仅处理 platform=openai 且 type=oauth 的 Sub2API 账号。检测只刷新 Sub2API 状态为“错误”的账号，以及选 keeper 和验证补跑所需的同邮箱账号；其余账号按 Sub2API 状态计为正常。补跑验证出唯一健康替代 ID 后会自动清理锁定旧 ID；按钮仅用于历史重复项或自动清理失败重试，并且不会按邮箱批量删除。Codex 或查活确认账号已删除/停用（deleted or deactivated）时不再补跑，复核该 ID 仍刷新 401 后删除锁定的废号 account_id。</div>
     <div id="message"></div>
     <pre id="cleanupQueue" class="queue hidden"></pre>
   </section>
   <section class="card table-wrap">
+    <div class="filterbar">
+      <label for="stateFilter" class="muted">状态筛选</label>
+      <select id="stateFilter">
+        <option value="all">全部</option>
+        <option value="todo">待补跑 / 补跑失败</option>
+        <option value="retrying">补跑中</option>
+        <option value="cleanup">待清理旧 ID</option>
+        <option value="deactivated">废号待删除</option>
+        <option value="cleaned">已清理</option>
+        <option value="deleted">已删除废号</option>
+        <option value="ambiguous">状态不明确</option>
+      </select>
+      <span class="muted" id="filterSummary"></span>
+    </div>
     <table>
       <thead><tr><th><input type="checkbox" id="selectAll" aria-label="全选可操作账号"></th><th>旧 account_id</th><th>邮箱 / 名称</th><th>状态</th><th>原因</th><th>补跑前 account_id</th><th>补跑后 account_id</th><th>唯一替代 account_id</th><th>锁定清理 ID</th><th>本地 Codex</th></tr></thead>
       <tbody id="rows"><tr><td colspan="10" class="muted">正在读取最近一次审计状态…</td></tr></tbody>
@@ -76,7 +92,14 @@
   let pollDelay = 0;
   let stateLoading = false;
   const esc = value => String(value ?? '').replace(/[&<>"']/g, ch => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch]));
-  const stateText = {pending:'待补跑',retrying:'补跑中',verified:'已验证',cleanup_ready:'待清理/可重试',cleaned:'已清理',failed:'补跑失败',ambiguous:'状态不明确'};
+  const stateText = {pending:'待补跑',retrying:'补跑中',verified:'已验证',cleanup_ready:'待清理/可重试',cleaned:'已清理',failed:'补跑失败',ambiguous:'状态不明确',deactivated:'废号待删除',deleted:'已删除废号'};
+  const filterStates = {all:null,todo:['pending','failed'],retrying:['retrying'],cleanup:['cleanup_ready'],deactivated:['deactivated'],cleaned:['cleaned','verified'],deleted:['deleted'],ambiguous:['ambiguous']};
+  const filterStorageKey = 'sub2api401.stateFilter';
+  let stateFilter = 'all';
+  try { const saved = localStorage.getItem(filterStorageKey); if (saved && saved in filterStates) stateFilter = saved; } catch (_) {}
+  const inFilter = (item, key=stateFilter) => !filterStates[key] || filterStates[key].includes(item.state);
+  const cleanable = item => item.state === 'cleanup_ready' || item.state === 'deactivated';
+  const actionableRow = item => item.retryable || cleanable(item);
   async function api(path, options={}) {
     const response = await fetch(path, {...options, headers:{'Content-Type':'application/json', ...(options.headers || {})}});
     const data = await response.json().catch(() => ({ok:false,error:`HTTP ${response.status}`}));
@@ -108,27 +131,41 @@
     $('#timeoutCount').textContent = counts.timeout || 0;
     $('#verifiedCount').textContent = counts.verified || 0;
     $('#cleanupReadyCount').textContent = counts.cleanup_ready || 0;
+    $('#deactivatedCount').textContent = counts.deactivated || 0;
+    $('#deletedCount').textContent = counts.deleted || 0;
     $('#healthyCount').textContent = counts.healthy || 0;
     $('#unknownCount').textContent = counts.unknown || 0;
     $('#checkedAt').textContent = data.checked_at ? `状态时间 ${new Date(data.checked_at).toLocaleString()}` : '尚未执行远端检测';
   }
+  function renderFilter(visible) {
+    const select = $('#stateFilter');
+    select.value = stateFilter;
+    for (const option of select.options) {
+      const base = option.dataset.label || (option.dataset.label = option.textContent);
+      option.textContent = `${base}（${items.filter(item => inFilter(item, option.value)).length}）`;
+    }
+    $('#filterSummary').textContent = `显示 ${visible.length} / ${items.length} 条`;
+  }
   function render() {
-    const actionable = items.filter(item => item.retryable || item.state === 'cleanup_ready');
+    // Selection follows the filter so hidden rows are never submitted.
+    const visible = items.filter(item => inFilter(item));
+    const actionable = visible.filter(actionableRow);
     for (const accountId of [...selected]) if (!actionable.some(item => item.account_id === accountId)) selected.delete(accountId);
-    $('#rows').innerHTML = items.map(item => `<tr>
-      <td><input type="checkbox" data-account-id="${esc(item.account_id)}" ${(item.retryable || item.state === 'cleanup_ready') ? '' : 'disabled'} ${selected.has(item.account_id) ? 'checked' : ''}></td>
+    renderFilter(visible);
+    $('#rows').innerHTML = visible.map(item => `<tr>
+      <td><input type="checkbox" data-account-id="${esc(item.account_id)}" ${actionableRow(item) ? '' : 'disabled'} ${selected.has(item.account_id) ? 'checked' : ''}></td>
       <td class="ids">${esc(item.account_id)}</td><td>${esc(item.email || '—')}<div class="muted">${esc(item.account_name || '')}</div></td>
       <td><span class="badge ${esc(item.state)}">${esc(stateText[item.state] || item.state)}</span><div class="muted">${esc(item.health || '')}</div></td>
       <td>${esc(item.reason)}</td><td class="ids">${idLines(item.pre_retry_account_ids?.length ? item.pre_retry_account_ids : item.observed_account_ids)}</td>
       <td class="ids">${idLines(item.post_retry_account_ids)}</td><td class="ids">${esc(item.replacement_account_id || '—')}</td>
       <td class="ids">${esc(item.cleanup_account_id || '—')}</td><td>${esc(item.local_codex_status || '—')}</td>
-    </tr>`).join('') || '<tr><td colspan="10" class="muted">未发现需要处理的 Sub2API 账号。</td></tr>';
+    </tr>`).join('') || `<tr><td colspan="10" class="muted">${items.length ? '当前筛选下没有记录。' : '未发现需要处理的 Sub2API 账号。'}</td></tr>`;
     const retryIds = [...selected].filter(accountId => items.some(item => item.account_id === accountId && item.retryable));
-    const cleanupIds = [...selected].filter(accountId => items.some(item => item.account_id === accountId && item.state === 'cleanup_ready'));
+    const cleanupIds = [...selected].filter(accountId => items.some(item => item.account_id === accountId && cleanable(item)));
     $('#retryBtn').disabled = retryIds.length === 0;
     $('#retryBtn').textContent = `补跑 Codex（已选 ${retryIds.length}）`;
     $('#cleanupBtn').disabled = !cleanupSupported || cleanupIds.length === 0;
-    $('#cleanupBtn').textContent = `重试清理旧 ID（已选 ${cleanupIds.length}）`;
+    $('#cleanupBtn').textContent = `重试清理旧 ID / 删除废号（已选 ${cleanupIds.length}）`;
     $('#selectAll').checked = actionable.length > 0 && actionable.every(item => selected.has(item.account_id));
     $('#selectAll').indeterminate = selected.size > 0 && !$('#selectAll').checked;
   }
@@ -208,14 +245,14 @@
     }
   });
   $('#cleanupBtn').addEventListener('click', async () => {
-    const accountIds = [...selected].filter(accountId => items.some(item => item.account_id === accountId && item.state === 'cleanup_ready'));
+    const accountIds = [...selected].filter(accountId => items.some(item => item.account_id === accountId && cleanable(item)));
     if (!accountIds.length) return;
     try {
       const preview = await api('/api/sub2api-401/cleanup', {method:'POST', body:JSON.stringify({account_ids:accountIds, confirm_cleanup:false})});
-      const lines = (preview.items || []).map(item => `${item.email || '—'}\n  旧 account_id: ${item.cleanup_account_id || '—'}\n  已验证替代: ${item.replacement_account_id || '—'}`);
+      const lines = (preview.items || []).map(item => `${item.email || '—'}\n  旧 account_id: ${item.cleanup_account_id || '—'}\n  已验证替代: ${item.replacement_account_id || '（废号，无替代）'}`);
       $('#cleanupQueue').textContent = `${preview.manual_action || ''}\n\n${lines.join('\n\n')}`.trim();
       $('#cleanupQueue').classList.remove('hidden');
-      if (!confirm(`确认删除 ${accountIds.length} 个已锁定的旧 Sub2API account_id？\n\n系统不会按邮箱删除，并会在删除后重新读取账号列表确认旧 ID 消失；此按钮仅重试历史重复项或自动清理失败。`)) return;
+      if (!confirm(`确认删除 ${accountIds.length} 个已锁定的旧 Sub2API account_id？\n\n系统不会按邮箱删除，并会在删除后重新读取账号列表确认旧 ID 消失；废号删除前会复核该 ID 仍刷新 401。`)) return;
       const result = await api('/api/sub2api-401/cleanup', {method:'POST', body:JSON.stringify({account_ids:accountIds, confirm_cleanup:true})});
       await loadState();
       const failed = (result.items || []).filter(item => !item.ok).length;
@@ -230,7 +267,12 @@
   });
   $('#selectAll').addEventListener('change', event => {
     selected.clear();
-    if (event.target.checked) for (const item of items) if (item.retryable || item.state === 'cleanup_ready') selected.add(item.account_id);
+    if (event.target.checked) for (const item of items) if (actionableRow(item) && inFilter(item)) selected.add(item.account_id);
+    render();
+  });
+  $('#stateFilter').addEventListener('change', event => {
+    stateFilter = event.target.value in filterStates ? event.target.value : 'all';
+    try { localStorage.setItem(filterStorageKey, stateFilter); } catch (_) {}
     render();
   });
   loadState();

@@ -705,7 +705,26 @@ class Sub2Api401ServiceTests(unittest.TestCase):
         self.assertEqual("ambiguous", item["state"])
         self.assertEqual("", item["replacement_account_id"])
 
-    def test_old_account_missing_blocks_cleanup(self):
+    def test_old_account_missing_releases_new_id_and_blocks_cleanup(self):
+        rows = [{"account_id": "old", "email": "one@example.com"}]
+        deleted = []
+        service = self.service(
+            rows=rows,
+            refresh=lambda ids: {"total": len(ids), "success": 0, "failed": len(ids), "errors": [{"account_id": value, "error": "401"} for value in ids]},
+            delete=lambda account_id: deleted.append(account_id),
+        )
+        service.detect()
+        service.mark_retrying(["old"])
+        rows[:] = [{"account_id": "new", "email": "one@example.com"}]
+        items = service.detect({"one@example.com": "success"})["items"]
+        self.assertEqual(["new"], [item["account_id"] for item in items])
+        self.assertEqual("pending", items[0]["state"])
+        self.assertTrue(items[0]["retryable"])
+        self.assertEqual("", items[0]["cleanup_account_id"])
+        service.cleanup(["old"], opt_in=True)
+        self.assertEqual([], deleted)
+
+    def test_old_account_missing_keeps_lock_while_codex_retry_runs(self):
         rows = [{"account_id": "old", "email": "one@example.com"}]
         service = self.service(
             rows=rows,
@@ -714,9 +733,57 @@ class Sub2Api401ServiceTests(unittest.TestCase):
         service.detect()
         service.mark_retrying(["old"])
         rows[:] = [{"account_id": "new", "email": "one@example.com"}]
-        item = service.detect({"one@example.com": "success"})["items"][0]
-        self.assertEqual("ambiguous", item["state"])
-        self.assertEqual("", item["cleanup_account_id"])
+        items = service.detect({"one@example.com": "running"})["items"]
+        self.assertEqual(["old"], [item["account_id"] for item in items])
+        self.assertFalse(items[0]["retryable"])
+
+    def test_cleaned_replacement_that_turns_401_becomes_its_own_pending_row(self):
+        rows = [{"account_id": "old", "email": "one@example.com"}]
+        failing = {"old"}
+
+        def refresh(ids):
+            errors = [{"account_id": value, "error": "Token revoked (401)"} for value in ids if value in failing]
+            return {"total": len(ids), "success": len(ids) - len(errors), "failed": len(errors), "errors": errors}
+
+        def delete(account_id):
+            rows[:] = [row for row in rows if row["account_id"] != account_id]
+            return {"ok": True}
+
+        service = self.service(rows=rows, refresh=refresh, delete=delete)
+        service.detect()
+        service.mark_retrying(["old"])
+        rows.append({"account_id": "new", "email": "one@example.com"})
+        service.detect({"one@example.com": "success"})
+        service.cleanup(["old"], opt_in=True)
+        self.assertEqual("cleaned", service.state()["items"][0]["state"])
+
+        failing.add("new")
+        by_id = {item["account_id"]: item for item in service.detect({"one@example.com": "success"})["items"]}
+        self.assertEqual({"old", "new"}, set(by_id))
+        self.assertEqual("cleaned", by_id["old"]["state"])
+        self.assertEqual("pending", by_id["new"]["state"])
+        self.assertEqual("unauthorized", by_id["new"]["health"])
+        self.assertTrue(by_id["new"]["retryable"])
+
+    def test_stuck_audit_row_with_missing_old_id_releases_current_id(self):
+        self.audit_path.write_text(json.dumps({"version": 2, "items": {"1": {
+            "account_id": "1", "email": "one@example.com", "state": "ambiguous", "health": "unauthorized",
+            "reason": "检测时锁定的旧 account_id 已变化或不存在，禁止清理",
+            "pre_retry_account_ids": ["1"], "post_retry_account_ids": ["42"], "observed_account_ids": ["42"],
+            "replacement_account_id": "42", "replacement_health": "healthy",
+        }}}), encoding="utf-8")
+        rows = [{"account_id": "42", "email": "one@example.com"}]
+        service = self.service(
+            rows=rows,
+            refresh=lambda ids: {"total": 1, "success": 0, "failed": 1, "errors": [{"account_id": "42", "error": "Token revoked (401)"}]},
+        )
+        items = service.detect({"one@example.com": "success"})["items"]
+        self.assertEqual(["42"], [item["account_id"] for item in items])
+        self.assertEqual("pending", items[0]["state"])
+        self.assertTrue(items[0]["retryable"])
+        selected, skipped = service.select_retryable(["42"])
+        self.assertEqual(["42"], [item["account_id"] for item in selected])
+        self.assertEqual([], skipped)
 
     def test_local_retry_failure_preserves_old_id_and_blocks_cleanup(self):
         rows = [{"account_id": "old", "email": "one@example.com"}]

@@ -114,6 +114,8 @@ All Sub2API-401 responses set `Cache-Control: no-store, max-age=0`, `Pragma: no-
 | Re-list confirms old ID absent and a second refresh confirms the replacement healthy | `cleaned` |
 | Re-list confirms an exact historical old ID absent, the keeper remains same-email and unique latest, and a second refresh confirms it unauthorized | `cleaned`; on the next detect the unauthorized singleton keeper becomes normal retryable `pending` |
 | Historical unauthorized old ID is absent but the keeper no longer refreshes unauthorized or is no longer unique latest | `ambiguous`; retain the exact cleanup and keeper evidence |
+| A retry row's locked old ID is absent on a later detect and no local Codex retry is running | Release its same-email IDs to normal per-account detection; keep the row only when it is `cleaned`, otherwise drop it. A revoked replacement becomes its own retryable `pending` row |
+| A retry row's locked old ID is absent while local Codex retry is `retrying`/`queued`/`running` | Keep the row and its same-email ID lock until the retry finishes |
 
 ### 5. Good/Base/Bad Cases
 

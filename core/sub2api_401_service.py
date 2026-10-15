@@ -357,11 +357,18 @@ class Sub2Api401Service:
         }
 
         if old.get("state") == "cleaned" and replacement:
-            if old_id not in by_id and replacement in by_id and kinds.get(replacement) == "healthy":
+            if old_id not in by_id:
+                # Cleanup is finished history. The replacement is no longer
+                # locked by this row and is classified as a normal account.
+                replacement_healthy = replacement in by_id and kinds.get(replacement) == "healthy"
                 return self._sanitize_entry({
                     **base,
                     "state": "cleaned",
-                    "reason": "旧 Sub2API account_id 已删除，替代账号保持健康",
+                    "reason": (
+                        "旧 Sub2API account_id 已删除，替代账号保持健康"
+                        if replacement_healthy
+                        else "旧 Sub2API account_id 已删除；替代账号已按普通账号重新检测"
+                    ),
                     "replacement_account_id": replacement,
                     "cleanup_account_id": old_id,
                 })
@@ -531,15 +538,23 @@ class Sub2Api401Service:
             for account_id, old in previous.items():
                 if not old.get("pre_retry_account_ids"):
                     continue
+                retry_status = local_status.get(_email(old.get("email")), "")
                 item = self._evaluate_after_retry(
                     old,
                     by_id,
                     by_email,
                     kinds,
                     reasons,
-                    local_status=local_status.get(_email(old.get("email")), ""),
+                    local_status=retry_status,
                     checked_at=checked_at,
                 )
+                if account_id not in by_id and retry_status not in _RUNNING_LOCAL_STATES:
+                    # The locked old ID is gone, so this retry row can no longer
+                    # act. Release same-email IDs to normal per-account
+                    # detection; a revoked replacement then becomes `pending`.
+                    if item.get("state") == "cleaned":
+                        next_tracked[account_id] = item
+                    continue
                 next_tracked[account_id] = item
                 processed_ids.update(item.get("post_retry_account_ids") or [])
                 processed_ids.update(item.get("pre_retry_account_ids") or [])

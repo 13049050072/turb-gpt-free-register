@@ -123,3 +123,198 @@ fc43bc512711a623b6030b6f0a531834282f80cffda5c84eade31a44162f99ac  MODIFIED_FILE.
 71b60fd78d42b5bb09d9f889a0f40a4dcd57a9eb46de06ff2d05528cf5042e1a  ROLLBACK.sh
 2f53e6c67014ca38e091b35667b6b6aa961fac386c5f91d6365661fd2ee3ba89  BASELINE.tar.gz
 fe2e06454ba91adbaaa2ca999179c55af55fa45bf267b29910c0ca30f459e045  PROBE_deactivated.py
+
+==================================================================
+FOLLOW-UP 1: state filter on /chatgpt2api-401 (base 3f589456aef82f14dce5316937e3752d75476907)
+Generated: 2026-10-15T11:32:13Z
+Records: .trellis/tasks/10-15-chatgpt2api-401-deactivated-delete/artifacts/followup-filter/
+
+PRODUCTION CHECK (read-only, after user ran detect + refresh on deployed 3f58945)
+- audit: Counter({('deleted', ''): 63}) progress completed=63 failed=0
+- chatgpt2api remote now: 67 accounts, invalid 0 (was 130 / 63)
+- tracebacks in last 30m: 0
+- record retention: deleted rows stay in /data/chatgpt2api_401_audit.json until the next detect(); detect() rebuilds items only from rows still invalid remotely, so they then disappear. Local turb account rows are unchanged (live_check_status=deactivated).
+
+CHANGED
+- webui/templates/chatgpt2api_401.html: #stateFilter select (all/todo/running/ready/replaced/deleted/problem) with per-option counts, #filterSummary, render() shows only filtered rows, selection pruned to visible actionable rows, selectAll scoped to filter, choice kept in localStorage
+- tests/test_chatgpt2api_401_templates.py: test_page_filters_rows_by_state_and_scopes_selection
+
+BASELINE HASHES
+dad8501d32fcf92896bee43c84e6baf6599d6e504a30ef50f5df5a58c3107a8c  webui/templates/chatgpt2api_401.html
+d9b48b81b8294c892421b2a954fd5a0fb052514952d06ff36ae94e16e46f5894  tests/test_chatgpt2api_401_templates.py
+MODIFIED HASHES
+60b35ed7c961d80dee5cefd8056aaf31baaee87848b313f816da2f53d8bf77aa  webui/templates/chatgpt2api_401.html
+4eeee67f70289cfb7fb1236c2a83387c96d2ffb3595593f3d474e368c17c6c04  tests/test_chatgpt2api_401_templates.py
+ROLLBACK HASHES
+dad8501d32fcf92896bee43c84e6baf6599d6e504a30ef50f5df5a58c3107a8c  webui/templates/chatgpt2api_401.html
+d9b48b81b8294c892421b2a954fd5a0fb052514952d06ff36ae94e16e46f5894  tests/test_chatgpt2api_401_templates.py
+restored-hashes-equal-original
+
+SAME-INPUT PROBE: .venv/bin/python -I .trellis/tasks/10-15-chatgpt2api-401-deactivated-delete/artifacts/followup-filter/PROBE_filter.py <tree>  (headless Chromium, mocked state: 3 deleted, 2 pending, 1 failed, 1 conflict, 1 replaced)
+BASELINE exit=0 stdout: {"filter_present": false, "refresh_btn_after_select_all": "查活并写回（已选 3）", "rows_all": 8}
+MODIFIED exit=0 stdout: {"badges_deleted": ["已删除废号"], "filter_after_reload": "deleted", "filter_options": ["全部（8）", "待查活 / 重试（3）", "队列 / 查活中（0）", "历史待写回（0）", "已验证替换（1）", "已删除废号（3）", "冲突 / 映射不明确（1）"], "filter_present": true, "refresh_btn_after_select_all": "查活并写回（已选 3）", "refresh_btn_after_switch_to_deleted": "查活并写回（已选 0）", "rows_after_reload": 3, "rows_all": 8, "rows_deleted": 3, "rows_todo": 3, "summary_deleted": "显示 3 / 8 条"}
+ROLLBACK apply exit=0: rollback complete: restored 2 paths from /Users/jiangdk/code/personal/turb-gpt-free-register/.trellis/tasks/10-15-chatgpt2api-401-deactivated-delete/artifacts/followup-filter/BASELINE.tar.gz
+ROLLBACK probe exit=0 stdout: {"filter_present": false, "refresh_btn_after_select_all": "查活并写回（已选 3）", "rows_all": 8}
+restored probe output == baseline: yes; reapply patch exit=0, reapplied hashes == modified: yes
+
+TESTS exit=0: Ran 70 tests in 1.017s OK
+STATIC: node --check extracted <script> exit 0; git diff --check PASS
+NOT DONE: not committed, not deployed.
+ARTIFACT HASHES
+6bdffffa70d1ad810a42e73ae1f029e085f569cb387c8d34e321387ce6cb440c  MODIFIED_FILE.tar.gz
+fd43d44577485e4f505f0cade75ebf019e51d21cabafce1158276e886ee01f82  DIFF_FILE.patch
+50b24d67a9b4cc77c30de14f4f1804dd1b9542bc013a51ad6a76902ae1695587  ROLLBACK.sh
+3f6cbb9ea8f2a37d9ca04a4cd471fe5bcddbcc5c5c4730b963e10a8b760774ef  BASELINE.tar.gz
+b8721ce09cf0dbfa6806effe9831ae03b8cd531d9dc46febe7b19ff309a2a895  PROBE_filter.py
+
+==================================================================
+FOLLOW-UP 2: Sub2API 401 retry rows release replacement IDs once the old ID is gone (base 3f589456aef82f14dce5316937e3752d75476907)
+Generated: 2026-10-15T11:43:13Z
+Records: .trellis/tasks/10-15-chatgpt2api-401-deactivated-delete/artifacts/followup-sub2api/
+
+PRODUCTION EVIDENCE (read-only)
+- sub2api openai oauth accounts: 41; status active 35, error 6
+- #42 #43 #44 #46 #52 #55: status=error schedulable=False err='Token revoked (401): Encountered invalidated oauth token for user, failing request'
+- each is post_retry_account_ids of an audit row whose old ID (1,12,15,30,37,6) no longer exists -> row 'ambiguous: 检测时锁定的旧 account_id 已变化或不存在，禁止清理', retryable false
+- detect() puts those IDs in processed_ids, so they were refreshed but never classified as their own rows
+
+CHANGED
+- core/sub2api_401_service.py _detect_locked: a retry row whose locked old ID is absent and whose local Codex status is not retrying/queued/running no longer adds its IDs to processed_ids; it is kept only when state=cleaned, otherwise dropped
+- core/sub2api_401_service.py _evaluate_after_retry: a cleaned row whose old ID is absent stays cleaned (history) even if the replacement later fails refresh
+- tests/test_sub2api_401_service.py: test_old_account_missing_blocks_cleanup -> test_old_account_missing_releases_new_id_and_blocks_cleanup; new: keeps_lock_while_codex_retry_runs, cleaned_replacement_that_turns_401_becomes_its_own_pending_row, stuck_audit_row_with_missing_old_id_releases_current_id
+- .trellis/spec/backend/sub2api-credential-rotation.md: two error-matrix rows
+
+BASELINE HASHES
+4994246558881c5b099382d3ec3182d2d8bbfd7bf87b7701f224cedbec1b3bd0  core/sub2api_401_service.py
+3d207bf96cb352917b7b428fdeba6d5e19255b5f29467fd6cdb362023926a0be  tests/test_sub2api_401_service.py
+97162d760dc1f343cf17471947e07aff4c7e829123106c8db23a566e03c2b27c  .trellis/spec/backend/sub2api-credential-rotation.md
+MODIFIED HASHES
+33fc9ec6cd8ef37d9cb9b9245e2940aaf0457db41ee18eef7398e9a3b132a906  core/sub2api_401_service.py
+afbe517dfaede4f48aeed56333669b9ab8c354feb9e40c44d923d3d3558595d5  tests/test_sub2api_401_service.py
+f0f9a58c9586ddf9a6fa51fe3d63e19127df1babe3ce3477da7f2a174f751fc9  .trellis/spec/backend/sub2api-credential-rotation.md
+ROLLBACK HASHES
+4994246558881c5b099382d3ec3182d2d8bbfd7bf87b7701f224cedbec1b3bd0  core/sub2api_401_service.py
+3d207bf96cb352917b7b428fdeba6d5e19255b5f29467fd6cdb362023926a0be  tests/test_sub2api_401_service.py
+97162d760dc1f343cf17471947e07aff4c7e829123106c8db23a566e03c2b27c  .trellis/spec/backend/sub2api-credential-rotation.md
+restored-hashes-equal-original
+
+SAME-INPUT PROBE: .venv/bin/python -I .trellis/tasks/10-15-chatgpt2api-401-deactivated-delete/artifacts/followup-sub2api/PROBE_released_ids.py <tree>
+BASELINE exit=0
+[{"account_id": "1", "health": "unauthorized", "reason": "检测时锁定的旧 account_id 已变化或不存在，禁止清理", "retryable": false, "state": "ambiguous"}, {"account_id": "9", "health": "unauthorized", "reason": "旧 Sub2API account_id 已删除，替代账号保持健康", "retryable": false, "state": "cleaned"}]
+{"counts": {"ambiguous": 1, "cleaned": 1, "pending": 0, "unauthorized": 1}}
+MODIFIED exit=0
+[{"account_id": "42", "health": "unauthorized", "reason": "Token revoked (401): Encountered invalidated oauth token", "retryable": true, "state": "pending"}, {"account_id": "9", "health": "unauthorized", "reason": "旧 Sub2API account_id 已删除，替代账号保持健康", "retryable": false, "state": "cleaned"}]
+{"counts": {"ambiguous": 0, "cleaned": 1, "pending": 1, "unauthorized": 1}}
+ROLLBACK apply exit=0: rollback complete: restored 3 paths from /Users/jiangdk/code/personal/turb-gpt-free-register/.trellis/tasks/10-15-chatgpt2api-401-deactivated-delete/artifacts/followup-sub2api/BASELINE.tar.gz
+ROLLBACK probe exit=0
+[{"account_id": "1", "health": "unauthorized", "reason": "检测时锁定的旧 account_id 已变化或不存在，禁止清理", "retryable": false, "state": "ambiguous"}, {"account_id": "9", "health": "unauthorized", "reason": "旧 Sub2API account_id 已删除，替代账号保持健康", "retryable": false, "state": "cleaned"}]
+{"counts": {"ambiguous": 1, "cleaned": 1, "pending": 0, "unauthorized": 1}}
+restored probe output == baseline: yes; reapply patch exit=0, reapplied hashes == modified: yes, reapplied probe == modified: yes
+
+PRODUCTION REPLAY (real audit + real account list; refresh simulated from sub2api status=error)
+== baseline
+states: {'ambiguous': 8, 'cleaned': 15, 'failed': 1}
+pending retryable: []
+ambiguous rows: ['1', '6', '8', '12', '15', '30', '36', '37']
+== modified
+states: {'cleaned': 15, 'pending': 6, 'failed': 1}
+pending retryable: ['42', '43', '44', '46', '52', '55']
+ambiguous rows: []
+
+TESTS focused focused exit=0: Ran 90 tests in 0.457s OK
+TESTS new-on-original exit=1:
+FAIL: test_cleaned_replacement_that_turns_401_becomes_its_own_pending_row (tests.test_sub2api_401_service.Sub2Api401ServiceTests.test_cleaned_replacement_that_turns_401_becomes_its_own_pending_row)
+FAIL: test_old_account_missing_releases_new_id_and_blocks_cleanup (tests.test_sub2api_401_service.Sub2Api401ServiceTests.test_old_account_missing_releases_new_id_and_blocks_cleanup)
+FAIL: test_stuck_audit_row_with_missing_old_id_releases_current_id (tests.test_sub2api_401_service.Sub2Api401ServiceTests.test_stuck_audit_row_with_missing_old_id_releases_current_id)
+Ran 41 tests in 0.038s
+FAILED (failures=3)
+FULL full exit=1:
+ERROR: test_ensure_authorize_context_matches_20260914_capture_shape (test_chatgpt_auth_context.ChatgptAuthContextTests.test_ensure_authorize_context_matches_20260914_capture_shape)
+FAIL: test_restore_context_requires_exact_email_match (test_remail_client.RemailClientTests.test_restore_context_requires_exact_email_match)
+Ran 547 tests in 12.324s
+FAILED (failures=1, errors=1)
+(same 2 pre-existing failures recorded in PRISTINE_UNRELATED_FAILURES.log)
+STATIC: py_compile PASS; git diff --check PASS
+NOT DONE: not committed, not deployed; production audit untouched.
+ARTIFACT HASHES
+4ddaf5f595a073d942ed372721cf7634530449be488ddf81354bc48e91f0f0b3  MODIFIED_FILE.tar.gz
+bcd53598aaaaf49cd5b0948699b72276299f565e0f9904cc961d38728c9ddea9  DIFF_FILE.patch
+abae30b4235d04973d8964f00d4b3a999382a695190a23e606e86f6642325966  ROLLBACK.sh
+c023287dd1f413b9a7eb8411d201986f699fcfe121413986a102ead28aa3ac67  BASELINE.tar.gz
+1b1b00ea2fd88fccb7b8e2929cb18ea2db88171d3ed75e7ad2cf15c34351571c  PROBE_released_ids.py
+445d9193f4670aa486b9bc9ee4707edfe5208abec2d63c58dbdd0e48b77fee7c  REPLAY_production.py
+
+==================================================================
+FOLLOW-UP 3: Sub2API 401 detect refreshes only Sub2API error accounts (base 3f589456aef82f14dce5316937e3752d75476907 + uncommitted FOLLOW-UP 2)
+Generated: 2026-10-15T11:48:27Z
+Records: .trellis/tasks/10-15-chatgpt2api-401-deactivated-delete/artifacts/followup-sub2api-probe/
+
+CHANGED
+- core/sub2api_401_service.py: _PROBE_STATUSES={'error'}; new _probe_ids(accounts): error-status IDs, IDs without status (older Sub2API), same-email siblings of probed IDs, and the email group of retry rows whose old ID is still listed; _detect_locked refreshes only those (no request when empty), non-probed IDs classified healthy 'Sub2API 状态正常，未刷新'; probed_count persisted and returned as counts.probed
+- webui/templates/sub2api_401.html: header copy, '本次刷新' metric (#probedCount), notice on refresh scope
+- tests: 4 service tests (error-only, no-error-no-request, same-email sibling, in-flight candidate) + 1 template test; spec: 2 error-matrix rows
+- DIFF_FILE.patch is relative to this follow-up's BASELINE.tar.gz (FOLLOW-UP 2 state), not HEAD
+
+BASELINE HASHES
+33fc9ec6cd8ef37d9cb9b9245e2940aaf0457db41ee18eef7398e9a3b132a906  core/sub2api_401_service.py
+afbe517dfaede4f48aeed56333669b9ab8c354feb9e40c44d923d3d3558595d5  tests/test_sub2api_401_service.py
+19a602be9fb32688935753fd3bb1561f52b0052baf3e0ee71d5b2624aab1b093  webui/templates/sub2api_401.html
+4979dacd4ad953b9029f94ab690ff0ffcd32fc55fc0b279e719cc3c63254abdc  tests/test_sub2api_401_templates.py
+f0f9a58c9586ddf9a6fa51fe3d63e19127df1babe3ce3477da7f2a174f751fc9  .trellis/spec/backend/sub2api-credential-rotation.md
+MODIFIED HASHES
+447f4429f8bfa464a4d2ffe5878e68c66b81ff34212d55b8d974097039195c6b  core/sub2api_401_service.py
+93c9b277f7f8dd2f03116d05fc585127e7179bcc44d766e2c62c7ce4a1fcfd0b  tests/test_sub2api_401_service.py
+9520b87efdfc1da544ab07331e2f50a0432201c5ddf934854867d3571a653099  webui/templates/sub2api_401.html
+63316ff7f66884bc3010d895fa753553acedd41d5ab06a127a8f90465d65d498  tests/test_sub2api_401_templates.py
+5ad859a73a9bb33ce1369c6b171ca7c9720edb9fb9e37935378479f1a956891e  .trellis/spec/backend/sub2api-credential-rotation.md
+ROLLBACK HASHES
+33fc9ec6cd8ef37d9cb9b9245e2940aaf0457db41ee18eef7398e9a3b132a906  core/sub2api_401_service.py
+afbe517dfaede4f48aeed56333669b9ab8c354feb9e40c44d923d3d3558595d5  tests/test_sub2api_401_service.py
+19a602be9fb32688935753fd3bb1561f52b0052baf3e0ee71d5b2624aab1b093  webui/templates/sub2api_401.html
+4979dacd4ad953b9029f94ab690ff0ffcd32fc55fc0b279e719cc3c63254abdc  tests/test_sub2api_401_templates.py
+f0f9a58c9586ddf9a6fa51fe3d63e19127df1babe3ce3477da7f2a174f751fc9  .trellis/spec/backend/sub2api-credential-rotation.md
+restored-hashes-equal-original
+
+SAME-INPUT PROBE: .venv/bin/python -I .trellis/tasks/10-15-chatgpt2api-401-deactivated-delete/artifacts/followup-sub2api-probe/PROBE_refresh_scope.py <tree>
+BASELINE exit=0
+{"health_counts": {"healthy": 3, "timeout": 0, "unauthorized": 2, "unknown": 0}, "items": [{"account_id": "42", "health": "unauthorized", "replacement_account_id": "", "retryable": true, "state": "pending"}, {"account_id": "50", "health": "unauthorized", "replacement_account_id": "51", "retryable": false, "state": "cleanup_ready"}], "probed": null, "refresh_calls": [["40", "41", "42", "50", "51"]]}
+MODIFIED exit=0
+{"health_counts": {"healthy": 3, "timeout": 0, "unauthorized": 2, "unknown": 0}, "items": [{"account_id": "42", "health": "unauthorized", "replacement_account_id": "", "retryable": true, "state": "pending"}, {"account_id": "50", "health": "unauthorized", "replacement_account_id": "51", "retryable": false, "state": "cleanup_ready"}], "probed": 3, "refresh_calls": [["42", "50", "51"]]}
+ROLLBACK apply exit=0: rollback complete: restored 5 paths from /Users/jiangdk/code/personal/turb-gpt-free-register/.trellis/tasks/10-15-chatgpt2api-401-deactivated-delete/artifacts/followup-sub2api-probe/BASELINE.tar.gz
+ROLLBACK probe exit=0
+{"health_counts": {"healthy": 3, "timeout": 0, "unauthorized": 2, "unknown": 0}, "items": [{"account_id": "42", "health": "unauthorized", "replacement_account_id": "", "retryable": true, "state": "pending"}, {"account_id": "50", "health": "unauthorized", "replacement_account_id": "51", "retryable": false, "state": "cleanup_ready"}], "probed": null, "refresh_calls": [["40", "41", "42", "50", "51"]]}
+restored probe output == baseline: yes; reapply patch exit=0, reapplied hashes == modified: yes, reapplied probe == modified: yes
+
+PRODUCTION REPLAY (sanitized real list + audit; refresh simulated from status=error)
+== baseline (follow-up 2 state, restored copy)
+listed: 41 refreshed: 41 [['2', '3', '4', '5', '7', '9', '10', '13', '14', '20', '21', '23', '24', '26', '27', '28', '29', '40', '41', '42', '43', '44', '45', '46', '47', '48', '49', '50', '51', '52', '53', '54', '55', '65', '68', '69', '70', '71', '72', '73', '74']]
+states: {'cleaned': 15, 'pending': 6, 'failed': 1}
+pending retryable: ['42', '43', '44', '46', '52', '55']
+== modified
+listed: 41 refreshed: 7 [['42', '43', '44', '46', '52', '55', '65']]
+states: {'cleaned': 15, 'pending': 6, 'failed': 1}
+pending retryable: ['42', '43', '44', '46', '52', '55']
+Note: real detect at 2026-10-15T11:32Z counted 7 unauthorized while only 6 accounts have status=error; #65 is status=active yet refreshed unauthorized. It stays probed via its retry row; an account with a dead RT and status=active outside any retry row is not refreshed until Sub2API marks it error.
+
+TESTS new-on-baseline exit=1:
+FAIL: test_detect_also_refreshes_same_email_siblings_of_error_account (tests.test_sub2api_401_service.Sub2Api401ServiceTests.test_detect_also_refreshes_same_email_siblings_of_error_account)
+FAIL: test_detect_refreshes_only_error_status_accounts (tests.test_sub2api_401_service.Sub2Api401ServiceTests.test_detect_refreshes_only_error_status_accounts)
+FAIL: test_detect_without_error_accounts_sends_no_refresh (tests.test_sub2api_401_service.Sub2Api401ServiceTests.test_detect_without_error_accounts_sends_no_refresh)
+Ran 45 tests in 0.036s
+FAILED (failures=3)
+TESTS focused focused exit=0: Ran 95 tests in 0.456s OK
+FULL full exit=1:
+ERROR: test_ensure_authorize_context_matches_20260914_capture_shape (test_chatgpt_auth_context.ChatgptAuthContextTests.test_ensure_authorize_context_matches_20260914_capture_shape)
+FAIL: test_restore_context_requires_exact_email_match (test_remail_client.RemailClientTests.test_restore_context_requires_exact_email_match)
+Ran 552 tests in 7.307s
+FAILED (failures=1, errors=1)
+(same 2 pre-existing failures as PRISTINE_UNRELATED_FAILURES.log)
+STATIC: py_compile PASS; git diff --check PASS; node --check sub2api_401.html script exit 0
+NOT DONE: not committed, not deployed.
+ARTIFACT HASHES
+1743704510323dd5253729cf52b0728320363500e36ca4793b135256c8dbd2c9  MODIFIED_FILE.tar.gz
+b0e36a04e580744d277dee11a3b9955beaf4059baea6584a506c29e97fff025b  DIFF_FILE.patch
+4ff4bbfb357a8da83ac3f4cb09e78684c1db1203cd78df59bf5910faec047275  ROLLBACK.sh
+1b1ed7aa80abd0635df76ae80765911663ea956a520c02c6ba7cd39e9f43a3ff  BASELINE.tar.gz
+f8b2744af576a5de7571f7b7b1c559a76425e62875d18cd7bf079810b6c1bda4  PROBE_refresh_scope.py
+f66d2fdb33ad9fa154c62901423513b7f2080d8b6c1bc73d5765d4262bdb6b75  REPLAY_production.py

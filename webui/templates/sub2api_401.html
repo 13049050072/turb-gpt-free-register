@@ -21,7 +21,7 @@
 </head>
 <body>
 <div class="wrap">
-  <div class="top"><div><h1>Sub2API 401 凭证轮换</h1><div class="muted">批量刷新 OpenAI OAuth 账号 → 补跑 unauthorized → 验证同邮箱新 account_id → 自动清理锁定旧 ID（历史重复项或失败时可手动重试）。</div></div><a href="/">← 返回控制台</a></div>
+  <div class="top"><div><h1>Sub2API 401 凭证轮换</h1><div class="muted">只刷新 Sub2API 标为错误的 OpenAI OAuth 账号 → 补跑 unauthorized → 验证同邮箱新 account_id → 自动清理锁定旧 ID（历史重复项或失败时可手动重试）。</div></div><a href="/">← 返回控制台</a></div>
   <section class="card" id="schedulerCard">
     <div class="scheduler-grid">
       <label class="switch"><input type="checkbox" id="autoEnabled"> 开启 Sub2API 自动巡检</label>
@@ -46,6 +46,7 @@
       <span class="spacer"></span><span class="muted" id="checkedAt">正在读取审计状态…</span>
     </div>
     <div class="counts">
+      <div class="metric"><span class="muted">本次刷新</span><b id="probedCount">0</b></div>
       <div class="metric"><span class="muted">401 / unauthorized</span><b id="unauthorizedCount">0</b></div>
       <div class="metric"><span class="muted">刷新超时</span><b id="timeoutCount">0</b></div>
       <div class="metric"><span class="muted">已验证恢复</span><b id="verifiedCount">0</b></div>
@@ -53,7 +54,7 @@
       <div class="metric"><span class="muted">状态正常</span><b id="healthyCount">0</b></div>
       <div class="metric"><span class="muted">状态未知</span><b id="unknownCount">0</b></div>
     </div>
-    <div class="notice">系统仅处理 platform=openai 且 type=oauth 的 Sub2API 账号。补跑验证出唯一健康替代 ID 后会自动清理锁定旧 ID；按钮仅用于历史重复项或自动清理失败重试，并且不会按邮箱批量删除。</div>
+    <div class="notice">系统仅处理 platform=openai 且 type=oauth 的 Sub2API 账号。检测只刷新 Sub2API 状态为“错误”的账号，以及选 keeper 和验证补跑所需的同邮箱账号；其余账号按 Sub2API 状态计为正常。补跑验证出唯一健康替代 ID 后会自动清理锁定旧 ID；按钮仅用于历史重复项或自动清理失败重试，并且不会按邮箱批量删除。</div>
     <div id="message"></div>
     <pre id="cleanupQueue" class="queue hidden"></pre>
   </section>
@@ -102,6 +103,7 @@
   }
   function updateCounts(data) {
     const counts = data.counts || {};
+    $('#probedCount').textContent = counts.probed || 0;
     $('#unauthorizedCount').textContent = counts.unauthorized || 0;
     $('#timeoutCount').textContent = counts.timeout || 0;
     $('#verifiedCount').textContent = counts.verified || 0;

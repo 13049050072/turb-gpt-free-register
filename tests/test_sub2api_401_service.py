@@ -57,6 +57,69 @@ class Sub2Api401ServiceTests(unittest.TestCase):
             key: result["counts"][key] for key in ("healthy", "unauthorized", "timeout", "unknown")
         })
 
+    def test_detect_refreshes_only_error_status_accounts(self):
+        rows = [
+            {"account_id": "40", "email": "a@example.com", "status": "active"},
+            {"account_id": "41", "email": "b@example.com", "status": "active"},
+            {"account_id": "42", "email": "c@example.com", "status": "error"},
+        ]
+        refreshed = []
+
+        def refresh(ids):
+            refreshed.append(list(ids))
+            return {"total": 1, "success": 0, "failed": 1, "errors": [{"account_id": "42", "error": "Token revoked (401)"}]}
+
+        result = self.service(rows=rows, refresh=refresh).detect()
+        self.assertEqual([["42"]], refreshed)
+        self.assertEqual(["42"], [item["account_id"] for item in result["items"]])
+        self.assertEqual("pending", result["items"][0]["state"])
+        self.assertEqual(1, result["counts"]["probed"])
+        self.assertEqual(2, result["counts"]["healthy"])
+        self.assertEqual(1, result["counts"]["unauthorized"])
+
+    def test_detect_without_error_accounts_sends_no_refresh(self):
+        refreshed = []
+        rows = [{"account_id": "40", "email": "a@example.com", "status": "active"}]
+        result = self.service(rows=rows, refresh=lambda ids: refreshed.append(ids) or {}).detect()
+        self.assertEqual([], refreshed)
+        self.assertEqual([], result["items"])
+        self.assertEqual(0, result["counts"]["probed"])
+
+    def test_detect_also_refreshes_same_email_siblings_of_error_account(self):
+        rows = [
+            {"account_id": "50", "email": "d@example.com", "status": "error", "created_at": "2026-10-12T00:00:00Z"},
+            {"account_id": "51", "email": "d@example.com", "status": "active", "created_at": "2026-10-14T00:00:00Z"},
+            {"account_id": "60", "email": "e@example.com", "status": "active"},
+        ]
+        refreshed = []
+
+        def refresh(ids):
+            refreshed.append(sorted(ids))
+            return {"total": len(ids), "success": 1, "failed": 1, "errors": [{"account_id": "50", "error": "401"}]}
+
+        item = self.service(rows=rows, refresh=refresh).detect()["items"][0]
+        self.assertEqual([["50", "51"]], refreshed)
+        self.assertEqual("cleanup_ready", item["state"])
+        self.assertEqual("51", item["replacement_account_id"])
+
+    def test_in_flight_retry_refreshes_new_active_candidate(self):
+        rows = [{"account_id": "old", "email": "one@example.com", "status": "error"}]
+        refreshed = []
+
+        def refresh(ids):
+            refreshed.append(sorted(ids))
+            errors = [{"account_id": "old", "error": "401"}] if "old" in ids else []
+            return {"total": len(ids), "success": len(ids) - len(errors), "failed": len(errors), "errors": errors}
+
+        service = self.service(rows=rows, refresh=refresh)
+        service.detect()
+        service.mark_retrying(["old"])
+        rows.append({"account_id": "new", "email": "one@example.com", "status": "active"})
+        item = service.detect({"one@example.com": "success"})["items"][0]
+        self.assertEqual(["new", "old"], refreshed[-1])
+        self.assertEqual("cleanup_ready", item["state"])
+        self.assertEqual("new", item["replacement_account_id"])
+
     def test_pre_retry_snapshot_persists_across_restart(self):
         rows = [{"account_id": "old", "email": "one@example.com", "account_name": "one"}]
         service = self.service(

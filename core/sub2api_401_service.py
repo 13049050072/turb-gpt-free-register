@@ -19,6 +19,8 @@ _STATES = {"pending", "retrying", "verified", "cleanup_ready", "cleaned", "faile
 _HEALTH_STATES = {"healthy", "unauthorized", "timeout", "unknown"}
 _RUNNING_LOCAL_STATES = {"retrying", "queued", "running"}
 _FAILED_LOCAL_STATES = {"failed", "stopped", "cancelled", "canceled", "error"}
+# Detection refreshes only accounts Sub2API itself marks with these statuses.
+_PROBE_STATUSES = {"error"}
 _UNAUTHORIZED_RE = re.compile(r"(?:\b401\b|unauthori[sz]ed|invalid[_ -]?grant|invalid[_ -]?token)", re.I)
 _SECRET_RE = re.compile(
     r"(?i)([\"']?\b(?:access[_ -]?token|refresh[_ -]?token|id[_ -]?token|authorization|bearer|"
@@ -137,6 +139,7 @@ class Sub2Api401Service:
         self._lock = threading.RLock()
         self._operation_lock = threading.RLock()
         self._health_counts = {kind: 0 for kind in _HEALTH_STATES}
+        self._probed_count = 0
         self._tracked = self._load_audit()
 
     @property
@@ -159,6 +162,8 @@ class Sub2Api401Service:
         raw_counts = payload.get("health_counts") if isinstance(payload, dict) else None
         if isinstance(raw_counts, dict):
             self._health_counts = {kind: _bounded_int(raw_counts.get(kind)) for kind in _HEALTH_STATES}
+        if isinstance(payload, dict):
+            self._probed_count = _bounded_int(payload.get("probed_count"))
         raw_items = payload.get("items") if isinstance(payload, dict) else None
         if not isinstance(raw_items, dict):
             return {}
@@ -178,6 +183,7 @@ class Sub2Api401Service:
             "version": 2,
             "updated_at": _now(),
             "health_counts": {kind: _bounded_int(self._health_counts.get(kind)) for kind in sorted(_HEALTH_STATES)},
+            "probed_count": _bounded_int(self._probed_count),
             "items": {account_id: self._sanitize_entry(item) for account_id, item in sorted(self._tracked.items())},
         }
         temp_path = target.with_name(f".{target.name}.{os.getpid()}.tmp")
@@ -256,6 +262,7 @@ class Sub2Api401Service:
         counts["verified"] = counts.get("verified", 0) + counts.get("cleanup_ready", 0) + counts.get("cleaned", 0)
         for kind in _HEALTH_STATES:
             counts[kind] = _bounded_int(self._health_counts.get(kind))
+        counts["probed"] = _bounded_int(self._probed_count)
         return counts
 
     def state(self) -> dict:
@@ -508,6 +515,40 @@ class Sub2Api401Service:
             if changed:
                 self._persist_locked()
 
+    def _probe_ids(self, accounts: list[dict]) -> list[str]:
+        """Pick the account IDs detection sends to batch-refresh.
+
+        Only Sub2API `error` accounts are probed. Same-email siblings join so
+        keeper selection compares refreshed health, and a retry row whose old
+        ID still exists keeps verifying its new candidates. Rows without a
+        status (older Sub2API builds) are probed as before.
+        """
+        listed: set[str] = set()
+        ids_by_email: dict[str, set[str]] = {}
+        probe: set[str] = set()
+        for raw in accounts:
+            if not isinstance(raw, dict):
+                continue
+            account_id = _account_id(raw.get("account_id") or raw.get("id"))
+            if not account_id:
+                continue
+            listed.add(account_id)
+            email = _email(raw.get("email"))
+            if email:
+                ids_by_email.setdefault(email, set()).add(account_id)
+            status = _text(raw.get("status"), 64).lower()
+            if not status or status in _PROBE_STATUSES:
+                probe.add(account_id)
+        with self._lock:
+            for old_id, item in self._tracked.items():
+                if item.get("pre_retry_account_ids") and old_id in listed:
+                    probe.add(old_id)
+                    probe.update(ids_by_email.get(_email(item.get("email")), set()))
+        for email_ids in ids_by_email.values():
+            if len(email_ids) > 1 and email_ids & probe:
+                probe.update(email_ids)
+        return _dedupe_ids(sorted(probe))
+
     def detect(self, local_status: dict[str, str] | None = None) -> dict:
         with self._operation_lock:
             return self._detect_locked(local_status)
@@ -517,14 +558,23 @@ class Sub2Api401Service:
         with self._operation_lock:
             accounts = self._list_fn()
             account_ids = _dedupe_ids([(row.get("account_id") or row.get("id")) for row in accounts if isinstance(row, dict)])
+            probe_ids = self._probe_ids(accounts)
             try:
-                refresh_payload = self._refresh_fn(account_ids)
+                refresh_payload = (
+                    self._refresh_fn(probe_ids)
+                    if probe_ids
+                    else {"total": 0, "success": 0, "failed": 0, "errors": []}
+                )
             except Exception:
                 self._persist_post_snapshot_error(accounts, "Sub2API 后置刷新失败；已保存补跑后 account_id 快照，旧账号保持不变")
                 raise
 
         by_id, by_email = self._account_maps(accounts)
-        kinds, reasons = self._refresh_maps(account_ids, refresh_payload)
+        kinds, reasons = self._refresh_maps(probe_ids, refresh_payload)
+        for account_id in account_ids:
+            if account_id not in kinds:
+                kinds[account_id] = "healthy"
+                reasons[account_id] = "Sub2API 状态正常，未刷新"
         checked_at = _now()
         health_counts = {kind: 0 for kind in _HEALTH_STATES}
         for account_id in account_ids:
@@ -614,6 +664,7 @@ class Sub2Api401Service:
 
             self._tracked = next_tracked
             self._health_counts = health_counts
+            self._probed_count = len(probe_ids)
             self._persist_locked()
             visible = self._public_items_locked()
 

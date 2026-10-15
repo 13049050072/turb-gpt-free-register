@@ -114,6 +114,8 @@ All Sub2API-401 responses set `Cache-Control: no-store, max-age=0`, `Pragma: no-
 | Re-list confirms old ID absent and a second refresh confirms the replacement healthy | `cleaned` |
 | Re-list confirms an exact historical old ID absent, the keeper remains same-email and unique latest, and a second refresh confirms it unauthorized | `cleaned`; on the next detect the unauthorized singleton keeper becomes normal retryable `pending` |
 | Historical unauthorized old ID is absent but the keeper no longer refreshes unauthorized or is no longer unique latest | `ambiguous`; retain the exact cleanup and keeper evidence |
+| Detect lists accounts whose Sub2API `status` is set and not `error` | Do not send them to batch-refresh; classify as `healthy` with reason `Sub2API 状态正常，未刷新`. The persisted `probed_count` / `counts.probed` reports how many IDs were refreshed |
+| Detect lists an `error` account, an account without `status`, a same-email sibling of a probed account, or an ID in the email group of a retry row whose old ID still exists | Send it to batch-refresh and classify from the refresh result as before; with no such IDs, send no refresh request |
 | A retry row's locked old ID is absent on a later detect and no local Codex retry is running | Release its same-email IDs to normal per-account detection; keep the row only when it is `cleaned`, otherwise drop it. A revoked replacement becomes its own retryable `pending` row |
 | A retry row's locked old ID is absent while local Codex retry is `retrying`/`queued`/`running` | Keep the row and its same-email ID lock until the retry finishes |
 

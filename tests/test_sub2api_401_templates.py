@@ -43,6 +43,17 @@ class Sub2Api401TemplateTests(unittest.TestCase):
         self.assertIn('<option selected>3</option>', page)
         self.assertIn("workers:Number($('#workers').value || 3)", page)
 
+    def test_page_states_error_only_refresh_scope(self):
+        page = Path("webui/templates/sub2api_401.html").read_text(encoding="utf-8")
+        for text in (
+            "只刷新 Sub2API 标为错误的 OpenAI OAuth 账号",
+            '<b id="probedCount">0</b>',
+            "$('#probedCount').textContent = counts.probed || 0;",
+            "检测只刷新 Sub2API 状态为“错误”的账号",
+        ):
+            self.assertIn(text, page)
+        self.assertNotIn("批量刷新 OpenAI OAuth 账号", page)
+
     def test_page_polls_retrying_state_until_terminal(self):
         page = Path("webui/templates/sub2api_401.html").read_text(encoding="utf-8")
         for text in (

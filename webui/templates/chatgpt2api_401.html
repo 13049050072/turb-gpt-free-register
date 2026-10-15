@@ -12,7 +12,7 @@
     button,select,input{font:inherit;border:1px solid var(--line);border-radius:7px;padding:9px 13px;background:#fff;color:var(--text)}button{cursor:pointer;font-weight:650}button.primary{background:var(--primary);border-color:var(--primary);color:#fff}button.danger{border-color:#f0a39c;background:#fff7f6;color:var(--danger)}button:disabled{opacity:.48;cursor:not-allowed}
     .scheduler-grid{display:grid;grid-template-columns:minmax(200px,1fr) repeat(3,minmax(140px,auto));gap:12px;align-items:end}.scheduler-grid label{display:grid;gap:5px}.scheduler-meta{margin-top:12px;display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:10px}.scheduler-meta>div{border:1px solid var(--line);border-radius:7px;padding:9px 11px}.switch{display:flex!important;align-items:center;gap:9px;padding:9px 0}.switch input{width:18px;height:18px;padding:0}
     .counts{display:grid;grid-template-columns:repeat(auto-fit,minmax(105px,1fr));gap:9px;margin-top:14px}.metric{border:1px solid var(--line);border-radius:7px;padding:10px 12px}.metric b{display:block;font-size:20px}.notice{margin-top:12px;padding:10px 12px;border-left:3px solid #e2a73b;background:#fff8e8;color:#714b00}.notice.error{border-color:#e56b61;background:#fff3f2;color:var(--danger)}.notice.ok{border-color:#54b58a;background:#edfdf4;color:var(--ok)}
-    .table-wrap{overflow:auto;padding:0}table{width:100%;border-collapse:collapse;min-width:1220px}th,td{border-bottom:1px solid #e9edf2;padding:11px 10px;text-align:left;vertical-align:top}th{font-size:12px;color:var(--muted);background:#f8fafc}tbody tr:last-child td{border-bottom:0}.id{max-width:260px;word-break:break-all;font:12px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace}
+    .table-panel{padding:0;overflow:hidden}.filterbar{display:flex;flex-wrap:wrap;align-items:center;gap:10px;padding:12px 14px;border-bottom:1px solid #e9edf2}.filterbar select{padding:7px 11px}.table-wrap{overflow:auto}table{width:100%;border-collapse:collapse;min-width:1220px}th,td{border-bottom:1px solid #e9edf2;padding:11px 10px;text-align:left;vertical-align:top}th{font-size:12px;color:var(--muted);background:#f8fafc}tbody tr:last-child td{border-bottom:0}.id{max-width:260px;word-break:break-all;font:12px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace}
     .badge{display:inline-block;padding:3px 8px;border-radius:999px;font-size:12px;font-weight:700}.pending{background:#fff5e5;color:var(--warn)}.queued,.refreshing{background:#edf4ff;color:#175cd3}.ready{background:#eef4ff;color:#3538cd}.replaced,.deleted{background:#ecfdf3;color:var(--ok)}.failed,.ambiguous,.conflict{background:#fff1f0;color:var(--danger)}
     .preview{margin:12px 0 0;white-space:pre-wrap;word-break:break-all;background:#151b26;color:#e8edf5;border-radius:7px;padding:12px;max-height:260px;overflow:auto}.hidden{display:none}
     @media(max-width:900px){.top{flex-direction:column}.counts{grid-template-columns:repeat(2,minmax(0,1fr))}.wrap{padding:20px 12px 40px}.scheduler-grid,.scheduler-meta{grid-template-columns:1fr}}
@@ -61,11 +61,26 @@
     <div id="message"></div>
     <pre id="preview" class="preview hidden"></pre>
   </section>
-  <section class="panel table-wrap">
+  <section class="panel table-panel">
+    <div class="filterbar">
+      <label for="stateFilter" class="muted">状态筛选</label>
+      <select id="stateFilter">
+        <option value="all">全部</option>
+        <option value="todo">待查活 / 重试</option>
+        <option value="running">队列 / 查活中</option>
+        <option value="ready">历史待写回</option>
+        <option value="replaced">已验证替换</option>
+        <option value="deleted">已删除废号</option>
+        <option value="problem">冲突 / 映射不明确</option>
+      </select>
+      <span class="muted" id="filterSummary"></span>
+    </div>
+    <div class="table-wrap">
     <table>
       <thead><tr><th><input type="checkbox" id="selectAll" aria-label="全选可操作账号"></th><th>远端稳定 ID</th><th>邮箱</th><th>本地 ID</th><th>状态</th><th>受控原因</th><th>旧 AT 摘要</th><th>新 AT 摘要</th><th>更新时间</th></tr></thead>
       <tbody id="rows"><tr><td colspan="9" class="muted">正在读取最近一次审计状态…</td></tr></tbody>
     </table>
+    </div>
   </section>
 </div>
 <script>
@@ -78,6 +93,11 @@
   let pollDelay = 0;
   let stateLoading = false;
   const esc = value => String(value ?? '').replace(/[&<>"']/g, ch => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch]));
+  const filterStates = {all:null,todo:['pending','failed'],running:['queued','refreshing'],ready:['ready'],replaced:['replaced'],deleted:['deleted'],problem:['conflict','ambiguous']};
+  const filterStorageKey = 'chatgpt2api401.stateFilter';
+  let stateFilter = 'all';
+  try { const saved = localStorage.getItem(filterStorageKey); if (saved && saved in filterStates) stateFilter = saved; } catch (_) {}
+  const inFilter = (item, key=stateFilter) => !filterStates[key] || filterStates[key].includes(item.state);
   const labels = {pending:'待查活',queued:'队列等待',refreshing:'查活中',ready:'历史待写回',replaced:'已替换',deleted:'已删除废号',failed:'查活失败',ambiguous:'映射不明确',conflict:'快照冲突'};
   async function api(path, options={}) {
     const response = await fetch(path, {...options, headers:{'Content-Type':'application/json', ...(options.headers || {})}});
@@ -117,22 +137,34 @@
     $('#checkedAt').textContent = data.checked_at ? `检测时间 ${new Date(data.checked_at).toLocaleString()} · 后台并发 ${progress.workers || 5}` : `尚未执行远端检测 · 后台并发 ${progress.workers || 5}`;
   }
   function actionable(item) { return item.retryable || item.replaceable; }
+  function renderFilter(visible) {
+    const select = $('#stateFilter');
+    select.value = stateFilter;
+    for (const option of select.options) {
+      const base = option.dataset.label || (option.dataset.label = option.textContent);
+      option.textContent = `${base}（${items.filter(item => inFilter(item, option.value)).length}）`;
+    }
+    $('#filterSummary').textContent = `显示 ${visible.length} / ${items.length} 条`;
+  }
   function render() {
-    for (const remoteId of [...selected]) if (!items.some(item => item.remote_id === remoteId && actionable(item))) selected.delete(remoteId);
-    $('#rows').innerHTML = items.map(item => `<tr>
+    // Selection follows the filter so hidden rows are never submitted.
+    const visible = items.filter(item => inFilter(item));
+    for (const remoteId of [...selected]) if (!visible.some(item => item.remote_id === remoteId && actionable(item))) selected.delete(remoteId);
+    renderFilter(visible);
+    $('#rows').innerHTML = visible.map(item => `<tr>
       <td><input type="checkbox" data-remote-id="${esc(item.remote_id)}" ${actionable(item) ? '' : 'disabled'} ${selected.has(item.remote_id) ? 'checked' : ''}></td>
       <td class="id">${esc(item.remote_id)}</td><td>${esc(item.email || '—')}</td><td>${esc(item.local_account_id || '—')}</td>
       <td><span class="badge ${esc(item.state)}">${esc(labels[item.state] || item.state)}</span></td><td>${esc(item.reason)}</td>
       <td class="id">${esc(item.old_at_fingerprint || '—')}</td><td class="id">${esc(item.new_at_fingerprint || '—')}</td>
       <td>${esc(item.replaced_at || item.deleted_at || item.refresh_completed_at || item.refresh_started_at || item.queued_at || item.detected_at || '—')}</td>
-    </tr>`).join('') || '<tr><td colspan="9" class="muted">未发现可处理的 ChatGPT2API 失效账号。</td></tr>';
+    </tr>`).join('') || `<tr><td colspan="9" class="muted">${items.length ? '当前筛选下没有记录。' : '未发现可处理的 ChatGPT2API 失效账号。'}</td></tr>`;
     const refreshIds = [...selected].filter(remoteId => items.some(item => item.remote_id === remoteId && item.retryable));
     const replaceIds = [...selected].filter(remoteId => items.some(item => item.remote_id === remoteId && item.replaceable));
     $('#refreshBtn').disabled = refreshIds.length === 0;
     $('#refreshBtn').textContent = `查活并写回（已选 ${refreshIds.length}）`;
     $('#replaceBtn').disabled = replaceIds.length === 0;
     $('#replaceBtn').textContent = `确认原位替换（已选 ${replaceIds.length}）`;
-    const available = items.filter(actionable);
+    const available = visible.filter(actionable);
     const queueRunning = items.some(item => item.state === 'queued' || item.state === 'refreshing');
     $('#detectBtn').disabled = queueRunning;
     $('#selectAll').checked = available.length > 0 && available.every(item => selected.has(item.remote_id));
@@ -236,7 +268,12 @@
   });
   $('#selectAll').addEventListener('change', event => {
     selected.clear();
-    if (event.target.checked) for (const item of items) if (actionable(item)) selected.add(item.remote_id);
+    if (event.target.checked) for (const item of items) if (actionable(item) && inFilter(item)) selected.add(item.remote_id);
+    render();
+  });
+  $('#stateFilter').addEventListener('change', event => {
+    stateFilter = event.target.value in filterStates ? event.target.value : 'all';
+    try { localStorage.setItem(filterStorageKey, stateFilter); } catch (_) {}
     render();
   });
   loadState();

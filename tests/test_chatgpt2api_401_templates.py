@@ -32,6 +32,22 @@ class ChatGPT2API401TemplateTests(unittest.TestCase):
         self.assertNotIn("slice(0, 50)", page)
         self.assertNotIn("完成前请保持页面打开", page)
 
+    def test_page_filters_rows_by_state_and_scopes_selection(self):
+        page = Path("webui/templates/chatgpt2api_401.html").read_text(encoding="utf-8")
+        for text in (
+            '<select id="stateFilter">',
+            '<option value="deleted">已删除废号</option>',
+            "deleted:['deleted']",
+            "todo:['pending','failed']",
+            "problem:['conflict','ambiguous']",
+            "const visible = items.filter(item => inFilter(item));",
+            "if (actionable(item) && inFilter(item)) selected.add(item.remote_id);",
+            "const available = visible.filter(actionable);",
+            "当前筛选下没有记录。",
+            "localStorage.setItem(filterStorageKey, stateFilter)",
+        ):
+            self.assertIn(text, page)
+
     def test_page_has_independent_scheduler_controls(self):
         page = Path("webui/templates/chatgpt2api_401.html").read_text(encoding="utf-8")
         for text in (

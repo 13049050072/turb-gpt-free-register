@@ -1924,6 +1924,26 @@
     }
     .config-subtabs-v2 button:hover { background: #f5f7fa; color: #303133; }
     .config-subtabs-v2 button.active { background: #ecf5ff; color: #377DFF; font-weight: 600; }
+    .config-email-source-v2 {
+      margin-top: 14px; padding: 14px 16px; border: 1px solid #dce8ff;
+      border-radius: 10px; background: #f8fbff;
+      display: grid; grid-template-columns: minmax(0, 1fr) minmax(210px, 280px) minmax(240px, 1.2fr);
+      gap: 14px; align-items: end;
+    }
+    .config-email-source-v2-copy { min-width: 0; align-self: center; }
+    .config-email-source-v2-copy strong { display: block; color: #303133; font-size: 14px; }
+    .config-email-source-v2-copy p { margin: 5px 0 0; color: #606266; font-size: 12px; line-height: 1.5; }
+    .config-email-source-v2-copy .config-email-source-current { margin-top: 7px; color: #377DFF; font-weight: 600; overflow-wrap: anywhere; }
+    .config-email-source-v2 .fld { margin: 0; min-width: 0; }
+    .config-email-source-v2 input, .config-email-source-v2 select { width: 100%; box-sizing: border-box; }
+    @media (max-width: 900px) {
+      .config-email-source-v2 { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      .config-email-source-v2-copy { grid-column: 1 / -1; }
+    }
+    @media (max-width: 560px) {
+      .config-email-source-v2 { grid-template-columns: minmax(0, 1fr); }
+      .config-email-source-v2-copy { grid-column: auto; }
+    }
     .config-section-v2-subhelp {
       margin: 12px 0 0; font-size: 13px; color: #909399; line-height: 1.5;
     }
@@ -6078,6 +6098,56 @@ function emailConfigSectionForKey(key) {
   return ['其他邮箱配置', ''];
 }
 
+const EMAIL_SOURCE_CHOICES_V2 = [
+  ['outlook', 'Outlook 邮箱池'],
+  ['generic_api', '通用 API 邮箱池'],
+  ['imap', '通用 IMAP'],
+  ['cloudflare_domain', 'Cloudflare 域名邮箱'],
+  ['cloudflare', 'Cloudflare 临时邮箱'],
+  ['gptmail', 'GPTMail'],
+  ['mailnest', 'MailNest'],
+  ['cloudmail', 'CloudMail'],
+  ['remail', 'Remail'],
+  ['xigua', '西瓜'],
+  ['mailcode', '域名邮箱 MailCode'],
+];
+
+function currentEmailSourceValueV2() {
+  const field = CONFIG.find(item => item.key === 'EMAIL_SOURCE');
+  const value = Object.prototype.hasOwnProperty.call(CONFIG_PENDING_UPDATES, 'EMAIL_SOURCE')
+    ? CONFIG_PENDING_UPDATES.EMAIL_SOURCE
+    : field?.value;
+  return String(value == null ? '' : value);
+}
+
+function renderEmailSourceSelectorV2() {
+  const value = currentEmailSourceValueV2();
+  const normalized = value.trim().replace(/[;|]/g, ',').split(',').map(item => item.trim()).filter(Boolean);
+  const singleSource = normalized.length === 1 && EMAIL_SOURCE_CHOICES_V2.some(([source]) => source === normalized[0])
+    ? normalized[0]
+    : '__custom__';
+  return `
+    <div class="config-email-source-v2">
+      <div class="config-email-source-v2-copy">
+        <strong>注册实际使用的邮箱来源</strong>
+        <p>这里决定注册时从哪里取邮箱。下方服务商标签只切换参数表单，不会自动切换注册来源；多个来源可用逗号分隔并按顺序兜底。</p>
+        <p class="config-email-source-current">当前配置：<span id="emailSourceCurrentV2">${esc(value || '未设置')}</span></p>
+      </div>
+      <label class="fld">快速选择单一来源
+        <span class="hint">选择后会替换下方来源值，点击下方的“保存”按钮生效。</span>
+        <select data-email-source-preset-v2>
+          <option value="__custom__"${singleSource === '__custom__' ? ' selected' : ''}>自定义 / 多来源</option>
+          ${EMAIL_SOURCE_CHOICES_V2.map(([source, label]) => `<option value="${attrEsc(source)}"${singleSource === source ? ' selected' : ''}>${esc(label)}</option>`).join('')}
+        </select>
+      </label>
+      <label class="fld">邮箱来源（EMAIL_SOURCE）
+        <span class="hint">支持单个来源或逗号分隔的多个来源，按顺序兜底。</span>
+        <input type="text" id="emailSourceValueV2" data-key="EMAIL_SOURCE" value="${attrEsc(value)}" placeholder="例如 cloudflare_domain" autocomplete="off" spellcheck="false">
+      </label>
+    </div>
+  `;
+}
+
 function smsConfigSectionForKey(key) {
   if (['SMS_PROVIDER','SMS_COUNTRY','SMS_SERVICE','SMS_MAX_PRICE','SMS_MAX_RETRIES','SMS_CODE_WAIT'].includes(key)) {
     return ['通用接码', '接码通道选择、国家/服务代码、价格、等待和重试参数；SMSBower 的 OpenAI 服务代码为 dr，openai/chatgpt 会自动转换'];
@@ -6504,7 +6574,8 @@ function renderCodexFieldV2(f) {
 function renderSectionedConfigSectionV2(name, fields, sectionForKey, preferred, activeRef, dataAttr) {
   const slug = configGroupSlug(name);
   const bySection = {};
-  for (const f of fields) {
+  const sectionFields = name === '邮箱 / OTP' ? fields.filter(f => f.key !== 'EMAIL_SOURCE') : fields;
+  for (const f of sectionFields) {
     const [section, help] = sectionForKey(f.key || '');
     if (!bySection[section]) bySection[section] = { help, fields: [] };
     bySection[section].fields.push(f);
@@ -6533,6 +6604,7 @@ function renderSectionedConfigSectionV2(name, fields, sectionForKey, preferred, 
   return `
     <section class="config-section-v2" id="${esc(slug)}" data-config-section="${esc(name)}">
       ${renderConfigSectionHead(name, '')}
+      ${name === '邮箱 / OTP' ? renderEmailSourceSelectorV2() : ''}
       <div class="config-subtabs-v2">
         ${sections.map(section => `
           <button type="button" data-${dataAttr}="${esc(section)}" class="${section === active ? 'active' : ''}">
@@ -6845,6 +6917,29 @@ function bindConfigLayoutV2() {
         e.stopPropagation();
         setCodexOauthDriverValue(oauthItem.dataset.codexOauthValue);
         return;
+      }
+    });
+    layout.addEventListener('change', (e) => {
+      const preset = e.target.closest('[data-email-source-preset-v2]');
+      if (!preset || preset.value === '__custom__') return;
+      CONFIG_PENDING_UPDATES.EMAIL_SOURCE = preset.value;
+      const input = document.getElementById('emailSourceValueV2');
+      if (input) input.value = preset.value;
+      const current = document.getElementById('emailSourceCurrentV2');
+      if (current) current.textContent = preset.value;
+    });
+    layout.addEventListener('input', (e) => {
+      const input = e.target.closest('#emailSourceValueV2');
+      if (!input) return;
+      CONFIG_PENDING_UPDATES.EMAIL_SOURCE = input.value;
+      const current = document.getElementById('emailSourceCurrentV2');
+      if (current) current.textContent = input.value || '未设置';
+      const preset = layout.querySelector('[data-email-source-preset-v2]');
+      if (preset) {
+        const normalized = input.value.trim().replace(/[;|]/g, ',').split(',').map(item => item.trim()).filter(Boolean);
+        preset.value = normalized.length === 1 && EMAIL_SOURCE_CHOICES_V2.some(([source]) => source === normalized[0])
+          ? normalized[0]
+          : '__custom__';
       }
     });
   }

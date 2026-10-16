@@ -2595,12 +2595,12 @@ def create_app(auth_code: str | None = None) -> Flask:
             if not api_key:
                 return jsonify({
                     "ok": False,
-                    "error": "已选择 mailnest 邮箱来源，请填写 MailNest API Key（配置 → 邮箱 / OTP）。",
+                    "error": "当前邮箱来源配置 EMAIL_SOURCE 包含 mailnest，请填写 MailNest API Key；如果不使用 MailNest，请从 EMAIL_SOURCE 中移除 mailnest（配置 → 邮箱 / OTP）。",
                 }), 400
             if not project_code:
                 return jsonify({
                     "ok": False,
-                    "error": "已选择 mailnest 邮箱来源，请填写 MailNest 项目代码（配置 → 邮箱 / OTP）。",
+                    "error": "当前邮箱来源配置 EMAIL_SOURCE 包含 mailnest，请填写 MailNest 项目代码；如果不使用 MailNest，请从 EMAIL_SOURCE 中移除 mailnest（配置 → 邮箱 / OTP）。",
                 }), 400
         if "cloudmail" in sources:
             api_base = str(getattr(_email_cfg, "CLOUDMAIL_API_BASE", "") or "").strip()

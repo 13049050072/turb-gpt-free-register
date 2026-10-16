@@ -2,10 +2,11 @@
 """
 SQLite 持久化层（JSON/TXT 仅用于首次迁移）。
 
-运行时数据全部存储在根目录 `turb.sqlite3`；旧 JSON/TXT/Codex 文件仅用于一次性迁移。
+运行时数据默认存储在根目录 `turb.sqlite3`；设置 `TURB_DB_PATH` 后可将 SQLite 数据库放到持久化挂载目录。旧 JSON/TXT/Codex 文件仅用于一次性迁移。
 """
 import hashlib
 import json
+import os
 import sqlite3
 import threading
 import uuid
@@ -15,7 +16,6 @@ from pathlib import Path
 from typing import Any
 
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
-_DATA_DIR = _PROJECT_ROOT
 _LEGACY_DATA_DIR = _PROJECT_ROOT / "data"
 _LOG_DIR = _PROJECT_ROOT / "注册日志"
 _PLAN_CHECK_STALE_SECONDS = 120
@@ -36,7 +36,11 @@ _CODEX_AGENT_DIR = _PROJECT_ROOT / "codex_agent_accounts"
 # 仅供一次性迁移旧导出状态，运行期间不再读取该文件。
 _LEGACY_CODEX_EXPORT_STATE = _PROJECT_ROOT / "codex_导出状态.json"
 # SQLite 是运行时唯一业务数据主存储；旧 JSON/TXT 仅用于一次性迁移。
-_SQLITE_PATH = _PROJECT_ROOT / "turb.sqlite3"
+_DB_PATH_ENV = os.getenv("TURB_DB_PATH", "").strip()
+_SQLITE_PATH = Path(_DB_PATH_ENV).expanduser() if _DB_PATH_ENV else _PROJECT_ROOT / "turb.sqlite3"
+if not _SQLITE_PATH.is_absolute():
+    _SQLITE_PATH = _PROJECT_ROOT / _SQLITE_PATH
+_DATA_DIR = _SQLITE_PATH.parent
 _SQLITE_LOCK = threading.RLock()
 _SQLITE_READY = False
 _TABLES = {

@@ -21,7 +21,7 @@ from urllib.parse import urlparse
 from flask import Flask, Response, jsonify, make_response, render_template, request
 import pyotp
 
-from core import codex_retry_service, db, plan_check_service, extract_link_service, codex_agent_service, live_check_service
+from core import account_inspection_service, codex_retry_service, db, plan_check_service, extract_link_service, codex_agent_service, live_check_service
 from webui.auth import init_auth, register_auth_routes
 from core import registration_service as svc
 from webui import config_editor
@@ -325,27 +325,30 @@ def create_app(auth_code: str | None = None) -> Flask:
 
     init_auth(app, auth_code=auth_code)
     register_auth_routes(app)
-    recovered_registration_jobs = db.recover_interrupted_registration_jobs()
-    if recovered_registration_jobs:
-        logger.warning("已释放 %s 个因 WebUI 重启中断的注册任务", recovered_registration_jobs)
-    recovered_plan_checks = db.recover_interrupted_plan_checks()
-    if recovered_plan_checks:
-        logger.warning("已恢复 %s 个因 WebUI 重启中断的套餐查询状态", recovered_plan_checks)
-    recovered_extract_links = db.recover_interrupted_extract_links()
-    if recovered_extract_links:
-        logger.warning("已恢复 %s 个因 WebUI 重启中断的提链状态", recovered_extract_links)
-    recovered_live_checks = db.recover_interrupted_live_checks()
-    if recovered_live_checks:
-        logger.warning("已恢复 %s 个因 WebUI 重启中断的查活状态", recovered_live_checks)
-    recovered_codex_agents = db.recover_interrupted_codex_agents()
-    if recovered_codex_agents:
-        logger.warning("已恢复 %s 个因 WebUI 重启中断的 Codex Agent Token 状态", recovered_codex_agents)
-    recovered_totp_setups = db.recover_interrupted_totp_setups()
-    if recovered_totp_setups:
-        logger.warning("已恢复 %s 个因 WebUI 重启中断的 2FA 状态", recovered_totp_setups)
-    recovered_email_changes = db.recover_interrupted_email_changes()
-    if recovered_email_changes:
-        logger.warning("已恢复 %s 个因 WebUI 重启中断的邮箱换绑状态", recovered_email_changes)
+    with account_inspection_service.startup_recovery_guard() as can_recover:
+        if can_recover:
+            recovered_registration_jobs = db.recover_interrupted_registration_jobs()
+            if recovered_registration_jobs:
+                logger.warning("已释放 %s 个因 WebUI 重启中断的注册任务", recovered_registration_jobs)
+            recovered_plan_checks = db.recover_interrupted_plan_checks()
+            if recovered_plan_checks:
+                logger.warning("已恢复 %s 个因 WebUI 重启中断的套餐查询状态", recovered_plan_checks)
+            recovered_extract_links = db.recover_interrupted_extract_links()
+            if recovered_extract_links:
+                logger.warning("已恢复 %s 个因 WebUI 重启中断的提链状态", recovered_extract_links)
+            db.recover_interrupted_account_inspections()
+            recovered_live_checks = db.recover_interrupted_live_checks()
+            if recovered_live_checks:
+                logger.warning("已恢复 %s 个因 WebUI 重启中断的查活状态", recovered_live_checks)
+            recovered_codex_agents = db.recover_interrupted_codex_agents()
+            if recovered_codex_agents:
+                logger.warning("已恢复 %s 个因 WebUI 重启中断的 Codex Agent Token 状态", recovered_codex_agents)
+            recovered_totp_setups = db.recover_interrupted_totp_setups()
+            if recovered_totp_setups:
+                logger.warning("已恢复 %s 个因 WebUI 重启中断的 2FA 状态", recovered_totp_setups)
+            recovered_email_changes = db.recover_interrupted_email_changes()
+            if recovered_email_changes:
+                logger.warning("已恢复 %s 个因 WebUI 重启中断的邮箱换绑状态", recovered_email_changes)
 
     # ----------------------------------------------------------
     # 页面
@@ -821,6 +824,30 @@ def create_app(auth_code: str | None = None) -> Flask:
             "skipped": skipped,
             "skipped_count": len(skipped),
         })
+
+    @app.get("/api/accounts/inspections")
+    def api_account_inspections():
+        try:
+            page = int(request.args.get("page", 1))
+            if not 1 <= page <= 1 + (2**63 - 1) // 20:
+                raise ValueError("page 超出范围")
+        except (ValueError, TypeError):
+            return jsonify({"ok": False, "error": "page 必须为正整数且不能超出范围"}), 400
+        return jsonify({"ok": True, **account_inspection_service.list_inspections(limit=20, offset=(page - 1) * 20)})
+
+    @app.post("/api/accounts/inspections")
+    def api_start_account_inspection():
+        data = request.get_json(silent=True)
+        if request.get_data() and not isinstance(data, dict):
+            return jsonify({"ok": False, "error": "请求体必须是有效的 JSON 对象"}), 400
+        try:
+            run, created = account_inspection_service.start_inspection(
+                workers=(data or {}).get("workers", account_inspection_service.DEFAULT_WORKERS),
+                archived=(data or {}).get("archived", "0"))
+        except ValueError as exc:
+            return jsonify({"ok": False, "error": str(exc)}), 400
+        return jsonify({"ok": created, "task": run,
+                        "error": "" if created else "有未完成的巡检任务，请等待完成"}), 202 if created else 409
 
     @app.post("/api/accounts/check-live-bulk")
     def api_accounts_check_live_bulk():

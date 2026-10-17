@@ -106,9 +106,10 @@ def main() -> None:
     if args.open_browser:
         Timer(1.0, lambda: webbrowser.open(url)).start()
 
-    # debug=False：避免 reloader 双进程导致线程池/定时器重复
     try:
-        app.run(host=args.host, port=args.port, debug=False, threaded=True)
+        # 项目配置加载器会跳过 Windows 环境变量长度限制外的大字段；
+        # 禁用 Flask 的自动 dotenv 加载，避免它再次把大字段写入 os.environ。
+        app.run(host=args.host, port=args.port, debug=False, threaded=True, load_dotenv=False)
     finally:
         _release_single_instance(instance_lock)
 

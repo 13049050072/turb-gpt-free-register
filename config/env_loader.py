@@ -8,6 +8,7 @@
 """
 from __future__ import annotations
 
+import logging
 import os
 import re
 from pathlib import Path
@@ -15,6 +16,54 @@ from pathlib import Path
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 _ENV_PATH = _PROJECT_ROOT / ".env"
 _LOADED = False
+_ENV_VALUE_MAX_CHARS = 32767
+_ENV_VALUES_CACHE: dict[str, str | None] | None = None
+_ENV_VALUES_CACHE_STAT: tuple[int, int] | None = None
+_OVERSIZED_ENV_WARNED: set[str] = set()
+
+
+def _invalidate_env_values_cache() -> None:
+    global _ENV_VALUES_CACHE, _ENV_VALUES_CACHE_STAT
+    _ENV_VALUES_CACHE = None
+    _ENV_VALUES_CACHE_STAT = None
+
+
+def _dotenv_file_values() -> dict[str, str | None]:
+    """Parse and cache the project .env without copying large values to os.environ."""
+    global _ENV_VALUES_CACHE, _ENV_VALUES_CACHE_STAT
+    try:
+        stat = _ENV_PATH.stat()
+    except OSError:
+        _ENV_VALUES_CACHE = {}
+        _ENV_VALUES_CACHE_STAT = None
+        return {}
+
+    signature = (stat.st_mtime_ns, stat.st_size)
+    if _ENV_VALUES_CACHE is not None and _ENV_VALUES_CACHE_STAT == signature:
+        return _ENV_VALUES_CACHE
+
+    try:
+        from dotenv import dotenv_values
+    except ImportError:  # pragma: no cover - python-dotenv is a declared dependency
+        values = read_env_file()
+    else:
+        values = dotenv_values(dotenv_path=_ENV_PATH)
+
+    _ENV_VALUES_CACHE = {
+        str(key): None if value is None else str(value)
+        for key, value in values.items()
+        if key
+    }
+    _ENV_VALUES_CACHE_STAT = signature
+    return _ENV_VALUES_CACHE
+
+
+def _raw_env_value(key: str) -> str | None:
+    """Read a setting from the process environment, then the project .env."""
+    value = os.getenv(key)
+    if value is not None:
+        return value
+    return _dotenv_file_values().get(key)
 
 # 这些多行列表字段允许用空值显式覆盖为 []。
 # 例如 WebUI 清空代理池后会写入 PROXY_POOL="" / PROXY_POOL="[]"，不能再回退到源码默认本地代理。
@@ -58,24 +107,24 @@ def env_path() -> Path:
 def load_env(*, override: bool = False) -> Path:
     """加载项目根 .env 到进程环境。可重复调用（reload 时用 override=True）。
 
-    优先使用 python-dotenv；未安装时使用本文件内置的轻量 parser，避免配置读取强依赖。
+    超过操作系统单个环境变量长度限制的值保留在 .env 中，由 env_value 直接读取。
     """
     global _LOADED
-    try:
-        from dotenv import load_dotenv
-    except ImportError:  # pragma: no cover
-        if _ENV_PATH.exists():
-            for key, value in read_env_file().items():
-                if override or key not in os.environ:
-                    os.environ[key] = value
-        _LOADED = True
-        return _ENV_PATH
-
     if _ENV_PATH.exists():
-        load_dotenv(dotenv_path=_ENV_PATH, override=override)
-    else:
-        # 仍然允许系统环境变量生效
-        load_dotenv(override=override)
+        for key, value in _dotenv_file_values().items():
+            if value is None or (not override and key in os.environ):
+                continue
+            if len(value) > _ENV_VALUE_MAX_CHARS:
+                if override:
+                    os.environ.pop(key, None)
+                if key not in _OVERSIZED_ENV_WARNED:
+                    logging.getLogger(__name__).warning(
+                        ".env 的 %s 长度超过进程环境变量限制，将从文件读取",
+                        key,
+                    )
+                    _OVERSIZED_ENV_WARNED.add(key)
+                continue
+            os.environ[key] = value
     _LOADED = True
     return _ENV_PATH
 
@@ -87,7 +136,7 @@ def ensure_loaded() -> None:
 
 def env_str(key: str, default: str = "") -> str:
     ensure_loaded()
-    value = os.getenv(key)
+    value = _raw_env_value(key)
     if value is None or str(value).strip() == "":
         return default
     return str(value).strip()
@@ -174,6 +223,7 @@ def write_env_values(updates: dict[str, str]) -> list[str]:
     tmp = _ENV_PATH.with_suffix(".env.tmp")
     tmp.write_text(text, encoding="utf-8")
     tmp.replace(_ENV_PATH)
+    _invalidate_env_values_cache()
 
     # 让当前进程立刻看到新值
     load_env(override=True)
@@ -214,7 +264,7 @@ def _coerce_env_value(raw: str, default, vtype: str | None = None):
 
 def env_value(key: str, default=None, vtype: str | None = None):
     ensure_loaded()
-    raw = os.getenv(key)
+    raw = _raw_env_value(key)
     # `.env.example` 和 WebUI 里常见 `KEY=` / `KEY=""` 这种空配置。
     # 空值表示“未配置，使用 config/*.py 里的默认值”，否则 bool 默认 True
     # 会被空字符串误覆盖成 False，str/list 默认值也会被误清空。
@@ -257,7 +307,7 @@ def apply_env_overrides(namespace: dict, schema: dict[str, str] | None = None) -
     ensure_loaded()
     keys = schema.keys() if schema else [k for k in namespace if k.isupper()]
     for key in keys:
-        if os.getenv(key) is None:
+        if _raw_env_value(key) is None:
             continue
         default = namespace.get(key)
         vtype = schema.get(key) if schema else None

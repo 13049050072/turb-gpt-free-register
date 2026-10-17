@@ -591,6 +591,8 @@
         <div class="accounts-actionbar">
           <div class="btn-group">
             <span class="btn-group-title">套餐/提链</span>
+            <button type="button" class="btn" id="btnStartInspection" onclick="startAccountInspection()" title="按当前归档筛选巡检账号：本地解析 AT，失效后自动查活及查套餐">一键巡检</button>
+            <button type="button" class="btn" onclick="openInspectionHistory()">巡检历史</button>
             <button class="btn primary" id="btnCheckSelectedLive" data-live-check-selected="1" title="重新登录选中账号；成功且未封号则标记正常，并刷新最新 AT/accessToken">查活</button>
             <button class="btn primary" id="btnCheckSelectedPlans" disabled title="查询选中账号当前套餐；free 账号会检查 Plus 试用资格">查套餐</button>
             <button class="btn good" id="btnExtractSelectedLinks" disabled title="给选中的 free(可Plus试用) 账号批量提链，类型按配置 PIX/UPI/KAKAO_PAY/IDEAL">提链</button>
@@ -4034,5 +4036,6 @@ setInterval(loadSummary, 30000);
 setInterval(() => { if (!$('#tab-accounts').classList.contains('hidden')) pollAccountPlanStatuses(); }, 10000);
 </script>
 {% include 'promo_details.html' %}
+{% include 'account_inspections.html' %}
 </body>
 </html>

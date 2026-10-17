@@ -356,7 +356,7 @@ EDITABLE_FIELDS = [
     },
     {
         "key": "EMAIL_SOURCE", "file": "email.py", "type": "str", "group": "邮箱 / OTP",
-        "label": "邮箱来源", "help": "可填单个或多个，逗号分隔并按顺序兜底：outlook,generic_api,imap,cloudflare_domain,cloudflare,gptmail,mailnest,cloudmail,remail,xigua",
+        "label": "邮箱来源", "help": "可填单个或多个，逗号分隔并按顺序兜底：outlook,generic_api,imap,cloudflare_domain,cloudflare,gptmail,mailnest,cloudmail,remail,xigua,mailcode",
     },
     {
         "key": "IMAP_MAILBOX", "file": "email.py", "type": "str", "group": "邮箱 / OTP",
@@ -476,6 +476,24 @@ EDITABLE_FIELDS = [
         "label": "CloudMail随机名前缀长度", "help": "生成邮箱 local-part 的长度，建议 10-16",
     },
     {
+        "key": "MAILCODE_API_KEY", "file": "email.py", "type": "str", "group": "邮箱 / OTP",
+        "label": "MailCode API Key", "help": "官网 API 密钥；服务地址固定使用官网，密钥保存在 .env",
+        "external_url": "https://mailcode.bzb.qzz.io", "external_label": "打开官网",
+        "storage": "env", "secret": True,
+    },
+    {
+        "key": "MAILCODE_PRODUCT_ID", "file": "email.py", "type": "str", "group": "邮箱 / OTP",
+        "label": "MailCode 商品 ID", "help": "MailCode 商品列表返回的 id",
+    },
+    {
+        "key": "MAILCODE_REQUEST_TIMEOUT", "file": "email.py", "type": "int", "group": "邮箱 / OTP",
+        "label": "MailCode 请求超时(秒)", "help": "单次 HTTP 请求超时",
+    },
+    {
+        "key": "MAILCODE_CHANNEL_WAIT_SECONDS", "file": "email.py", "type": "int", "group": "邮箱 / OTP",
+        "label": "MailCode 通道准备超时(秒)", "help": "购买后等待取码通道 READY 的最长时间",
+    },
+    {
         "key": "REMAIL_API_BASE", "file": "email.py", "type": "str", "group": "邮箱 / OTP",
         "label": "Remail API 地址", "help": "默认 https://remail.aishop6.com；也可填写文档地址 https://remail.aishop6.com/docs",
         "external_url": "https://remail.aishop6.com/register?aff=AFFLGYQMTYIXH",
@@ -554,6 +572,10 @@ EDITABLE_FIELDS = [
     {
         "key": "BROWSER_DATA_SAVER_MODE", "file": "browser.py", "type": "bool", "group": "浏览器画像",
         "label": "本地浏览器省流量模式", "help": "仅 Roxy/Cloak 本地浏览器拦截图片和媒体等可选资源；Browser Use/Skyvern 云端浏览器不启用；默认关闭",
+    },
+    {
+        "key": "BROWSER_DATA_SAVER_BLOCKED_PROXY_HOSTS", "file": "browser.py", "type": "list_str_multiline", "group": "浏览器画像",
+        "label": "省流量代理域名屏蔽", "help": "仅本地浏览器代理中继生效；每行一个域名，默认 dl.google.com、gvt1.com",
     },
     {
         "key": "BROWSER_DATA_SAVER_BLOCKED_RESOURCE_TYPES", "file": "browser.py", "type": "list_str_multiline", "group": "浏览器画像",

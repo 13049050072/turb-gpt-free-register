@@ -342,6 +342,15 @@ def _check_live_in_current_session(
     from core.chatgpt_auth import get_csrf_token, signin_openai
     from core.openai_auth import follow_authorize
 
+    from core.live_check_service import complete_authenticated_live_check
+    # A real account is checked before touching the existing session.  The
+    # direct helper is also used by older callers/tests that provide the
+    # authenticated session as the identity fixture but do not create a local
+    # account row; keep that path gated by the authenticated response and the
+    # write-back result below.
+    expected_account = db.get_account(account_id)
+    if expected_account and str(expected_account.get("email") or "").strip().lower() != email.strip().lower():
+        raise RuntimeError("账号已删除或邮箱已变更，取消原会话查活")
     live_started = time.monotonic()
     _append_log(account_id, "原会话查活开始：复用 Cookie、CF 状态、出口和当前指纹")
     step_started = time.monotonic()
@@ -365,6 +374,12 @@ def _check_live_in_current_session(
     if not access_token:
         raise RuntimeError("换绑后原会话查活未获取到 access_token")
     _append_log(account_id, f"原会话查活：登录验证及 session 获取成功，cost={_cost(step_started)}")
+    # The login response is the second identity signal.  This catches a
+    # session that authenticated a different mailbox even when the local row
+    # disappeared between the pre-check and authentication.
+    authenticated_email = str((session_info or {}).get("user", {}).get("email") or "").strip().lower()
+    if authenticated_email and authenticated_email != email.strip().lower():
+        raise RuntimeError("账号已删除或邮箱已变更，取消原会话查活")
     result = {
         "ok": True,
         "status": "live",
@@ -375,8 +390,23 @@ def _check_live_in_current_session(
         "fingerprint": _safe_fingerprint_for_account(session),
         "fingerprint_text": _safe_fingerprint_text_for_account(session),
     }
-    db.update_account_liveness(account_id, result)
-    _append_log(account_id, f"原会话查活成功：最新 AT 已写回，total={_cost(live_started)}")
+    if expected_account is not None:
+        result = complete_authenticated_live_check(
+            account_id=account_id, expected_account=expected_account,
+            result=result, session=session,
+        )
+        if not result.get("ok"):
+            raise RuntimeError(result.get("error") or "原会话查活结果写入失败")
+        log_suffix = "，已自动查套餐"
+    else:
+        # Keep the historical direct-helper contract for callers which supply
+        # a valid authenticated identity but intentionally have no DB fixture.
+        # In production a missing row makes this write return False, so a
+        # deleted account still cannot be treated as a successful live check.
+        if not db.update_account_liveness(account_id, result):
+            raise RuntimeError("账号已删除或邮箱已变更，取消原会话查活")
+        log_suffix = ""
+    _append_log(account_id, f"原会话查活成功：最新 AT 已写回{log_suffix}，total={_cost(live_started)}")
     return result
 
 

@@ -404,6 +404,9 @@ class ProxyChainRelay:
                 with self._traffic_lock:
                     stats = self._destination_stats(destination_key)
                     stats["blocked_connection_count"] += 1
+                    first_block = stats["blocked_connection_count"] == 1
+                if first_block:
+                    logger.info("[代理省流量] 已在连接上游前拦截 target=%s:%s（后续重试仅累计次数）", *destination_key)
                 try:
                     client.sendall(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
                 except OSError:
@@ -533,5 +536,5 @@ def browser_blocked_proxy_hosts() -> tuple[str, ...]:
         return ()
     raw = getattr(browser_cfg, "BROWSER_DATA_SAVER_BLOCKED_PROXY_HOSTS", ("dl.google.com", "gvt1.com"))
     if isinstance(raw, str):
-        raw = raw.replace(",", "\\n").splitlines()
+        raw = raw.replace(",", "\n").splitlines()
     return tuple(str(value).strip() for value in (raw or ()) if str(value).strip())

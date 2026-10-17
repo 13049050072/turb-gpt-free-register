@@ -149,6 +149,20 @@ class ProxyChainRetryTests(unittest.TestCase):
             browser.close()
             server.close()
 
+    def test_connect_retry_metadata_is_reported_in_proxy_destination_logs(self):
+        from core.browser_traffic import merge_proxy_transport_traffic
+
+        transport = {
+            "available": True, "upload_bytes": 10, "download_bytes": 90, "total_bytes": 100,
+            "destinations": [{"host": "chatgpt.com", "port": 443, "upload_bytes": 10,
+                              "download_bytes": 90, "total_bytes": 100, "connection_count": 2,
+                              "failed_connection_count": 0, "connect_retry_count": 1,
+                              "recovered_connection_count": 1}],
+        }
+        with self.assertLogs("core.browser_traffic", level="INFO") as logs:
+            merge_proxy_transport_traffic({}, transport, label="Roxy")
+        self.assertTrue(any("retries=1 recovered=1" in line for line in logs.output))
+
     def test_roxy_cleanup_summarizes_history_without_repeating_warning(self):
         client = RoxyBrowserClient(api_base="http://127.0.0.1:50000", token="")
         relay = Mock()

@@ -58,6 +58,7 @@ IPWO 住宅代理提供覆盖195+国家和地区的住宅 IP 资源，支持多�
 - 通用 IMAP 邮箱池：每行 `邮箱----IMAP密码` 或 `邮箱:IMAP密码`，服务器、端口和 SSL 在导入界面统一配置
 - GPTMail 临时邮箱 API：运行时随机生成邮箱并自动收取验证码
 - Remail 开放 API：按项目下单短效邮箱并自动收取验证码（`remail`）
+- 域名邮箱 MailCode：幂等购买邮箱并按游标自动收码（`mailcode`）
 - 西瓜邮箱接码平台：按项目方案下单邮箱并自动收取验证码（`xigua`）
 - `EMAIL_SOURCE` 支持多个来源组合，例如：
 
@@ -114,7 +115,7 @@ EMAIL_SOURCE = "outlook,generic_api,imap"
 - HTTP 请求数、失败/未完成请求数；
 - WebSocket 帧 payload 字节（如流程使用 WebSocket）。
 
-现代/Legacy WebUI 的注册任务列表会显示总流量，完整结构保存在任务记录的 `network_traffic` 和成功账号的 `extra_json` 中。统计为浏览器侧可观测的请求/响应流量，不包含 TLS/IP/代理隧道额外开销，也不包含邮箱 API、Roxy API 或 CDP 控制通道流量。
+现代/Legacy WebUI 的注册任务列表会显示总流量，完整结构保存在任务记录的 `network_traffic` 和成功账号的 `extra_json` 中。Roxy 新建代理池环境，以及使用代理池或显式 HTTP/SOCKS5 代理的 Cloak，会通过本地代理中继统计浏览器双向传输，包含 TLS、启动阶段和后台请求；页面可见的计数另存为 `browser_observed_*`，资源明细仍为页面口径，不能与传输总量相加。无代理、复用已有 Roxy 环境或使用未支持代理协议时仍使用页面可见统计，可能漏掉其他 target。传输统计不包含 TCP/IP 开销、重传或代理商特有计费项，也不包含邮箱 API、Roxy API 或 CDP 控制通道流量。
 
 #### 省流量模式
 
@@ -148,6 +149,12 @@ BROWSER_DATA_SAVER_BLOCKED_RESOURCE_TYPES=["image", "media", "stylesheet"]
 ```
 
 CSS 通常不是注册接口必需，但会影响隐藏元素、布局和可见性判断，建议先单独测试；出现元素找不到或点击异常时移除 `stylesheet`。
+
+#### 代理传输与连接恢复
+
+本地代理中继会自动按目标 host:port 统计传输字节、连接数、失败连接数，并在任务记录 `network_traffic.proxy_transport.destinations` 中保存；日志按消耗输出 `[代理目标]`。HTTPS 隧道只能做目标归因，不能识别完整 URL 或发起者。开启省流量模式时，中继会在连接代理前阻断 `dl.google.com`、`gvt1.com` 及其子域名（可在 `BROWSER_DATA_SAVER_BLOCKED_PROXY_HOSTS` 修改）；命中返回本地 HTTP 403，记录到 `blocked_connection_count`，不伪造节省字节数。
+
+SOCKS5 CONNECT 握手错误码 `1/3/4/6` 最多自动重试三次，等待 0.25 秒和 0.5 秒；只有浏览器数据转发前才重试，不重放 HTTP/TLS 数据。认证、规则拒绝及端口拒绝等错误不会重试。代理中继关闭引起的连接终止不计作故障，Roxy 收尾仅汇总重试/恢复/失败数量。
 
 #### 资源明细日志
 
@@ -238,6 +245,7 @@ cp .env.example .env
 - `QQ_IMAP_PASSWORD`
 - `CLOUDFLARE_API_KEY` / `CLOUDFLARE_CUSTOM_AUTH`（`EMAIL_SOURCE=cloudflare` 时）
 - `REMAIL_API_KEY`（`EMAIL_SOURCE=remail` 时）
+- `MAILCODE_API_KEY`（`EMAIL_SOURCE=mailcode` 时）
 - `XIGUA_API_KEY`（`EMAIL_SOURCE=xigua` 时）
 - `CPA_MANAGEMENT_KEY`
 - `SMS_API_KEY`
@@ -407,6 +415,19 @@ REMAIL_SUPPLY_POLICY=public_only
 `REMAIL_SERVICE_MODE` 默认为 `purchase`（长效购买，可重复收件），也可改为 `code`（短效接码）。
 `REMAIL_SUPPLY_POLICY` 默认为 `public_only`，也可改为 `private_first`。每个注册任务会创建一个
 对应模式的订单，验证码通过 `/v1/pickup` 获取；Remail 订单余额和对应项目库存需可用。
+
+#### 域名邮箱 MailCode
+
+在 WebUI「配置 → 邮箱 / OTP → 域名邮箱 MailCode」填写 API Key 和商品 ID；服务地址固定为 `https://mailcode.bzb.qzz.io`。
+
+```dotenv
+USE_EMAIL_SERVICE=True
+EMAIL_SOURCE=mailcode
+MAILCODE_API_KEY=你的_MailCode_API_Key
+MAILCODE_PRODUCT_ID=product_a3783a0ead074b4091631b9ad04153f9
+```
+
+购买请求使用幂等键，网络重试不会重复扣费；购买后等待取码通道 READY，验证码使用服务端游标读取并持久化，重启后不重新购买。
 
 #### 西瓜邮箱接码平台
 

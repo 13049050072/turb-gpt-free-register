@@ -403,8 +403,8 @@ def create_app(auth_code: str | None = None) -> Flask:
         from core.email_provider import parse_email_sources
         pool = {"total": 0, "available": 0, "used": 0, "failed": 0}
         for src in parse_email_sources(_email_cfg.EMAIL_SOURCE):
-            # GPTMail/MailNest/CloudMail/西瓜 地址按需生成，不属于本地邮箱池。
-            if src in ("gptmail", "mailnest", "cloudmail", "cloudflare", "xigua"):
+            # GPTMail/MailNest/CloudMail/西瓜/MailCode 地址按需生成，不属于本地邮箱池。
+            if src in ("gptmail", "mailnest", "cloudmail", "cloudflare", "xigua", "mailcode"):
                 continue
             one = (
                 db.generic_api_email_pool_summary() if src == "generic_api"

@@ -4,8 +4,9 @@ import threading
 import unittest
 from unittest.mock import patch
 
-from core.proxy_chain import ProxyChainRelay, open_proxy_pool_proxy, _read_exact
+from core.proxy_chain import ProxyChainRelay, open_proxy_pool_proxy, browser_blocked_proxy_hosts, _read_exact
 from core.browser_traffic import merge_proxy_transport_traffic
+from core.cloakbrowser_driver import CloakSeleniumDriver
 
 
 class ProxyChainTrafficTests(unittest.TestCase):
@@ -16,13 +17,91 @@ class ProxyChainTrafficTests(unittest.TestCase):
         connect.assert_called_once_with(("127.0.0.1", 8888), timeout=15.0)
 
     def test_pool_counting_is_opt_in_and_preserves_target(self):
-        with patch("config.proxy.PROXY_POOL_UPSTREAM_PROXY", ""), patch("core.proxy_chain.ProxyChainRelay") as factory:
+        with patch("config.proxy.PROXY_POOL_UPSTREAM_PROXY", ""), patch("core.proxy_chain.ProxyChainRelay") as factory, patch(
+            "core.proxy_chain.browser_blocked_proxy_hosts", return_value=("dl.google.com", "gvt1.com")
+        ):
             self.assertEqual(open_proxy_pool_proxy("http://proxy.test:8888"), ("http://proxy.test:8888", None))
             factory.assert_not_called()
             relay = factory.return_value.start.return_value
             relay.proxy_url = "http://127.0.0.1:12345"
             self.assertEqual(open_proxy_pool_proxy("http://proxy.test:8888", measure_transport=True), (relay.proxy_url, relay))
-            factory.assert_called_once_with("http://proxy.test:8888", "", timeout=15.0, blocked_hosts=())
+            factory.assert_called_once_with("http://proxy.test:8888", "", timeout=15.0, blocked_hosts=("dl.google.com", "gvt1.com"))
+
+    def test_browser_host_rules_require_data_saver_and_support_empty_override(self):
+        with patch("config.browser.BROWSER_DATA_SAVER_MODE", False):
+            self.assertEqual(browser_blocked_proxy_hosts(), ())
+        with patch("config.browser.BROWSER_DATA_SAVER_MODE", True), patch(
+            "config.browser.BROWSER_DATA_SAVER_BLOCKED_PROXY_HOSTS", ["dl.google.com", "gvt1.com"]
+        ):
+            self.assertEqual(browser_blocked_proxy_hosts(), ("dl.google.com", "gvt1.com"))
+        with patch("config.browser.BROWSER_DATA_SAVER_MODE", True), patch(
+            "config.browser.BROWSER_DATA_SAVER_BLOCKED_PROXY_HOSTS", []
+        ):
+            self.assertEqual(browser_blocked_proxy_hosts(), ())
+        with patch("config.browser.BROWSER_DATA_SAVER_MODE", True), patch(
+            "config.browser.BROWSER_DATA_SAVER_BLOCKED_PROXY_HOSTS", "dl.google.com\ngvt1.com"
+        ):
+            self.assertEqual(browser_blocked_proxy_hosts(), ("dl.google.com", "gvt1.com"))
+
+    def test_cloak_driver_exposes_live_proxy_transport_snapshot(self):
+        relay = unittest.mock.Mock()
+        relay.traffic_snapshot.return_value = {"available": True, "upload_bytes": 3, "download_bytes": 7, "total_bytes": 10}
+        driver = CloakSeleniumDriver(browser=None, context=None, page=None, proxy_relay=relay)
+        self.assertEqual(driver.proxy_transport_snapshot(), relay.traffic_snapshot.return_value)
+        relay.traffic_snapshot.assert_called_once_with()
+
+    def test_blocks_google_downloads_and_retries_before_any_upstream_connection(self):
+        relay = ProxyChainRelay("socks5://127.0.0.1:8888", blocked_hosts=("dl.google.com", "gvt1.com"))
+        for target in ("dl.google.com", "dl.google.com", "GVT1.COM.", "rr8---sn-example.gvt1.com", "redirector.gvt1.com"):
+            browser, client = socket.socketpair()
+            browser.settimeout(2)
+            try:
+                browser.sendall(f"CONNECT {target}:443 HTTP/1.1\r\nHost: {target}\r\n\r\n".encode())
+                with patch.object(relay, "_connect_target_through_upstream") as connect:
+                    relay._handle_client(client)
+                    connect.assert_not_called()
+                self.assertIn(b"403 Forbidden", browser.recv(4096))
+            finally:
+                browser.close()
+        snapshot = relay.traffic_snapshot()
+        self.assertEqual(snapshot["total_bytes"], 0)
+        self.assertEqual(snapshot["blocked_connection_count"], 5)
+        self.assertEqual(sum(item["failed_connection_count"] for item in snapshot["destinations"]), 0)
+        dl = next(item for item in snapshot["destinations"] if item["host"] == "dl.google.com")
+        self.assertEqual(dl["blocked_connection_count"], 2)
+        self.assertEqual(relay.last_error, "")
+        with self.assertLogs("core.browser_traffic", level="INFO") as captured:
+            result = merge_proxy_transport_traffic({}, snapshot, label="Roxy")
+        self.assertTrue(any("[代理拦截] target=dl.google.com:443 blocked=2" in line for line in captured.output))
+        self.assertFalse(any("[代理目标]" in line for line in captured.output))
+        self.assertEqual(result["proxy_transport"]["blocked_connection_count"], 5)
+
+    def test_host_block_also_applies_to_plain_http(self):
+        relay = ProxyChainRelay("http://127.0.0.1:8888", blocked_hosts=("gvt1.com",))
+        browser, client = socket.socketpair()
+        try:
+            browser.sendall(b"GET http://redirector.gvt1.com/download HTTP/1.1\r\nHost: redirector.gvt1.com\r\n\r\n")
+            with patch.object(relay, "_connect_target_through_upstream") as connect:
+                relay._handle_client(client)
+                connect.assert_not_called()
+            self.assertIn(b"403 Forbidden", browser.recv(4096))
+            self.assertEqual(relay.traffic_snapshot()["destinations"][0]["port"], 80)
+        finally:
+            browser.close()
+
+    def test_unrelated_hosts_are_not_blocked_by_substring(self):
+        relay = ProxyChainRelay("http://127.0.0.1:8888", blocked_hosts=("dl.google.com", "gvt1.com"))
+        for target in ("chatgpt.com", "auth.openai.com", "auth-cdn.oaistatic.com", "sentinel.openai.com", "notgvt1.com", "gvt1.com.example.org", "notdl.google.com"):
+            browser, client = socket.socketpair()
+            try:
+                browser.sendall(f"CONNECT {target}:443 HTTP/1.1\r\n\r\n".encode())
+                with patch.object(relay, "_connect_target_through_upstream", side_effect=ConnectionError("test")) as connect:
+                    with self.assertLogs("core.proxy_chain", level="WARNING"):
+                        relay._handle_client(client)
+                    connect.assert_called_once()
+            finally:
+                browser.close()
+        self.assertEqual(relay.traffic_snapshot()["blocked_connection_count"], 0)
 
     def test_transport_replaces_total_without_adding_page_bytes_twice(self):
         observed = {"upload_bytes": 1, "download_bytes": 9, "total_bytes": 10, "http_download_bytes": 9}

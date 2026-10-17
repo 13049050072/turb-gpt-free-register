@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 import tempfile
+import logging
 import unittest
 import uuid
 from pathlib import Path
@@ -65,6 +66,12 @@ class _DummyQueueSlot:
 
 class AccountLivenessTests(unittest.TestCase):
     def setUp(self):
+        plan_patch = patch("core.chatgpt_plan.check_account_plan", return_value={"ok": True, "current_plan_type": "plus"})
+        self.plan_mock = plan_patch.start()
+        self.addCleanup(plan_patch.stop)
+        rate_patch = patch("core.plan_check_service._wait_for_rate_slot")
+        rate_patch.start()
+        self.addCleanup(rate_patch.stop)
         _DummyBrowserSession.created = []
 
     def test_preflight_preserves_explicit_direct_route_and_skips_providers(self):
@@ -260,6 +267,105 @@ class AccountLivenessTests(unittest.TestCase):
         self.assertTrue(reauth_session.session.closed)
         self.assertTrue(full_session.session.closed)
 
+    def test_live_success_queries_plan_before_session_closes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            session = _DummyBrowserSession(proxy="")
+            def query(token, **kwargs):
+                self.assertEqual(token, "fresh-token")
+                self.assertIs(kwargs["session"], session)
+                self.assertFalse(session.session.closed)
+                return {"ok": True, "current_plan_type": "plus"}
+            self.plan_mock.side_effect = query
+            with patch.object(liveness, "_LOG_DIR", Path(tmp)), \
+                 patch.object(liveness, "_stored_access_token", return_value=""), \
+                 patch.object(liveness, "_account_totp_secret", return_value=""), \
+                 patch.object(liveness, "_login_via_full_web_flow", return_value=(session, {"accessToken": "fresh-token"})):
+                result = liveness.check_account_liveness("user@example.com")
+            self.assertTrue(result["ok"])
+            self.assertTrue(result["plan_result"]["ok"])
+            self.assertTrue(session.session.closed)
+            self.plan_mock.assert_called_once()
+
+    def test_plan_exception_does_not_turn_live_success_into_failure(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            session = _DummyBrowserSession(proxy="")
+            self.plan_mock.side_effect = RuntimeError("plan timeout")
+            with patch.object(liveness, "_LOG_DIR", Path(tmp)), \
+                 patch.object(liveness, "_stored_access_token", return_value=""), \
+                 patch.object(liveness, "_account_totp_secret", return_value=""), \
+                 patch.object(liveness, "_login_via_full_web_flow", return_value=(session, {"accessToken": "fresh-token"})):
+                result = liveness.check_account_liveness("user@example.com")
+            self.assertTrue(result["ok"])
+            self.assertEqual(result["access_token"], "fresh-token")
+            self.assertFalse(result["plan_result"]["ok"])
+            self.assertTrue(session.session.closed)
+
+    def test_full_web_login_failure_closes_session_before_ownership_transfer(self):
+        for stage in ('authorize', 'deactivated', 'otp'):
+            with self.subTest(stage=stage):
+                session = _DummyBrowserSession(proxy='socks5://proxy.example:1080')
+                error = RuntimeError('failed at ' + stage)
+                with patch.object(liveness, '_network_preflight_with_retry', return_value=(session, 'https://auth.example/authorize')), \
+                     patch.object(liveness, 'follow_authorize', side_effect=error if stage == 'authorize' else None,
+                                  return_value='https://auth.example/email-verification'), \
+                     patch.object(liveness, 'detect_account_unusable_text', return_value='account_deactivated' if stage == 'deactivated' else None), \
+                     patch.object(liveness, '_login_via_password_or_otp', side_effect=error if stage == 'otp' else None), \
+                     patch.object(liveness, 'close_browser_session', wraps=liveness.close_browser_session) as close:
+                    expected = liveness.AccountUnusableError if stage == 'deactivated' else RuntimeError
+                    with self.assertRaises(expected):
+                        liveness._login_via_full_web_flow('user@example.com', session.proxy,
+                            email_source=None, fingerprint_state={})
+                close.assert_called_once_with(session)
+                self.assertTrue(session.session.closed)
+
+    def test_full_web_login_success_transfers_open_session_to_caller(self):
+        session = _DummyBrowserSession(proxy='')
+        info = {'accessToken': 'fresh-token'}
+        with patch.object(liveness, '_network_preflight_with_retry', return_value=(session, 'https://auth.example/authorize')), \
+             patch.object(liveness, 'follow_authorize', return_value='https://auth.example/email-verification'), \
+             patch.object(liveness, 'detect_account_unusable_text', return_value=None), \
+             patch.object(liveness, '_login_via_password_or_otp', return_value=info), \
+             patch.object(liveness, 'close_browser_session') as close:
+            returned, result = liveness._login_via_full_web_flow('user@example.com', '',
+                email_source=None, fingerprint_state={})
+        self.assertIs(returned, session)
+        self.assertIs(result, info)
+        self.assertFalse(session.session.closed)
+        close.assert_not_called()
+
+    def test_full_web_login_cleanup_error_preserves_original_login_error(self):
+        session = _DummyBrowserSession(proxy='')
+        original = RuntimeError('original authorization failure')
+        with patch.object(liveness, '_network_preflight_with_retry', return_value=(session, 'https://auth.example/authorize')), \
+             patch.object(liveness, 'follow_authorize', side_effect=original), \
+             patch.object(liveness, 'close_browser_session', side_effect=OSError('close failed')) as close:
+            with self.assertRaises(RuntimeError) as raised:
+                liveness._login_via_full_web_flow('user@example.com', '', email_source=None, fingerprint_state={})
+        self.assertIs(raised.exception, original)
+        close.assert_called_once_with(session)
+
+    def test_log_handler_close_error_does_not_override_saved_live_success(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            session = _DummyBrowserSession(proxy='')
+            handler = logging.FileHandler(str(Path(tmp) / 'test.log'))
+            try:
+                with patch.object(liveness, '_LOG_DIR', Path(tmp)), \
+                     patch.object(liveness, '_stored_access_token', return_value=''), \
+                     patch.object(liveness, '_account_totp_secret', return_value=''), \
+                     patch.object(liveness, '_login_via_full_web_flow', return_value=(session, {'accessToken': 'fresh-token'})), \
+                     patch.object(liveness.logging, 'FileHandler', return_value=handler), \
+                     patch.object(handler, 'close', side_effect=OSError('log close failed')) as close:
+                    result = liveness.check_account_liveness('user@example.com')
+                self.assertTrue(result['ok'])
+                self.assertTrue(result['plan_result']['ok'])
+                self.assertTrue(session.session.closed)
+                self.assertNotIn(handler, logging.getLogger().handlers)
+                self.assertFalse(liveness.is_checking('user@example.com'))
+                close.assert_called_once()
+            finally:
+                logging.getLogger().removeHandler(handler)
+                handler.close()
+
     def test_service_403_rotates_proxy_and_never_falls_back_direct_when_pool_exists(self):
         slot = _DummyQueueSlot()
         failed = {"ok": False, "status": "failed", "error": "HTTP Error 403: blocked"}
@@ -281,7 +387,7 @@ class AccountLivenessTests(unittest.TestCase):
 
         with patch.object(live_service, "_QUEUE_SLOTS", slot), \
              patch.object(live_service.db, "mark_account_live_check_running", return_value=True), \
-             patch.object(live_service.db, "get_account", return_value={"email_source": "remail"}), \
+             patch.object(live_service.db, "get_account", return_value={"email": "user@example.com", "email_source": "remail"}), \
              patch.object(live_service.db, "update_account_liveness"), \
              patch.object(live_service, "_append_log"), \
              patch.object(live_service, "resolve_plan_check_route", side_effect=route_for), \
@@ -322,7 +428,7 @@ class AccountLivenessTests(unittest.TestCase):
         }
         with patch.object(live_service, "_QUEUE_SLOTS", slot), \
              patch.object(live_service.db, "mark_account_live_check_running", return_value=True), \
-             patch.object(live_service.db, "get_account", return_value={}), \
+             patch.object(live_service.db, "get_account", return_value={"email": "user@example.com"}), \
              patch.object(live_service.db, "update_account_liveness"), \
              patch.object(live_service, "_append_log"), \
              patch.object(live_service, "resolve_plan_check_route", return_value=route), \

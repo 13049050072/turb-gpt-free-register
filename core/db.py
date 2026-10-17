@@ -323,6 +323,7 @@ def _ensure_sqlite() -> None:
                 conn.execute(f"DROP TABLE {old_table}")
         if not migration_done:
             conn.execute("INSERT OR REPLACE INTO storage_meta(key, value) VALUES('legacy_import_completed', ?)", (_now(),))
+        _reserve_account_id_floor(conn, int(conn.execute("SELECT COALESCE(MAX(id), 0) FROM accounts").fetchone()[0]))
         conn.commit()
         conn.close()
         _SQLITE_READY = True
@@ -348,6 +349,11 @@ def _save_collection(collection: str, rows: list[dict]) -> None:
     source = _EMAIL_SOURCES[collection] if table == "email_pool" else None
     with closing(_sqlite_conn()) as conn:
         with conn:
+            if table == "accounts":
+                # 全量重写账号表时也保留历史最大 ID；删除最后一个/全部账号不能重用 ID。
+                floor = max([int(r.get("id") or 0) for r in rows] + [
+                    int(conn.execute("SELECT COALESCE(MAX(id), 0) FROM accounts").fetchone()[0])])
+                _reserve_account_id_floor(conn, floor)
             if table == "email_pool":
                 conn.execute("DELETE FROM email_pool WHERE source=?", (source,))
             else:
@@ -585,6 +591,24 @@ def _read_json(path: Path, default: Any) -> Any:
         return json.loads(path.read_text(encoding="utf-8"))
     except Exception:
         return default
+
+
+def _reserve_account_id_floor(conn, value: int) -> None:
+    conn.execute("""INSERT INTO storage_meta(key,value) VALUES('account_id_high_watermark',?)
+                    ON CONFLICT(key) DO UPDATE SET value=MAX(CAST(value AS INTEGER),CAST(excluded.value AS INTEGER))""",
+                 (str(value),))
+
+
+def _next_account_id() -> int:
+    """事务内预留单调递增 ID，防止删除后旧任务操作到新账号。"""
+    _ensure_sqlite()
+    with closing(_sqlite_conn()) as conn, conn:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute("SELECT value FROM storage_meta WHERE key='account_id_high_watermark'").fetchone()
+        existing = int(conn.execute("SELECT COALESCE(MAX(id),0) FROM accounts").fetchone()[0])
+        value = max(int(row[0]) if row else 0, existing) + 1
+        _reserve_account_id_floor(conn, value)
+        return value
 
 
 def _next_id(items: list[dict]) -> int:
@@ -1077,7 +1101,7 @@ def insert_account(
         extra_json = json.dumps(extra, ensure_ascii=False) if extra else None
 
         if existing is None:
-            row_id = _next_id(accounts)
+            row_id = _next_account_id()
             row = {
                 "id": row_id,
                 "email": email,
@@ -1283,6 +1307,7 @@ def claim_account_plan_check(
     acc_id: int | None = None,
     email: str | None = None,
     trigger: str = "manual",
+    *, run_id: str | None = None,
 ) -> bool:
     """原子占用账号的套餐查询；已有未超时查询时返回 False。"""
     with _LOCK:
@@ -1309,6 +1334,7 @@ def claim_account_plan_check(
 
         now = _now()
         row["plan_check_status"] = "queued"
+        row["plan_check_run_id"] = run_id
         row["plan_check_trigger"] = str(trigger or "manual")
         row["plan_check_queued_at"] = now
         row["plan_check_started_at"] = None
@@ -1319,14 +1345,23 @@ def claim_account_plan_check(
         return True
 
 
-def mark_account_plan_check_running(acc_id: int) -> bool:
+def mark_account_plan_check_running(acc_id: int, *, run_id: str | None = None, expected_account: dict | None = None) -> bool:
     """把已排队的套餐查询标记为执行中。"""
     with _LOCK:
         accounts = _load_accounts()
         row = next((r for r in accounts if int(r.get("id") or 0) == int(acc_id)), None)
         if row is None or row.get("plan_check_status") not in {"queued", "running"}:
             return False
+        if run_id is not None and row.get("plan_check_run_id") not in (None, run_id):
+            return False
+        if not _matches_check_snapshot(row, expected_account):
+            row.update(plan_check_status="failed", plan_check_ok=False,
+                       plan_check_error="账号邮箱/AT 已变更，旧套餐任务已取消",
+                       plan_check_completed_at=_now(), updated_at=_now())
+            _save_accounts(accounts)
+            return False
         row["plan_check_status"] = "running"
+        row["plan_check_run_id"] = run_id
         row["plan_check_started_at"] = _now()
         row["plan_check_error"] = None
         row["updated_at"] = _now()
@@ -1354,7 +1389,22 @@ def recover_interrupted_plan_checks() -> int:
         return recovered
 
 
-def update_account_plan_check(acc_id: int | None = None, email: str | None = None, result: dict | None = None) -> bool:
+def _matches_check_snapshot(row: dict, expected: dict | None) -> bool:
+    """网络请求期间账号身份/AT 变化时，禁止旧结果覆盖新账号状态。调用方持有 _LOCK。"""
+    if expected is None:
+        return True
+    for key in ("email", "access_token"):
+        if key not in expected:
+            continue
+        current, previous = str(row.get(key) or ""), str(expected.get(key) or "")
+        if key == "email":
+            current, previous = current.strip().lower(), previous.strip().lower()
+        if current != previous:
+            return False
+    return True
+
+
+def update_account_plan_check(acc_id: int | None = None, email: str | None = None, result: dict | None = None, *, expected_account: dict | None = None, expected_run_id: str | None = None) -> bool:
     """更新账号套餐/Plus 试用资格查询结果。"""
     result = result or {}
     with _LOCK:
@@ -1366,6 +1416,18 @@ def update_account_plan_check(acc_id: int | None = None, email: str | None = Non
             or (target_email and (r.get("email") or "").lower() == target_email)
         ), None)
         if row is None:
+            return False
+        if expected_run_id is not None:
+            allowed_statuses = {"running"} if result.get("ok") else {"queued", "running"}
+            if row.get("plan_check_run_id") != expected_run_id or row.get("plan_check_status") not in allowed_statuses:
+                return False
+        if not _matches_check_snapshot(row, expected_account):
+            # 只结束自己占用的旧查询，不动后续任务，也不覆盖已有套餐权益。
+            if expected_run_id is not None:
+                row.update(plan_check_status="failed", plan_check_ok=False,
+                           plan_check_error="账号邮箱/AT 已变更，旧套餐结果已丢弃",
+                           plan_check_completed_at=_now(), updated_at=_now())
+                _save_accounts(accounts)
             return False
 
         ok = bool(result.get("ok"))
@@ -1427,8 +1489,9 @@ def update_account_plan_check(acc_id: int | None = None, email: str | None = Non
         row["plan_check_network_route"] = result.get("network_route")
         row["plan_check_proxy_used"] = result.get("proxy_used")
         row["plan_check_proxy_fallback_reason"] = result.get("proxy_fallback_reason")
-        row["token_expired"] = result.get("token_expired")
-        row["token_expires_at"] = result.get("token_expires_at")
+        for key in ("token_expired", "token_expires_at"):
+            if key in result:
+                row[key] = result[key]
         row["plan_check_result_json"] = json.dumps(result, ensure_ascii=False)
         row["updated_at"] = _now()
         _save_accounts(accounts)
@@ -1915,6 +1978,7 @@ def finish_account_email_change(
             row["access_token"] = ""
             row["token_expired"] = True
             row["live_check_status"] = ""
+            row["live_check_run_id"] = None
             row["email_change_new_email"] = str(new_email).strip()
         row["email_change_status"] = "success" if ok else "failed"
         row["email_change_ok"] = bool(ok)
@@ -1945,13 +2009,22 @@ def recover_interrupted_email_changes() -> int:
         return count
 
 
-def update_account_liveness(acc_id: int, result: dict | None = None) -> bool:
+def update_account_liveness(acc_id: int, result: dict | None = None, *, expected_account: dict | None = None, expected_run_id: str | None = None) -> bool:
     """写回账号查活结果；成功时同步刷新最新 access_token 和账号基础信息。"""
     result = result or {}
     with _LOCK:
         rows = _load_accounts()
         row = next((r for r in rows if int(r.get("id") or 0) == int(acc_id)), None)
         if row is None:
+            return False
+        if expected_run_id is not None and (row.get("live_check_run_id") != expected_run_id
+                                            or row.get("live_check_status") not in {"queued", "running"}):
+            return False
+        if not _matches_check_snapshot(row, expected_account):
+            if expected_run_id is not None:
+                row.update(live_check_status="failed", live_check_ok=False, live_checked_at=_now(),
+                           live_check_error="账号邮箱/AT 已变更，旧查活结果已丢弃", updated_at=_now())
+                _save_accounts(rows)
             return False
 
         now = _now()
@@ -1967,6 +2040,14 @@ def update_account_liveness(acc_id: int, result: dict | None = None) -> bool:
             token = str(result.get("access_token") or "").strip()
             if token:
                 row["access_token"] = token
+                # token 元数据属于当前 AT，不能等到套餐成功才清理旧 AT 的过期标记。
+                try:
+                    from core.chatgpt_plan import token_claims
+                    claims = token_claims(token)
+                except (TypeError, ValueError, AttributeError, OverflowError, OSError):
+                    claims = {}
+                row["token_expired"] = claims.get("token_expired")
+                row["token_expires_at"] = claims.get("token_expires_at")
             session = result.get("session") or {}
             user = session.get("user") or {}
             account = session.get("account") or {}
@@ -2082,12 +2163,13 @@ def recover_interrupted_totp_setups() -> int:
         return recovered
 
 
-def claim_account_live_check(acc_id: int, trigger: str = "manual") -> bool:
+def claim_account_live_check(acc_id: int, trigger: str = "manual", *, run_id: str | None = None, expected_email: str | None = None) -> bool:
     """原子占用账号查活任务；已有 queued/running 时返回 False。"""
     with _LOCK:
         rows = _load_accounts()
         row = next((r for r in rows if int(r.get("id") or 0) == int(acc_id)), None)
-        if row is None:
+        if row is None or (expected_email is not None
+                           and str(row.get("email") or "").strip().lower() != expected_email.strip().lower()):
             return False
         if row.get("live_check_status") in {"queued", "running"}:
             try:
@@ -2100,6 +2182,7 @@ def claim_account_live_check(acc_id: int, trigger: str = "manual") -> bool:
                 pass
         now = _now()
         row["live_check_status"] = "queued"
+        row["live_check_run_id"] = run_id
         row["live_check_ok"] = False
         row["live_check_trigger"] = str(trigger or "manual")
         row["live_check_queued_at"] = now
@@ -2131,12 +2214,14 @@ def recover_interrupted_live_checks() -> int:
         return recovered
 
 
-def mark_account_live_check_running(acc_id: int) -> bool:
+def mark_account_live_check_running(acc_id: int, *, run_id: str | None = None) -> bool:
     """把账号查活任务标记为运行中。"""
     with _LOCK:
         rows = _load_accounts()
         row = next((r for r in rows if int(r.get("id") or 0) == int(acc_id)), None)
         if row is None or row.get("live_check_status") not in {"queued", "running"}:
+            return False
+        if run_id is not None and row.get("live_check_run_id") != run_id:
             return False
         now = _now()
         row["live_check_status"] = "running"
@@ -2448,7 +2533,7 @@ def import_registered_email_accounts(records: list[dict], source: str | None) ->
                 pool_row["copy_line"] = _outlook_line(pool_row)
                 original_line = _outlook_line(pool_row)
 
-            row_id = _next_id(accounts)
+            row_id = _next_account_id()
             access_token = (raw.get("access_token") or raw.get("token") or "").strip()
             totp_secret = (raw.get("totp_secret") or raw.get("totp") or "").strip() or None
             account = {
@@ -3528,3 +3613,77 @@ def domain_email_pool_summary() -> dict:
 def delete_domain_email(email: str) -> bool:
     """从域名邮箱池删除一个邮箱。"""
     return delete_email_pool(email, source="cloudflare_domain")
+
+
+# 巡检任务与账号业务状态分开持久化，唯一索引保证跨线程/进程启动防重。
+def _inspection_conn():
+    _ensure_sqlite()
+    conn = _sqlite_conn()
+    conn.execute("""CREATE TABLE IF NOT EXISTS account_inspections (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        status TEXT NOT NULL,
+        payload TEXT NOT NULL
+    )""")
+    conn.execute("""CREATE UNIQUE INDEX IF NOT EXISTS one_active_account_inspection
+        ON account_inspections ((1)) WHERE status IN ('queued', 'running')""")
+    conn.commit()
+    return conn
+
+
+def create_account_inspection(account_ids: list[int] | None = None, workers: int = 3, archived: str = "0") -> tuple[dict, bool]:
+    if account_ids is not None:
+        account_ids = list(dict.fromkeys(int(account_id) for account_id in account_ids))
+    with closing(_inspection_conn()) as conn, conn:
+        conn.execute("BEGIN IMMEDIATE")
+        active = conn.execute("SELECT payload FROM account_inspections WHERE status IN ('queued','running')").fetchone()
+        if active:
+            return json.loads(active[0]), False
+        if account_ids is None:
+            # 与任务占用处于同一事务中，避免 OFFSET 分页遇到新增/归档/删除时漏账号。
+            sql = "SELECT id FROM accounts"
+            params = ()
+            if archived != "all":
+                sql += " WHERE archived=?"
+                params = (int(archived == "only"),)
+            account_ids = [row[0] for row in conn.execute(sql + " ORDER BY id DESC", params)]
+        run = dict(status="queued", workers=workers, archived=archived, created_at=_now(), finished_at=None,
+                   total_count=len(account_ids), checked_count=0, skipped_count=0, invalid_count=0,
+                   live_success_count=0, live_failed_count=0,
+                   plan_success_count=0, plan_failed_count=0, error="",
+                   account_ids=account_ids)
+        cursor = conn.execute("INSERT INTO account_inspections(status,payload) VALUES (?,?)", (run["status"], json.dumps(run)))
+        run["id"] = cursor.lastrowid
+        conn.execute("UPDATE account_inspections SET payload=? WHERE id=?", (json.dumps(run), run["id"]))
+        return run, True
+
+
+def save_account_inspection(run: dict) -> bool:
+    # 终态不可覆盖，防止旧线程把已中断任务重新写为 running 或冲突新任务唯一索引。
+    with closing(_inspection_conn()) as conn, conn:
+        cursor = conn.execute("""UPDATE account_inspections SET status=?,payload=?
+                                 WHERE id=? AND status IN ('queued', 'running')""",
+                              (run["status"], json.dumps(run, ensure_ascii=False), run["id"]))
+        return cursor.rowcount == 1
+
+
+def list_account_inspections(limit: int = 50, offset: int = 0) -> dict:
+    with closing(_inspection_conn()) as conn:
+        conn.execute("BEGIN")  # items、active、total 使用同一读快照。
+        rows = conn.execute("SELECT payload FROM account_inspections ORDER BY id DESC LIMIT ? OFFSET ?", (limit, offset)).fetchall()
+        active = conn.execute("SELECT payload FROM account_inspections WHERE status IN ('queued','running')").fetchone()
+        total = conn.execute("SELECT COUNT(*) FROM account_inspections").fetchone()[0]
+    def public(payload):
+        return {k: v for k, v in json.loads(payload).items() if k != "account_ids"}
+    return dict(items=[public(r[0]) for r in rows], total=total,
+                active=public(active[0]) if active else None)
+
+
+def recover_interrupted_account_inspections(error: str = "WebUI 重启，巡检已中断；统计保留已完成部分") -> int:
+    with closing(_inspection_conn()) as conn, conn:
+        conn.execute("BEGIN IMMEDIATE")
+        rows = conn.execute("SELECT payload FROM account_inspections WHERE status IN ('queued','running')").fetchall()
+        for row in rows:
+            run = json.loads(row[0])
+            run.update(status="interrupted", finished_at=_now(), error=error)
+            conn.execute("UPDATE account_inspections SET status=?,payload=? WHERE id=?", (run["status"], json.dumps(run, ensure_ascii=False), run["id"]))
+        return len(rows)

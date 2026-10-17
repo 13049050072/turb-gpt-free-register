@@ -385,7 +385,9 @@ def check_account_plan(
     timeout: float | None = None,
     max_attempts: int | None = None,
     retry_delay: float | None = None,
+    session: BrowserSession | None = None,
 ) -> dict:
+    """查询套餐；传入 session 时借用现有会话，不更换出口、不预热、不关闭它。"""
     token = normalize_token(token)
     if not token:
         return {"ok": False, "checked_at": now_iso(), "error": "token 为空"}
@@ -401,7 +403,11 @@ def check_account_plan(
         }
 
     try:
-        route = resolve_plan_check_route(proxy)
+        route = resolve_plan_check_route(proxy) if session is None else {
+            "proxy_used": _mask_proxy(session.proxy or "") or None,
+            "network_route": "proxy" if session.proxy else "direct",
+            "proxy_mode": "live_session",
+        }
     except Exception as exc:
         return {
             "ok": False,
@@ -431,16 +437,18 @@ def check_account_plan(
     # 任务级随机 seed：同一查询的所有重试统一 device/session/Cookie；不同账号
     # 或下一次查询不会复用旧浏览器身份。
     task_seed = f"plan-check:{identity}:{uuid.uuid4()}"
-    env: BrowserSession | None = None
+    env: BrowserSession | None = session
+    owns_session = session is None
     relay = None
     try:
         # 首次按代理真实出口自动生成语言/时区画像，随后整条查询链固定不漂移。
-        effective_proxy, relay = open_plan_check_proxy(
-            route, route["proxy"], timeout=timeout_seconds,
-        )
-        env = BrowserSession(
-            proxy=effective_proxy, detect_exit_geo=True, fingerprint_seed=task_seed,
-        )
+        if owns_session:
+            effective_proxy, relay = open_plan_check_proxy(
+                route, route["proxy"], timeout=timeout_seconds,
+            )
+            env = BrowserSession(
+                proxy=effective_proxy, detect_exit_geo=True, fingerprint_seed=task_seed,
+            )
         effective_tz = str(timezone_offset_min or "").strip()
         if not effective_tz or effective_tz == "-":
             effective_tz = str(env.js_timezone_offset_min())
@@ -449,13 +457,14 @@ def check_account_plan(
             f"?timezone_offset_min={quote(effective_tz)}"
         )
         logger.info(
-            "[Plan] 统一会话已创建：proxy=%s device_id=%s oai_session_id=%s %s",
+            "[Plan] 查询会话（新建或借用）：proxy=%s device_id=%s oai_session_id=%s %s",
             route_meta.get("proxy_used") or route_meta.get("network_route") or "direct",
             str(env.device_id)[:12] + "...",
             str(env.oai_session_id)[:12] + "...",
             env.fingerprint_summary_text(),
         )
-        _warm_plan_session(env)
+        if owns_session:
+            _warm_plan_session(env)
 
         for attempt in range(1, attempts + 1):
             resp = None
@@ -554,13 +563,17 @@ def check_account_plan(
             **{k: v for k, v in claims.items() if k != "payload"},
         }
     finally:
-        if env is not None:
+        if owns_session and env is not None:
             try:
                 close_browser_session(env)
             except Exception:
                 pass
         if relay is not None:
-            relay.close()
+            try:
+                relay.close()
+            except Exception:
+                # 清理辅助资源失败不能覆盖已经取得的套餐业务结果。
+                logger.warning("[Plan] 代理中继关闭失败", exc_info=True)
 
     return last_result or {
         "ok": False,

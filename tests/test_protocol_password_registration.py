@@ -8,7 +8,7 @@ import main
 
 
 class ProtocolPasswordRegistrationTests(unittest.TestCase):
-    def test_password_registration_skips_auth_bootstrap_when_disabled_and_allows_opt_in(self):
+    def test_password_registration_runs_auth_bootstrap_when_enabled_and_allows_opt_out(self):
         session = SimpleNamespace(
             proxy=None,
             device_id="device-test",
@@ -121,7 +121,7 @@ class ProtocolPasswordRegistrationTests(unittest.TestCase):
             patch.object(main._twofa_cfg, "ENABLE_2FA", True),
             patch.object(main._email_cfg, "USE_EMAIL_SERVICE", True),
             patch.object(main._protocol_cfg, "SEND_SENTINEL_ON_EMAIL_OTP_VALIDATE", False),
-            patch.object(main._protocol_cfg, "CHATGPT_AUTH_BOOTSTRAP_ENABLED", False),
+            patch.object(main._protocol_cfg, "CHATGPT_AUTH_BOOTSTRAP_ENABLED", True),
             auth_bootstrap_patch,
             patch("core.email_provider.resolve_email_source", return_value="generic_api"),
             patch("core.flow_trigger.trigger_flow", return_value={"status": "skipped", "ok": False}),
@@ -146,19 +146,19 @@ class ProtocolPasswordRegistrationTests(unittest.TestCase):
             self.assertEqual(result["network_traffic"]["request_count"], 1)
             self.assertEqual(result["network_traffic"]["total_bytes"], 20)
             self.assertEqual(result["network_traffic"], saved["extra"]["network_traffic"])
-            auth_bootstrap.assert_not_called()
+            auth_bootstrap.assert_called_once_with(session, "access-token", strict=False)
 
-            # Explicit opt-in exercises the direct OAuth callback branch, which
+            # Explicit opt-out exercises the direct OAuth callback branch, which
             # has its own post-session bootstrap gate.
             registration_branch["direct_oauth"] = True
-            main._protocol_cfg.CHATGPT_AUTH_BOOTSTRAP_ENABLED = True
-            opt_in_result = main.run_registration(
+            main._protocol_cfg.CHATGPT_AUTH_BOOTSTRAP_ENABLED = False
+            opt_out_result = main.run_registration(
                 email="user@example.com",
                 name="Test User",
                 birthday="2000-01-01",
             )
-            self.assertTrue(opt_in_result["success"])
-            self.assertEqual(opt_in_result["network_traffic"], saved["extra"]["network_traffic"])
+            self.assertTrue(opt_out_result["success"])
+            self.assertEqual(opt_out_result["network_traffic"], saved["extra"]["network_traffic"])
             auth_bootstrap.assert_called_once_with(session, "access-token", strict=False)
             self.assertEqual(finalize_session.call_count, 2)
 

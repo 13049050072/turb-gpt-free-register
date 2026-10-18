@@ -21,7 +21,7 @@ This directory contains guidelines for backend development. Fill in each file wi
 | [Account Inspection](./account-inspection.md) | Durable one-click inspection, failure-detail confidentiality, SQLite snapshots, and stale-list prevention | Ready |
 | [Sub2API Credential Rotation](./sub2api-credential-rotation.md) | Verification-first Sub2API OpenAI OAuth retry, account-ID replacement proof, and cleanup gating | Ready |
 | [ChatGPT2API Credential Rotation](./chatgpt2api-credential-rotation.md) | Verification-first expired AT detection, local liveness refresh, and exact remote-ID replacement | Ready |
-| [Protocol Registration Traffic](./protocol-registration-traffic.md) | Always-on curl_cffi registration aggregates, default-off optional post-auth warm-up, durable persistence, and redaction | Ready |
+| [Protocol Registration Traffic](./protocol-registration-traffic.md) | Always-on curl_cffi registration aggregates, default-on optional post-auth warm-up, durable persistence, and redaction | Ready |
 
 ---
 

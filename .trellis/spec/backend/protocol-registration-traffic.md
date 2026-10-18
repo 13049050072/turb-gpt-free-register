@@ -8,7 +8,7 @@ The observer covers constructor-time GeoIP GETs and raw curl_cffi GET/POST calls
 
 ### Post-authenticated bootstrap traffic policy
 
-`CHATGPT_AUTH_BOOTSTRAP_ENABLED` defaults to `False` for protocol registration because the authenticated ChatGPT warm-up runs only after OAuth callback handling has produced `/api/auth/session` and an access token. Its account/settings/model/session warm-up requests are not required to construct the registration result or persist the account. Set `CHATGPT_AUTH_BOOTSTRAP_ENABLED=True` in `.env` to restore this optional traffic. The default does not disable anonymous bootstrap, network preflight, Sentinel, OAuth/OTP/account-creation requests, callback/session persistence, or any existing retry/fallback behavior. Both protocol registration completion branches keep their conditional opt-in call.
+`CHATGPT_AUTH_BOOTSTRAP_ENABLED` defaults to `True` for protocol registration, preserving the existing authenticated ChatGPT warm-up after OAuth callback handling has produced `/api/auth/session` and an access token. Set `CHATGPT_AUTH_BOOTSTRAP_ENABLED=False` in `.env` to skip this optional traffic. The default does not change anonymous bootstrap, network preflight, Sentinel, OAuth/OTP/account-creation requests, callback/session persistence, or any existing retry/fallback behavior. Both protocol registration completion branches keep their conditional call.
 
 ## 2. Signatures
 
@@ -95,7 +95,7 @@ The paged and legacy non-paged account-list API paths, plus both V2/Legacy accou
 - `tests/test_protocol_traffic.py`: exact native byte arithmetic; mutually exclusive HTTP/transport failures; partial/missing metrics; stream/redirect markers; URL sanitization; bounded details; freeze/report idempotence; public `BrowserSession.get()`/`post()` response and exception identity; constructor GeoIP observation; untracked-session isolation.
 - `tests/test_protocol_preflight_session_rotation.py`: one shared tracker reaches initial, preflight retry, auth retry, reopen-error, authorize reopen, and direct-fallback factories.
 - `tests/test_protocol_password_registration.py`: success aggregate persistence and freeze-before-2FA behavior.
-- `tests/test_protocol_password_registration.py` and `tests/test_config_defaults.py`: authenticated bootstrap is disabled by default, remains explicitly opt-in, and skipped registration still finalizes OAuth/session state and returns/persists traffic totals.
+- `tests/test_protocol_password_registration.py` and `tests/test_config_defaults.py`: authenticated bootstrap is enabled by default, can be explicitly disabled, and registration still finalizes OAuth/session state and returns/persists traffic totals.
 - `tests/test_protocol_traffic_integration.py`: constructor/ordinary failure summaries, registration-job success/failure persistence, unavailable-summary fallback, and non-protocol driver isolation.
 - `tests/test_config_defaults.py`: existing detail defaults and limits remain unchanged.
 - `tests/test_webui_account_traffic.py`: account-list API omission, durable account metadata not projected, registration-job compact traffic availability, malformed/secret account data omission, restored V2/Legacy account layout, and retained registration-job rendering.

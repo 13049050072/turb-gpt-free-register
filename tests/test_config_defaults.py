@@ -143,18 +143,18 @@ class ConfigDefaultFallbackTests(unittest.TestCase):
         self.assertIn('BROWSER_TRAFFIC_DETAIL_LOG="False"', env_example)
         self.assertIn('BROWSER_TRAFFIC_DETAIL_MAX_ENTRIES="2000"', env_example)
 
-    def test_protocol_authenticated_bootstrap_defaults_off_and_supports_opt_in(self):
+    def test_protocol_authenticated_bootstrap_defaults_on_and_supports_opt_out(self):
         with _protocol_source_defaults():
-            self.assertFalse(openai_protocol.CHATGPT_AUTH_BOOTSTRAP_ENABLED)
-            self.assertFalse(config_pkg.CHATGPT_AUTH_BOOTSTRAP_ENABLED)
-            self.assertTrue(openai_protocol.CHATGPT_ANON_BOOTSTRAP_ENABLED)
-
-        with _protocol_source_defaults(auth_bootstrap_enabled="True"):
             self.assertTrue(openai_protocol.CHATGPT_AUTH_BOOTSTRAP_ENABLED)
             self.assertTrue(config_pkg.CHATGPT_AUTH_BOOTSTRAP_ENABLED)
+            self.assertTrue(openai_protocol.CHATGPT_ANON_BOOTSTRAP_ENABLED)
+
+        with _protocol_source_defaults(auth_bootstrap_enabled="False"):
+            self.assertFalse(openai_protocol.CHATGPT_AUTH_BOOTSTRAP_ENABLED)
+            self.assertFalse(config_pkg.CHATGPT_AUTH_BOOTSTRAP_ENABLED)
 
         env_example = Path(".env.example").read_text(encoding="utf-8")
-        self.assertIn('CHATGPT_AUTH_BOOTSTRAP_ENABLED="False"', env_example)
+        self.assertIn('CHATGPT_AUTH_BOOTSTRAP_ENABLED="True"', env_example)
 
     def test_browser_data_saver_defaults_block_google_gsi(self):
         with _browser_source_defaults():

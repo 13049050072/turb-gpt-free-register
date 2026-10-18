@@ -47,17 +47,15 @@ run_registration(...) -> {
 
 Redirects remain one logical invocation and increment `redirect_count`; whole-chain body totals are marked incomplete. Stream return-time snapshots are not drained and increment `incomplete_size_request_count`. These are application-visible curl metrics, not packet, TLS, proxy-tunnel, DNS, retransmission, or provider-billing bytes.
 
-### Persistence and freeze
+### Persistence and presentation
 
-The bounded aggregate is stored under `result["network_traffic"]`, registration-job `network_traffic`, and successful account `extra_json["network_traffic"]`; no migration is required. Failed protocol results include the aggregate whenever `run_registration()` can return a result. `BrowserSession.close()` does not freeze a shared tracker. Freezing is idempotent and occurs before 2FA, so later 2FA, Codex, flow-trigger, and post-registration requests cannot change totals.
+The bounded aggregate is stored under `result["network_traffic"]`, registration-job `network_traffic`, and successful account `extra_json["network_traffic"]`; no migration is required. Failed protocol results include the aggregate whenever `run_registration()` can return a result. Account metadata persistence is the durable registration summary and is intentionally not a presentation contract for the account list.
+
+`BrowserSession.close()` does not freeze a shared tracker. Freezing is idempotent and occurs before 2FA, so later 2FA, Codex, flow-trigger, and post-registration requests cannot change totals.
 
 Telemetry is observational. Initialization, extraction, freeze, or logging failures return an unavailable summary or omit one observation, but never replace a registration response or exception and never alter proxy, cookie, fingerprint, retry, circuit-breaker, email recovery, or account-persistence behavior.
 
-### Account-list projection
-
-The paged account-list API reads the persisted aggregate from account `extra_json["network_traffic"]` and exposes a separate compact projection. That projection requires `available=true` plus finite, non-negative numeric `total_bytes`, `upload_bytes`, `download_bytes`, `request_count`, `request_elapsed_seconds`, `http_error_count`, and `transport_error_count`. It may additionally expose finite, non-negative `unknown_size_request_count` and `incomplete_size_request_count`. Integer counters and byte fields must remain integers within the JavaScript safe-integer range; numeric strings may be coerced to numbers. Missing, unavailable, non-object, non-finite, negative, oversized, or otherwise malformed required values omit the whole projection, so old rows render `-`.
-
-This is a fixed allowlist. Request details, URLs, arbitrary account extras, headers, bodies, credentials, tokens, exception text, and every other traffic field must not enter the compact account response. The V2 and Legacy account tables render the column immediately after the plan: total bytes on the main line, upload/download bytes on the subline, and request count, elapsed time, HTTP/transport failures, plus present unknown/incomplete counts in a numeric-only tooltip. Registration-job traffic rendering remains unchanged.
+The paged and legacy non-paged account-list API paths, plus both V2/Legacy account tables, omit `network_traffic` entirely. They do not render an account traffic column, tooltip, aggregate, URL, or any other traffic-derived value. Registration-job history and detail use the job `network_traffic` projection and continue to render its bounded aggregate in the registration task/job view. This separation keeps the durable account summary available for backend use without exposing registration traffic in account-list payloads or rows.
 
 ### Detail and confidentiality
 
@@ -96,7 +94,7 @@ Protocol detail URLs contain only a validated `http`/`https` scheme, host, and b
 - `tests/test_protocol_password_registration.py`: success aggregate persistence and freeze-before-2FA behavior.
 - `tests/test_protocol_traffic_integration.py`: constructor/ordinary failure summaries, registration-job success/failure persistence, unavailable-summary fallback, and non-protocol driver isolation.
 - `tests/test_config_defaults.py`: existing detail defaults and limits remain unchanged.
-- `tests/test_webui_account_traffic.py`: compact account-list allowlist, numeric coercion/malformed persistence handling, absent/unavailable omission, V2/Legacy column placement, numeric-only rendering, tooltip contents, and unavailable-row fallback.
+- `tests/test_webui_account_traffic.py`: account-list API omission, durable account metadata not projected, registration-job compact traffic availability, malformed/secret account data omission, restored V2/Legacy account layout, and retained registration-job rendering.
 - Quality gates: focused tests, related WebUI and registration/session regressions, both templates extracted for `node --check`, full discovery compared with clean HEAD when required, `py_compile`, `compileall`, and `git diff --check`.
 
 ## 7. Wrong vs Correct

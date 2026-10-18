@@ -1,10 +1,11 @@
 import json
+from contextlib import nullcontext
 from pathlib import Path
-import shutil
-import subprocess
 import unittest
+from unittest.mock import patch
 
-from webui.app import _compact_account_for_list
+from core import account_inspection_service, db
+from webui.app import _compact_account_for_list, _compact_job_for_list, create_app
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -15,18 +16,25 @@ TEMPLATES = (
 
 
 class AccountTrafficBackendTests(unittest.TestCase):
-    def test_compact_account_exposes_only_sanitized_aggregate_allowlist(self):
+    def _client(self):
+        # Keep app construction isolated from recovery/import side effects.
+        with patch.object(
+            account_inspection_service,
+            "startup_recovery_guard",
+            return_value=nullcontext(False),
+        ), patch("core.chatgpt2api_import_service.start_import_worker"):
+            return create_app(auth_code="test-auth").test_client()
+
+    def test_compact_account_omits_persisted_traffic_and_secret_shaped_values(self):
         traffic = {
             "available": True,
             "total_bytes": "4096",
-            "upload_bytes": 1024.0,
+            "upload_bytes": 1024,
             "download_bytes": 3072,
-            "request_count": "8",
-            "request_elapsed_seconds": "1.25",
+            "request_count": 8,
+            "request_elapsed_seconds": 1.25,
             "http_error_count": 1,
-            "transport_error_count": "2",
-            "unknown_size_request_count": 3,
-            "incomplete_size_request_count": "4",
+            "transport_error_count": 2,
             "url": "https://traffic-canary.invalid/private?token=traffic-canary",
             "details": [{"body": "traffic-canary-body"}],
             "headers": {"Authorization": "traffic-canary-credential"},
@@ -39,161 +47,153 @@ class AccountTrafficBackendTests(unittest.TestCase):
             "extra_json": json.dumps({"network_traffic": traffic}),
         })
 
-        self.assertEqual(compact["network_traffic"], {
+        self.assertNotIn("network_traffic", compact)
+        self.assertNotIn("traffic-canary", json.dumps(compact, sort_keys=True))
+
+    def test_accounts_api_omits_traffic_projection_from_compact_response(self):
+        traffic = {
             "available": True,
             "total_bytes": 4096,
             "upload_bytes": 1024,
             "download_bytes": 3072,
             "request_count": 8,
+            "request_elapsed_seconds": 1.25,
             "http_error_count": 1,
             "transport_error_count": 2,
-            "request_elapsed_seconds": 1.25,
-            "unknown_size_request_count": 3,
-            "incomplete_size_request_count": 4,
-        })
-        serialized = json.dumps(compact, sort_keys=True)
-        self.assertNotIn("traffic-canary", serialized)
-        self.assertNotIn("details", serialized)
-        self.assertNotIn("headers", serialized)
-        self.assertNotIn("exception", serialized)
-
-    def test_malformed_or_secret_shaped_metrics_are_omitted_without_text_passthrough(self):
-        traffic = {
-            "available": True,
-            "total_bytes": 100,
-            "upload_bytes": 40,
-            "download_bytes": 60,
-            "request_count": 2,
-            "request_elapsed_seconds": 0.5,
-            "http_error_count": 0,
-            "transport_error_count": 0,
-            "unknown_size_request_count": '<img src=x onerror="traffic-canary">',
-            "incomplete_size_request_count": -1,
             "token": "traffic-canary-token",
+            "details": [{"body": "traffic-canary-body"}],
         }
-        compact = _compact_account_for_list({"extra_json": {"network_traffic": traffic}})
-        sanitized = compact["network_traffic"]
-        self.assertNotIn("unknown_size_request_count", sanitized)
-        self.assertNotIn("incomplete_size_request_count", sanitized)
-        self.assertNotIn("token", sanitized)
-        self.assertNotIn("traffic-canary", json.dumps(compact))
+        row = {
+            "id": 885,
+            "email": "account@example.test",
+            "extra_json": json.dumps({"network_traffic": traffic}),
+        }
+        client = self._client()
+        with patch.object(
+            db,
+            "list_accounts_page",
+            return_value={"items": [row], "total": 1},
+        ):
+            response = client.get(
+                "/api/accounts?paged=1&page=1&page_size=20",
+                headers={"X-Auth-Code": "test-auth"},
+            )
 
-        traffic["total_bytes"] = '<script id="traffic-canary">'
-        self.assertNotIn(
-            "network_traffic",
-            _compact_account_for_list({"extra_json": {"network_traffic": traffic}}),
-        )
+        self.assertEqual(response.status_code, 200)
+        payload = response.get_json()
+        self.assertNotIn("network_traffic", payload["items"][0])
+        self.assertNotIn("traffic-canary", response.get_data(as_text=True))
 
-    def test_absent_unavailable_and_malformed_payload_traffic_is_omitted(self):
+    def test_accounts_api_omits_traffic_projection_from_non_paged_response(self):
+        row = {
+            "id": 886,
+            "email": "legacy@example.test",
+            "extra_json": json.dumps({
+                "network_traffic": {
+                    "available": True,
+                    "total_bytes": 4096,
+                    "details": [{"body": "traffic-canary-body"}],
+                },
+                "secret": "traffic-canary-secret",
+            }),
+        }
+        client = self._client()
+        with patch.object(db, "list_accounts", return_value=[row]):
+            response = client.get(
+                "/api/accounts?limit=20",
+                headers={"X-Auth-Code": "test-auth"},
+            )
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.get_json()
+        self.assertNotIn("network_traffic", payload[0])
+        self.assertNotIn("extra_json", payload[0])
+        self.assertNotIn("traffic-canary", response.get_data(as_text=True))
+
+    def test_malformed_account_metadata_is_ignored_without_text_passthrough(self):
         rows = (
-            {},
             {"extra_json": "not-json"},
             {"extra_json": "[]"},
             {"extra_json": {"network_traffic": None}},
-            {"extra_json": {"network_traffic": {"available": False}}},
             {"extra_json": {"network_traffic": {"available": "true"}}},
+            {
+                "extra_json": {
+                    "network_traffic": {
+                        "available": True,
+                        "total_bytes": "<script>traffic-canary</script>",
+                    },
+                    "secret": "traffic-canary-secret",
+                }
+            },
         )
         for row in rows:
             with self.subTest(row=row):
-                self.assertNotIn("network_traffic", _compact_account_for_list(row))
+                compact = _compact_account_for_list(row)
+                self.assertNotIn("network_traffic", compact)
+                self.assertNotIn("traffic-canary", json.dumps(compact))
 
-    def test_integer_metrics_preserve_exact_js_safe_range(self):
+    def test_registration_job_compact_api_keeps_safe_traffic_summary(self):
         traffic = {
             "available": True,
-            "total_bytes": "9007199254740991",
-            "upload_bytes": 0,
-            "download_bytes": 0,
-            "request_count": 0,
-            "request_elapsed_seconds": 0,
-            "http_error_count": 0,
-            "transport_error_count": 0,
+            "method": "curl_cffi.protocol",
+            "label": "Protocol",
+            "request_count": 2,
+            "upload_bytes": 10,
+            "download_bytes": 20,
+            "total_bytes": 30,
         }
-        compact = _compact_account_for_list({"extra_json": {"network_traffic": traffic}})
-        self.assertEqual(compact["network_traffic"]["total_bytes"], 9_007_199_254_740_991)
+        row = {
+            "id": 7,
+            "status": "success",
+            "email": "user@example.test",
+            "network_traffic": traffic,
+        }
+        client = self._client()
+        with patch.object(
+            db,
+            "list_jobs_page",
+            return_value={"items": [row], "total": 1},
+        ), patch.object(db, "job_status_counts", return_value={"success": 1}), patch(
+            "webui.app.svc.get_retry_info", return_value={}
+        ):
+            response = client.get(
+                "/api/jobs?paged=1&page=1&page_size=20",
+                headers={"X-Auth-Code": "test-auth"},
+            )
 
-        for malformed in ("9007199254740990.5", "9007199254740991.1", "9007199254740992"):
-            with self.subTest(value=malformed):
-                traffic["total_bytes"] = malformed
-                self.assertNotIn(
-                    "network_traffic",
-                    _compact_account_for_list({"extra_json": {"network_traffic": traffic}}),
-                )
+        self.assertEqual(response.status_code, 200)
+        payload = response.get_json()
+        self.assertEqual(payload["items"][0]["network_traffic"], traffic)
+        self.assertEqual(_compact_job_for_list(row)["network_traffic"], traffic)
 
 
 class AccountTrafficTemplateTests(unittest.TestCase):
-    def test_both_account_tables_have_traffic_column_and_safe_renderer(self):
+    def test_account_tables_restore_prior_twelve_column_layout(self):
+        expected_colgroup = (
+            '<col class="col-token"><col class="col-password"><col class="col-plan">'
+            '<col class="col-note"><col class="col-small">'
+        )
         for path in TEMPLATES:
             page = path.read_text(encoding="utf-8")
             table_class = "accounts-table-v2" if path.name == "index.html" else "accounts-table"
             table_start = page.index(f'<table class="{table_class}">')
             table = page[table_start:page.index("</table>", table_start)]
             with self.subTest(template=path.name):
-                self.assertLess(table.index("套餐"), table.index("流量"))
-                self.assertLess(table.index("流量"), table.index("备注"))
-                self.assertIn('<col class="col-plan"><col class="col-traffic"><col class="col-note">', table)
-                self.assertIn("${formatAccountTraffic(r.network_traffic)}", page)
-                self.assertIn('colspan="13"', page)
-                self.assertIn("Number.isFinite(n) && n >= 0", page)
-                self.assertIn("esc(hints.join('；'))", page)
+                self.assertIn(expected_colgroup, table)
+                self.assertEqual(table.count("<col "), 12)
+                self.assertNotIn("流量", table)
+                self.assertNotIn("network_traffic", table)
+                self.assertNotIn("col-traffic", table)
+                self.assertNotIn("formatAccountTraffic", page)
+                self.assertIn('colspan="12"', page)
 
-    @unittest.skipUnless(shutil.which("node"), "node is required for template helper execution")
-    def test_both_renderers_format_numeric_values_and_drop_injected_text(self):
+    def test_registration_job_traffic_rendering_remains_in_both_templates(self):
         for path in TEMPLATES:
             page = path.read_text(encoding="utf-8")
-            start = page.index("function trafficNumber(v)")
-            end_marker = "function jobsV2OpIcons()" if path.name == "index.html" else "function copyId(v)"
-            helpers = page[start:page.index(end_marker, start)]
-            script = """
-function fmt(v) { return v == null || v === '' ? '-' : String(v); }
-function esc(v) { return fmt(v).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/\"/g,'&quot;').replace(/'/g,'&#39;'); }
-""" + helpers + """
-const good = formatAccountTraffic({
-  available: true,
-  total_bytes: 2048,
-  upload_bytes: 512,
-  download_bytes: 1536,
-  request_count: 4,
-  request_elapsed_seconds: 1.25,
-  http_error_count: 1,
-  transport_error_count: 0,
-  unknown_size_request_count: 2,
-  incomplete_size_request_count: 1,
-});
-const malformed = formatAccountTraffic({
-  available: true,
-  total_bytes: '<img src=x onerror=traffic-canary>',
-  upload_bytes: 'traffic-canary-upload',
-  download_bytes: -1,
-  request_count: 'traffic-canary-request',
-  request_elapsed_seconds: Infinity,
-  http_error_count: {},
-  transport_error_count: null,
-});
-const jobTraffic = formatTraffic({
-  available: true,
-  total_bytes: 2048,
-  upload_bytes: 512,
-  download_bytes: 1536,
-  request_count: 4,
-  js_coverage: {enabled: true, script_count: 2, executed_script_count: 1, candidate_script_count: 3},
-});
-console.log(JSON.stringify({good, malformed, jobTraffic, unavailable: formatAccountTraffic(null)}));
-"""
-            result = subprocess.run(
-                [shutil.which("node"), "-e", script],
-                check=True,
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-            )
-            rendered = json.loads(result.stdout)
             with self.subTest(template=path.name):
-                self.assertIn(">2.0 KiB<", rendered["good"])
-                self.assertIn("↑ 512 B / ↓ 1.5 KiB", rendered["good"])
-                self.assertIn("请求 4；耗时 1.250 秒；HTTP 失败 1；传输失败 0；未知 2；不完整 1", rendered["good"])
-                self.assertNotIn("traffic-canary", rendered["malformed"])
-                self.assertEqual(rendered["jobTraffic"], '<span title="上传 512 B，下载 1.5 KiB，4 个请求，JS脚本 2（执行 1，候选 3）">2.0 KiB</span>')
-                self.assertEqual(rendered["unavailable"], "-")
+                self.assertIn("formatTraffic(j.network_traffic)", page)
+                self.assertIn("col-traffic", page)
+                self.assertIn("<th", page)
 
 
 if __name__ == "__main__":

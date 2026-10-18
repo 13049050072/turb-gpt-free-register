@@ -61,11 +61,10 @@ Telemetry is observational. Initialization, extraction, freeze, or logging failu
 
 The paged and legacy non-paged account-list API paths, plus both V2/Legacy account tables, omit `network_traffic` entirely. They do not render an account traffic column, tooltip, aggregate, URL, or any other traffic-derived value. Registration-job history and detail use the job `network_traffic` projection and continue to render its bounded aggregate in the registration task/job view. This separation keeps the durable account summary available for backend use without exposing registration traffic in account-list payloads or rows.
 
-### Detail and confidentiality
+### Failure diagnostics
 
-`BROWSER_TRAFFIC_DETAIL_LOG` controls optional request rows for both browser traffic and protocol registration. Aggregate accounting remains active when this option is false. `BROWSER_TRAFFIC_DETAIL_MAX_ENTRIES` is normalized to `1..10000` and enforced during collection; aggregate counters continue after the detail cap. Detail rows are emitted to the task log only and are not persisted in `network_traffic`.
+`register_user()` may inspect a bounded response-body prefix only on non-2xx `user/register` responses. It may log `status` plus a normalized code only when the code is in the fixed `_REGISTER_ERROR_CODE_ALLOWLIST`; arbitrary messages, unknown codes, response bodies, emails, passwords, tokens, cookies, and headers remain absent. The original response/exception behavior is preserved. This diagnostic is for classifying application-level 400/4xx failures and must not be used to weaken Sentinel validation or change retry behavior.
 
-Protocol detail URLs contain only a validated `http`/`https` scheme, host, and bounded sanitized path. Query strings, fragments, URL userinfo, proxy addresses, headers, cookies, request/response bodies, credentials, email addresses, OTPs, and exception text are never collected by this telemetry. Non-HTTP URLs are excluded.
 
 ## 4. Validation & Error Matrix
 

@@ -64,6 +64,31 @@ _ACCOUNT_DEAD_CODES = frozenset({
     "account_banned",
 })
 
+# user/register 非 2xx 响应里允许进入日志的 error.code 白名单。
+# 只放已知、无敏感信息的规范化 code；其余任意服务端 message 一律不落日志。
+_REGISTER_ERROR_CODE_ALLOWLIST = _ACCOUNT_DEAD_CODES | frozenset({
+    # 邮箱/密码注册常见拒绝原因
+    "email_already_used",
+    "email_already_exists",
+    "invalid_email",
+    "invalid_password",
+    "password_too_short",
+    "password_too_weak",
+    # 风控 / 限流 / 人机校验
+    "rate_limited",
+    "rate_limit_exceeded",
+    "too_many_requests",
+    "captcha_required",
+    "turnstile_required",
+    # 通用请求级错误
+    "invalid_request",
+    "invalid_grant",
+})
+
+# 抽取 error code 时的有界约束：超过则视为不可信，不落日志。
+_MAX_ERROR_CODE_LENGTH = 64
+_MAX_ERROR_BODY_READ_BYTES = 4096
+
 _ACCOUNT_DEAD_TEXT_MARKERS = (
     "account_deactivated",
     "account_deleted",
@@ -135,6 +160,35 @@ def _extract_error_code(resp) -> str:
     if isinstance(err, dict):
         return str(err.get("code") or "")
     return ""
+
+
+def _extract_allowlisted_error_code(resp) -> str:
+    """从响应体里抽出白名单内的 error.code，用于非 2xx 时的安全日志。
+
+    有界读取响应体（bounded），且仅当 code 命中 :data:`_REGISTER_ERROR_CODE_ALLOWLIST`
+    才返回，避免把服务端任意 message / 敏感字段（密码、邮箱、token 等）带进日志。
+    拿不到、非 JSON、或不在白名单内一律返回空串。
+    """
+    try:
+        raw = getattr(resp, "content", None)
+        if raw is None:
+            raw = getattr(resp, "text", "")
+        if isinstance(raw, str):
+            raw = raw.encode("utf-8", "replace")
+        payload = json.loads(bytes(raw)[:_MAX_ERROR_BODY_READ_BYTES])
+    except Exception:
+        return ""
+    if not isinstance(payload, dict):
+        return ""
+    err = payload.get("error")
+    if isinstance(err, dict):
+        code = str(err.get("code") or "")
+    else:
+        code = str(payload.get("code") or payload.get("error_code") or "")
+    code = code.strip().lower()
+    if not code or len(code) > _MAX_ERROR_CODE_LENGTH:
+        return ""
+    return code if code in _REGISTER_ERROR_CODE_ALLOWLIST else ""
 
 
 def _proxy_retry_config() -> tuple[int, float]:
@@ -615,7 +669,11 @@ def register_user(
     logger.info("[步骤7] 提交邮箱和密码：%s", email)
     resp = session.post(url, headers=headers, data=body)
     if resp.status_code != 200:
-        logger.error("[步骤7] user/register 失败 status=%s", resp.status_code)
+        code = _extract_allowlisted_error_code(resp)
+        if code:
+            logger.error("[步骤7] user/register 失败 status=%s code=%s", resp.status_code, code)
+        else:
+            logger.error("[步骤7] user/register 失败 status=%s", resp.status_code)
         resp.raise_for_status()
     data = resp.json()
     return data

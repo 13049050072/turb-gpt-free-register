@@ -193,6 +193,66 @@ class OpenAIRegistrationFlowTests(unittest.TestCase):
         })
         self.assertEqual(result["continue_url"], "/api/accounts/email-otp/send")
 
+    def _register_session_with_status(self, status_code, text=""):
+        class Session(_ProtocolSession):
+            def __init__(self, status_code, text):
+                super().__init__()
+                self._status_code = status_code
+                self._text = text
+
+            def post(self, url, *, headers, data):
+                self.posts.append((url, headers, data))
+                return _Response(status_code=self._status_code, text=self._text)
+
+        return Session(status_code, text)
+
+    def test_register_user_logs_allowlisted_error_code(self):
+        body = '{"error": {"code": "email_already_used", "message": "That email is taken"}}'
+        session = self._register_session_with_status(400, text=body)
+        with self.assertLogs("core.openai_auth", level="ERROR") as cm:
+            with self.assertRaises(RuntimeError):
+                openai_auth.register_user(
+                    session, "user@example.com", "Password!123", "sentinel"
+                )
+        output = "\n".join(cm.output)
+        self.assertIn("status=400", output)
+        self.assertIn("code=email_already_used", output)
+        self.assertNotIn("That email is taken", output)
+
+    def test_register_user_malformed_response_logs_status_only(self):
+        session = self._register_session_with_status(400, text="<html>not json</html>")
+        with self.assertLogs("core.openai_auth", level="ERROR") as cm:
+            with self.assertRaises(RuntimeError):
+                openai_auth.register_user(
+                    session, "user@example.com", "Password!123", "sentinel"
+                )
+        output = "\n".join(cm.output)
+        self.assertIn("status=400", output)
+        self.assertNotIn("not json", output)
+
+    def test_register_user_does_not_leak_secrets_or_body(self):
+        body = json.dumps({
+            "error": {
+                "code": "unexpected_internal_error",
+                "message": "password=SuperSecret123 token=abc.def.ghi",
+            },
+            "password": "SuperSecret123",
+            "token": "tok-123456",
+            "username": "user@example.com",
+        })
+        session = self._register_session_with_status(400, text=body)
+        with self.assertLogs("core.openai_auth", level="ERROR") as cm:
+            with self.assertRaises(RuntimeError):
+                openai_auth.register_user(
+                    session, "user@example.com", "Password!123", "sentinel"
+                )
+        output = "\n".join(cm.output)
+        self.assertIn("status=400", output)
+        self.assertNotIn("unexpected_internal_error", output)  # 非白名单 code 不落日志
+        self.assertNotIn("SuperSecret123", output)
+        self.assertNotIn("tok-123456", output)
+        self.assertNotIn("user@example.com", output)
+
     def test_navigate_create_account_password_switches_from_passwordless_page(self):
         class Session(_ProtocolSession):
             def get(self, url, *, headers, allow_redirects):

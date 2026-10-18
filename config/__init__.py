@@ -75,6 +75,9 @@ from config.browser import (
     BROWSER_PROFILE_POOL,
     pick_browser_profile,
     IMPERSONATE,
+    LIVENESS_IMPERSONATE,
+    LIVENESS_IMPERSONATE_ALLOWED,
+    normalize_liveness_impersonate,
     REQUEST_TIMEOUT,
 )
 
@@ -272,7 +275,7 @@ def _refresh_top_level_constants() -> None:
     # 简单粗暴：枚举一遍重要常量，覆盖到 _self
     for src in (browser, openai_protocol, _proxy, register, email, twofa, roxybrowser, cloakbrowser, browser_use, skyvern, codex, extract_link, sub2api, humanize, flow_trigger, chatgpt2api):
         for k in dir(src):
-            if k.isupper() or k in ("pick_proxy", "pick_browser_profile", "build_browser_environment", "validate_browser_profile"):
+            if k.isupper() or k in ("pick_proxy", "pick_browser_profile", "build_browser_environment", "validate_browser_profile", "normalize_liveness_impersonate"):
                 setattr(_self, k, getattr(src, k))
 
 
@@ -291,7 +294,8 @@ __all__ = [
     "NAVIGATOR_PROTO_SAMPLES", "DOCUMENT_KEY_SAMPLES", "WINDOW_KEY_SAMPLES", "WINDOW_FEATURE_FLAGS",
     "build_browser_environment", "validate_browser_profile",
     "BROWSER_PROFILE_POOL", "pick_browser_profile",
-    "IMPERSONATE", "REQUEST_TIMEOUT",
+    "IMPERSONATE", "LIVENESS_IMPERSONATE", "LIVENESS_IMPERSONATE_ALLOWED",
+    "normalize_liveness_impersonate", "REQUEST_TIMEOUT",
     # openai_protocol
     "OPENAI_CLIENT_ID", "OPENAI_SCOPE", "OPENAI_AUDIENCE", "OPENAI_REDIRECT_URI",
     "SENTINEL_SV", "OPENAI_BUILD_ID", "OAI_CLIENT_BUILD_NUMBER", "OAI_CLIENT_VERSION",

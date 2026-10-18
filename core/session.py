@@ -19,7 +19,7 @@ from config import (
     SEC_CH_UA_BITNESS, SEC_CH_UA_MODEL, SEND_HIGH_ENTROPY_CLIENT_HINTS,
     ACCEPT_LANGUAGE, IMPERSONATE, OAI_CLIENT_BUILD_NUMBER, OAI_CLIENT_VERSION,
     REQUEST_TIMEOUT, pick_proxy, pick_browser_profile, validate_browser_profile,
-    BROWSER_PROFILE_POOL, build_browser_environment,
+    BROWSER_PROFILE_POOL, build_browser_environment, normalize_liveness_impersonate,
 )
 from core.proxy_utils import mask_proxy_url
 
@@ -104,6 +104,7 @@ class BrowserSession:
         sentinel_sid: str | None = None,
         browser_profile: dict | None = None,
         fingerprint_seed: str | None = None,
+        transport_impersonate: str | None = None,
     ):
         """
         初始化会话。
@@ -114,6 +115,9 @@ class BrowserSession:
                    显式传 "" 表示禁用代理。
             detect_exit_geo: 是否探测出口 IP 并自动选择语言/时区画像。
                              套餐查询等短请求可关闭，避免额外网络等待。
+            transport_impersonate: 可选的 curl_cffi TLS/HTTP 传输画像覆盖。
+                                   不传时继续使用全局 IMPERSONATE；覆盖值只接受
+                                   查活兼容白名单，且不修改 browser_profile。
         """
         # proxy=None  → 从池里随机抽（默认行为），并按代理池上游配置决定是否链式
         # proxy=""    → 禁用代理（直连）
@@ -196,8 +200,15 @@ class BrowserSession:
             self.react_container_key = "__reactContainer$" + uuid.uuid4().hex[:11]
         self.react_resources_key = "__reactResources$" + self.react_container_key.split("$", 1)[1]
 
-        # 创建 curl_cffi 会话
-        self.session = Session(impersonate=IMPERSONATE)
+        # 创建 curl_cffi 会话。transport override 只作用于底层 TLS/HTTP 指纹；
+        # user-space UA/Client Hints/JS 画像仍由 browser_profile 的 chrome146
+        # 配置生成，且不会把该兼容值写入持久化指纹状态。
+        self.transport_impersonate = (
+            IMPERSONATE
+            if transport_impersonate is None
+            else normalize_liveness_impersonate(transport_impersonate)
+        )
+        self.session = Session(impersonate=self.transport_impersonate)
 
         # 设置代理
         if transport_proxy:

@@ -81,6 +81,8 @@ def _new_fingerprint_pinned_session(
     email: str,
     proxy: str | None,
     fingerprint_state: dict | None = None,
+    *,
+    transport_impersonate: str | None = None,
 ) -> BrowserSession:
     """创建任务独占账号会话；同一路由尝试内固定完整身份与浏览器画像。"""
     state = fingerprint_state if fingerprint_state is not None else {}
@@ -102,6 +104,7 @@ def _new_fingerprint_pinned_session(
         auth_session_logging_id=state.get("auth_session_logging_id"),
         oai_session_id=state.get("oai_session_id"),
         sentinel_sid=state.get("sentinel_sid"),
+        transport_impersonate=transport_impersonate,
     )
     for key in (
         "device_id", "auth_session_logging_id", "oai_session_id", "sentinel_sid",
@@ -148,6 +151,7 @@ def _network_preflight_with_retry(
     proxy: str | None,
     max_attempts: int = 4,
     fingerprint_state: dict | None = None,
+    transport_impersonate: str | None = None,
 ) -> tuple[BrowserSession, str]:
     """CSRF → Signin 备用预检；失败时保留同一会话重试。
 
@@ -164,7 +168,12 @@ def _network_preflight_with_retry(
     state = fingerprint_state if fingerprint_state is not None else {}
     # 一次网络预检只创建一个 BrowserSession。403 响应下发的新 __cf_bm、
     # OAuth/设备上下文都保留在同一 Cookie Jar 中供下一轮使用。
-    session = _new_fingerprint_pinned_session(email, proxy, state)
+    session = _new_fingerprint_pinned_session(
+        email,
+        proxy,
+        state,
+        transport_impersonate=transport_impersonate,
+    )
     for attempt in range(1, max_attempts + 1):
         logger.info(
             "[查活] 复用统一会话：proxy=%s device_id=%s oai_session_id=%s（网络预检第 %s/%s 次）",
@@ -599,12 +608,14 @@ def _login_via_full_web_flow(
     *,
     email_source: str | None,
     fingerprint_state: dict,
+    transport_impersonate: str | None = None,
 ) -> tuple[BrowserSession, dict]:
     """按 plus 纯协议注册的 Web 登录序列建立一份全新登录态。"""
     session, authorize_url = _network_preflight_with_retry(
         email,
         proxy,
         fingerprint_state=fingerprint_state,
+        transport_impersonate=transport_impersonate,
     )
     # 预检返回后本函数持有会话；只有成功返回才把释放责任移交给上层。
     try:
@@ -702,6 +713,7 @@ def check_account_liveness(
     email_source: str | None = None,
     fingerprint_state: dict | None = None,
     on_authenticated: Callable[[dict, BrowserSession], dict] | None = None,
+    transport_impersonate: str | None = None,
 ) -> dict:
     """
     重新登录账号并刷新最新 accessToken，关闭会话前在原会话查询套餐。
@@ -755,7 +767,12 @@ def check_account_liveness(
             # /api/auth/providers。已开启 TOTP 的账号保留密码 → MFA 路径，
             # 避免把 MFA challenge 误当成邮箱 OTP 页面。
             logger.info("[查活] 流程：登录态预热 → CSRF → Reauth Signin → Authorize → 邮箱 OTP → OAuth callback → Session/AT")
-            session = _new_fingerprint_pinned_session(email, proxy, task_fingerprint_state)
+            session = _new_fingerprint_pinned_session(
+                email,
+                proxy,
+                task_fingerprint_state,
+                transport_impersonate=transport_impersonate,
+            )
             logger.info(
                 "[查活] 会话创建完成：proxy=%s device_id=%s（复用2FA稳定链路）",
                 mask_proxy_url(session.proxy) or "直连/配置随机",
@@ -791,6 +808,7 @@ def check_account_liveness(
                     failed_proxy,
                     email_source=email_source,
                     fingerprint_state=task_fingerprint_state,
+                    transport_impersonate=transport_impersonate,
                 )
         else:
             # 兼容没有本地 AT 或已开启 TOTP 的记录，按 plus 成功注册样本复现
@@ -804,6 +822,7 @@ def check_account_liveness(
                 proxy,
                 email_source=email_source,
                 fingerprint_state=task_fingerprint_state,
+                transport_impersonate=transport_impersonate,
             )
         access_token = str(session_info.get("accessToken") or "")
         if not access_token:

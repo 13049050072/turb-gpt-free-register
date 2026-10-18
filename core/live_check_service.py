@@ -11,6 +11,7 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from pathlib import Path
 
+from config import browser as browser_cfg
 from core import db
 from core.account_liveness import check_account_liveness, log_path
 from core.chatgpt_plan import _mask_proxy, open_plan_check_proxy, resolve_plan_check_route
@@ -228,6 +229,7 @@ def _run_live_check(
                 email_source=email_source,
                 fingerprint_state={"force_fresh": route_attempt > 1},
                 on_authenticated=authenticated,
+                transport_impersonate=browser_cfg.LIVENESS_IMPERSONATE,
             )
             if isinstance(result, dict) and result.get("error") is not None:
                 result = dict(result)

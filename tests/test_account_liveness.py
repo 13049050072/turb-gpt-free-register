@@ -155,11 +155,13 @@ class AccountLivenessTests(unittest.TestCase):
              patch.object(liveness, "get_csrf_token", return_value="csrf"), \
              patch.object(liveness, "signin_openai", return_value="https://auth.example/authorize"):
             session, authorize_url = liveness._network_preflight_with_retry(
-                "user@example.com", "", max_attempts=1
+                "user@example.com", "", max_attempts=1,
+                transport_impersonate="chrome124",
             )
 
         self.assertEqual(session.proxy, "")
         self.assertEqual(authorize_url, "https://auth.example/authorize")
+        self.assertEqual(session.kwargs["transport_impersonate"], "chrome124")
         self.assertTrue(
             session.kwargs["fingerprint_seed"].startswith("live-check:user@example.com:")
         )
@@ -269,12 +271,14 @@ class AccountLivenessTests(unittest.TestCase):
             self.assertIs(
                 liveness._new_fingerprint_pinned_session(
                     "user@example.com", "socks5://proxy:1080", state,
+                    transport_impersonate="chrome124",
                 ),
                 first,
             )
             self.assertIs(
                 liveness._new_fingerprint_pinned_session(
                     "user@example.com", "", state,
+                    transport_impersonate="chrome124",
                 ),
                 second,
             )
@@ -288,6 +292,12 @@ class AccountLivenessTests(unittest.TestCase):
         self.assertEqual(second_kwargs["browser_profile"]["timezone_iana"], "Asia/Tokyo")
         self.assertEqual(first_kwargs["fingerprint_seed"], second_kwargs["fingerprint_seed"])
         self.assertTrue(str(first_kwargs["fingerprint_seed"]).startswith("live-check:user@example.com:"))
+        self.assertTrue(all(
+            call.kwargs["transport_impersonate"] == "chrome124"
+            for call in factory.call_args_list
+        ))
+        self.assertNotIn("transport_impersonate", state)
+        self.assertNotIn("transport_impersonate", state["browser_profile"])
 
     def test_reauth_otp_dead_account_error_is_not_retried(self):
         response = SimpleNamespace(
@@ -339,7 +349,7 @@ class AccountLivenessTests(unittest.TestCase):
             with patch.object(liveness, "_LOG_DIR", Path(tmp)), \
                  patch.object(liveness, "_stored_access_token", return_value="old-token"), \
                  patch.object(liveness, "_account_totp_secret", return_value=""), \
-                 patch.object(liveness, "_new_fingerprint_pinned_session", return_value=reauth_session), \
+                 patch.object(liveness, "_new_fingerprint_pinned_session", return_value=reauth_session) as new_session, \
                  patch.object(liveness, "_warm_authenticated_session"), \
                  patch.object(liveness, "human_delay"), \
                  patch.object(liveness, "_login_via_reauth", side_effect=RuntimeError("HTTP 403 callback")), \
@@ -350,15 +360,23 @@ class AccountLivenessTests(unittest.TestCase):
                     "user@example.com",
                     proxy=None,
                     fingerprint_state=state,
+                    transport_impersonate="chrome124",
                 )
 
         self.assertTrue(result["ok"])
         self.assertEqual(result["access_token"], "new-token")
+        new_session.assert_called_once_with(
+            "user@example.com",
+            None,
+            state,
+            transport_impersonate="chrome124",
+        )
         full_login.assert_called_once_with(
             "user@example.com",
             "socks5://proxy.example:1080",
             email_source=None,
             fingerprint_state=state,
+            transport_impersonate="chrome124",
         )
         self.assertTrue(reauth_session.session.closed)
         self.assertTrue(full_session.session.closed)
@@ -367,7 +385,8 @@ class AccountLivenessTests(unittest.TestCase):
         slot = _DummyQueueSlot()
         failed = {"ok": False, "status": "failed", "error": "HTTP Error 403: blocked"}
         success = {"ok": True, "status": "live", "access_token": "new-token"}
-        with patch.object(live_service, "_QUEUE_SLOTS", slot), \
+        with patch.object(live_service.browser_cfg, "LIVENESS_IMPERSONATE", "chrome124"), \
+             patch.object(live_service, "_QUEUE_SLOTS", slot), \
              patch.object(live_service.db, "mark_account_live_check_running", return_value=True), \
              patch.object(live_service.db, "get_account", return_value={"email_source": "remail"}), \
              patch.object(live_service.db, "update_account_liveness"), \
@@ -394,6 +413,10 @@ class AccountLivenessTests(unittest.TestCase):
             check.call_args_list[0].kwargs["fingerprint_state"],
             check.call_args_list[1].kwargs["fingerprint_state"],
         )
+        self.assertTrue(all(
+            call.kwargs["transport_impersonate"] == "chrome124"
+            for call in check.call_args_list
+        ))
         self.assertTrue(slot.released)
 
 
@@ -422,11 +445,12 @@ class AccountLivenessTests(unittest.TestCase):
                 "proxy_fallback_reason": None,
             }
 
-        with patch.object(live_service, "_QUEUE_SLOTS", slot), \
+        with patch.object(live_service.browser_cfg, "LIVENESS_IMPERSONATE", "chrome124"), \
+             patch.object(live_service, "_QUEUE_SLOTS", slot), \
              patch.object(live_service.db, "mark_account_live_check_running", return_value=True), \
              patch.object(live_service.db, "get_account", return_value={"email_source": "remail"}), \
              patch.object(live_service.db, "update_account_liveness"), \
-             patch.object(live_service, "_append_log"), \
+             patch.object(live_service, "_append_log") as append_log, \
              patch.object(live_service, "_configured_live_check_proxies", return_value=[gateway]), \
              patch.object(live_service, "resolve_plan_check_route", side_effect=resolve_route), \
              patch.object(live_service, "check_account_liveness", side_effect=[failed, success]) as check:
@@ -443,9 +467,18 @@ class AccountLivenessTests(unittest.TestCase):
         self.assertIn("-sid-", second)
         self.assertIn("acct%40label-sid-", second)
         self.assertNotEqual(first, second)
+        self.assertTrue(all(
+            call.kwargs["transport_impersonate"] == "chrome124"
+            for call in check.call_args_list
+        ))
         self.assertEqual(result["proxy_used"], "http://***:***@us.1024proxy.io:8080")
         self.assertNotIn("-sid-", result["proxy_used"])
         self.assertNotIn("pw%3A%40%2F", result["proxy_used"])
+        logged = "\n".join(str(call.args[1]) for call in append_log.call_args_list)
+        self.assertNotIn("pw%3A%40%2F", logged)
+        self.assertNotIn("-sid-", logged)
+        self.assertNotIn("chrome124", logged)
+        self.assertNotIn("transport_impersonate", str(result))
         self.assertTrue(slot.released)
 
     def test_service_honors_the_configured_dynamic_route_attempt_limit(self):
@@ -457,7 +490,8 @@ class AccountLivenessTests(unittest.TestCase):
             selected = str(explicit_proxy or "").strip()
             return {"proxy": selected, "network_route": "proxy" if selected else "direct"}
 
-        with patch("config.proxy.PLAN_CHECK_MAX_ATTEMPTS", 2), \
+        with patch.object(live_service.browser_cfg, "LIVENESS_IMPERSONATE", "chrome124"), \
+             patch("config.proxy.PLAN_CHECK_MAX_ATTEMPTS", 2), \
              patch.object(live_service, "_QUEUE_SLOTS", slot), \
              patch.object(live_service.db, "mark_account_live_check_running", return_value=True), \
              patch.object(live_service.db, "get_account", return_value={"email_source": "remail"}), \
@@ -476,6 +510,8 @@ class AccountLivenessTests(unittest.TestCase):
             check.call_args_list[0].kwargs["proxy"],
             check.call_args_list[1].kwargs["proxy"],
         )
+        self.assertTrue(all(call.kwargs["transport_impersonate"] == "chrome124"
+                            for call in check.call_args_list))
         self.assertTrue(slot.released)
 
     def test_service_switches_to_an_unused_dynamic_gateway_before_same_template_retry(self):
@@ -489,7 +525,8 @@ class AccountLivenessTests(unittest.TestCase):
             selected = str(explicit_proxy or "").strip()
             return {"proxy": selected, "network_route": "proxy" if selected else "direct"}
 
-        with patch.object(live_service, "_QUEUE_SLOTS", slot), \
+        with patch.object(live_service.browser_cfg, "LIVENESS_IMPERSONATE", "chrome124"), \
+             patch.object(live_service, "_QUEUE_SLOTS", slot), \
              patch.object(live_service.db, "mark_account_live_check_running", return_value=True), \
              patch.object(live_service.db, "get_account", return_value={"email_source": "remail"}), \
              patch.object(live_service.db, "update_account_liveness"), \
@@ -505,6 +542,8 @@ class AccountLivenessTests(unittest.TestCase):
         self.assertTrue(result["ok"])
         self.assertIn("us.1024proxy.io", check.call_args_list[0].kwargs["proxy"])
         self.assertIn("de.1024proxy.com", check.call_args_list[1].kwargs["proxy"])
+        self.assertTrue(all(call.kwargs["transport_impersonate"] == "chrome124"
+                            for call in check.call_args_list))
         self.assertTrue(slot.released)
 
     def test_service_keeps_existing_sticky_route_fallback_behavior(self):
@@ -526,7 +565,8 @@ class AccountLivenessTests(unittest.TestCase):
                 "proxy_fallback_reason": None,
             }
 
-        with patch.object(live_service, "_QUEUE_SLOTS", slot), \
+        with patch.object(live_service.browser_cfg, "LIVENESS_IMPERSONATE", "chrome124"), \
+             patch.object(live_service, "_QUEUE_SLOTS", slot), \
              patch.object(live_service.db, "mark_account_live_check_running", return_value=True), \
              patch.object(live_service.db, "get_account", return_value={"email_source": "remail"}), \
              patch.object(live_service.db, "update_account_liveness"), \
@@ -542,6 +582,8 @@ class AccountLivenessTests(unittest.TestCase):
         self.assertEqual(check.call_args_list[0].kwargs["proxy"], sticky)
         self.assertEqual(check.call_args_list[1].kwargs["proxy"], "")
         self.assertEqual(len(check.call_args_list), 2)
+        self.assertTrue(all(call.kwargs["transport_impersonate"] == "chrome124"
+                            for call in check.call_args_list))
         self.assertFalse(any("保留网关模板并创建新的会话" in str(line) for line in logged))
         self.assertTrue(slot.released)
 
@@ -549,7 +591,8 @@ class AccountLivenessTests(unittest.TestCase):
         slot = _DummyQueueSlot()
         failed = {"ok": False, "status": "deactivated", "error": "account_deactivated"}
         gateway = "http://user:pass@us.1024proxy.io:8080"
-        with patch.object(live_service, "_QUEUE_SLOTS", slot), \
+        with patch.object(live_service.browser_cfg, "LIVENESS_IMPERSONATE", "chrome124"), \
+             patch.object(live_service, "_QUEUE_SLOTS", slot), \
              patch.object(live_service.db, "mark_account_live_check_running", return_value=True), \
              patch.object(live_service.db, "get_account", return_value={"email_source": "remail"}), \
              patch.object(live_service.db, "update_account_liveness"), \
@@ -563,6 +606,7 @@ class AccountLivenessTests(unittest.TestCase):
 
         self.assertEqual(result["status"], "deactivated")
         check.assert_called_once()
+        self.assertEqual(check.call_args.kwargs["transport_impersonate"], "chrome124")
         self.assertTrue(slot.released)
 
     def test_definitive_account_error_in_403_text_does_not_retry(self):

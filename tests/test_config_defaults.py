@@ -6,23 +6,29 @@ from contextlib import contextmanager
 from pathlib import Path
 from unittest.mock import patch
 
+import config as config_pkg
 from config import env_loader
 from config import browser
 from webui import config_editor
 
 
 @contextmanager
-def _browser_source_defaults():
+def _browser_source_defaults(*, liveness_impersonate: str = ""):
     """测试源码默认值，不让开发机 .env 的显式 URL 覆盖影响断言。"""
     old_loaded = env_loader._LOADED
     try:
-        with patch.dict(os.environ, {"BROWSER_DATA_SAVER_BLOCKED_URL_PATTERNS": ""}, clear=False):
+        with patch.dict(os.environ, {
+            "BROWSER_DATA_SAVER_BLOCKED_URL_PATTERNS": "",
+            "LIVENESS_IMPERSONATE": liveness_impersonate,
+        }, clear=False):
             env_loader._LOADED = True
             importlib.reload(browser)
+            config_pkg._refresh_top_level_constants()
             yield
     finally:
         env_loader._LOADED = old_loaded
         importlib.reload(browser)
+        config_pkg._refresh_top_level_constants()
 
 
 class ConfigDefaultFallbackTests(unittest.TestCase):
@@ -142,10 +148,42 @@ class ConfigDefaultFallbackTests(unittest.TestCase):
         with _browser_source_defaults():
             self.assertEqual(browser.CHROME_MAJOR, "146")
             self.assertEqual(browser.IMPERSONATE, "chrome146")
+            self.assertEqual(browser.LIVENESS_IMPERSONATE, "chrome124")
             self.assertIn(f"Chrome/{browser.CHROME_FULL_VERSION}", browser.USER_AGENT)
             self.assertIn('"Google Chrome";v="146"', browser.SEC_CH_UA)
             session = requests.Session(impersonate=browser.IMPERSONATE)
             session.close()
+
+    def test_liveness_transport_env_accepts_only_fully_verified_profile(self):
+        with _browser_source_defaults(liveness_impersonate=" chrome124 "):
+            self.assertEqual(browser.LIVENESS_IMPERSONATE, "chrome124")
+            self.assertEqual(
+                browser.LIVENESS_IMPERSONATE_ALLOWED,
+                frozenset({"chrome124"}),
+            )
+
+    def test_unverified_or_invalid_liveness_transport_env_falls_back_to_chrome124(self):
+        for value in ("chrome131", "chrome146", "arbitrary-client"):
+            with self.subTest(value=value), _browser_source_defaults(liveness_impersonate=value):
+                self.assertEqual(browser.LIVENESS_IMPERSONATE, "chrome124")
+                self.assertEqual(browser.IMPERSONATE, "chrome146")
+
+    def test_reload_all_refreshes_validated_liveness_package_exports(self):
+        old_loaded = env_loader._LOADED
+        try:
+            with patch.dict(os.environ, {"LIVENESS_IMPERSONATE": "arbitrary-client"}, clear=False), \
+                 patch.object(config_pkg, "_RELOADABLE_SUBMODULES", ("config.browser",)), \
+                 patch.object(env_loader, "load_env", return_value=env_loader.env_path()):
+                env_loader._LOADED = True
+                self.assertEqual(config_pkg.reload_all(), ["config.browser"])
+                self.assertEqual(browser.LIVENESS_IMPERSONATE, "chrome124")
+                self.assertEqual(config_pkg.LIVENESS_IMPERSONATE, "chrome124")
+                self.assertEqual(config_pkg.LIVENESS_IMPERSONATE_ALLOWED, frozenset({"chrome124"}))
+                self.assertEqual(config_pkg.IMPERSONATE, "chrome146")
+        finally:
+            env_loader._LOADED = old_loaded
+            importlib.reload(browser)
+            config_pkg._refresh_top_level_constants()
 
 
 if __name__ == "__main__":

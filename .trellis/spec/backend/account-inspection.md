@@ -12,6 +12,8 @@ This workflow is distinct from the periodic Sub2API-401 and ChatGPT2API-401 sche
 
 For liveness network routing, a configured 1024Proxy dynamic gateway (`*.1024proxy.io`, `*.1024proxy.com`, or `*.1024proxy.net`) is treated as a reusable gateway template. Before each account route attempt, the worker derives a bounded opaque session suffix from a fresh in-memory run nonce, the normalized account email, gateway endpoint, and attempt number, then appends `-sid-<id>-t-10` to the raw proxy username. The nonce is never persisted, logged, or returned, so separate liveness jobs do not reuse a provider session while the URL passed to one `BrowserSession` remains stable. Existing `-sid-` usernames are preserved byte-for-byte and keep the prior route fallback behavior. A retryable network/HTTP 403 result starts the next attempt with a new suffix for an auto-derived template, including when the pool contains only one gateway; an existing sticky URL instead falls back as before. Definitive account states such as `account_deactivated` stop immediately. Direct mode and non-1024Proxy URLs are not transformed and retain their existing fallback behavior. Proxy credentials and generated session IDs are never placed in logs, API responses, persisted inspection state, or test fixtures; route output uses masked proxy summaries.
 
+Liveness uses a separate, bounded curl_cffi transport compatibility profile. `LIVENESS_IMPERSONATE` defaults to and accepts only `chrome124`, the sole profile verified through a complete previously failing account check. `chrome131` remains unverified because its complete `BrowserSession` probe timed out, and `chrome146` returned HTTP 403 through the target proxy; blank, unverified, or invalid values therefore resolve to `chrome124` before a curl session is created. This exception changes only TLS/HTTP transport impersonation for liveness. Global registration and other `BrowserSession` callers remain on `IMPERSONATE=chrome146`, and the Chrome 146 user-space User-Agent, Client Hints, Sentinel/JS profile, device IDs, cookies, and persisted fingerprint state are not rewritten by the override.
+
 ### 2. Signatures
 
 Proxy routing:
@@ -22,6 +24,21 @@ liveness_proxy_url(
     value: str, *, account_key: str, route_attempt: int,
     run_nonce: str | None = None,
 ) -> str
+```
+
+Transport and liveness:
+
+```python
+normalize_liveness_impersonate(value: object) -> str
+BrowserSession(
+    proxy: str | None = None, *, transport_impersonate: str | None = None, ...
+)
+check_account_liveness(
+    email: str, proxy: str | None = None, *, clear_log: bool = True,
+    email_source: str | None = None, fingerprint_state: dict | None = None,
+    on_authenticated: Callable | None = None,
+    transport_impersonate: str | None = None,
+) -> dict
 ```
 
 Service:
@@ -74,6 +91,8 @@ The modern and Legacy account lists share the same request-coalescing contract: 
 
 A liveness job creates one fresh, in-memory `run_nonce` and passes it to `liveness_proxy_url()` for each route attempt. The same derived proxy URL is reused for every request inside that attempt. A retryable 403/network result increments `route_attempt`, producing a different provider session without changing the configured gateway template. The nonce and generated session ID are never persisted. Synchronous `run_account_live_check()` does not own a queue semaphore slot; queued workers release exactly the slot acquired by `enqueue_account_live_check()`.
 
+Every route attempt passes the current validated `LIVENESS_IMPERSONATE` value to `check_account_liveness()`. That value reaches every `BrowserSession` created by both the initial reauth path and the clean full-web fallback path. `BrowserSession()` without the optional override remains backward compatible and uses global `IMPERSONATE`. The transport choice is runtime-only: it is not added to `fingerprint_state`, account records, liveness result payloads, logs, or browser profile summaries, and it does not mutate the persisted Chrome/JS/device profile.
+
 ### 4. Validation & Error Matrix
 
 | Condition | Required result |
@@ -95,6 +114,11 @@ A liveness job creates one fresh, in-memory `run_nonce` and passes it to `livene
 | Auto-derived 1024Proxy attempt returns retryable 403/network failure | Reuse the gateway template with a new provider session, bounded by `PLAN_CHECK_MAX_ATTEMPTS` |
 | Liveness result is definitive (`deactivated` or unusable-account evidence) | Stop immediately; do not rotate the proxy or retry |
 | Route is direct or not a recognized 1024Proxy gateway | Do not rewrite the proxy URL; retain existing route behavior |
+| `LIVENESS_IMPERSONATE` is absent or blank | Use `chrome124` |
+| `LIVENESS_IMPERSONATE` is `chrome124` | Pass that exact bounded value to every liveness `BrowserSession` |
+| `LIVENESS_IMPERSONATE` or a direct transport override is blank, unverified (`chrome131`/`chrome146`), or any other value | Fall back to `chrome124` before constructing `curl_cffi.Session` |
+| `BrowserSession` has no transport override | Use global `IMPERSONATE=chrome146` and retain existing behavior |
+| Liveness transport override is active | Change only TLS/HTTP impersonation; do not rewrite user-space browser/device/fingerprint state |
 
 ### 5. Good / Base / Bad Cases
 
@@ -110,6 +134,7 @@ A liveness job creates one fresh, in-memory `run_nonce` and passes it to `livene
 - API tests assert 202/400/404/409/503 behavior, signed 64-bit ID bounds, pagination bounds, authentication, and no-store/nosniff headers.
 - Template tests cover modern and Legacy controls, accessible history/failure dialogs, one in-flight list request, pending poll coalescing, and invalidation for success and uncertain outcomes of delete/archive/restore.
 - Liveness proxy tests assert provider-host boundary matching, byte-preserving encoded userinfo, cross-run freshness, per-attempt rotation, single-gateway retry, configured attempt limits, existing-sticky fallback, direct/non-provider preservation, definitive-failure stop, queue-slot ownership, and redaction in logs/results/session summaries.
+- Liveness transport tests assert the default `BrowserSession` still uses global `chrome146`, explicit `chrome124` reaches `curl_cffi.Session`, allowed environment overrides are bounded, invalid values fall back before curl construction, every service route attempt passes the configured profile, and clean full-web fallback preserves it without persisting transport state or exposing credentials/session IDs.
 - Quality gates include focused Python tests, both Node UI tests, inline JavaScript syntax checks, `py_compile`, `git diff --check`, and full discovery with any unrelated clean-HEAD failures reproduced explicitly.
 
 ### 7. Wrong vs Correct

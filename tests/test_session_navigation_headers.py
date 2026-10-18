@@ -3,10 +3,52 @@ import unittest
 from unittest.mock import patch
 
 from config.browser import build_browser_environment
+import core.session as session_module
 from core.session import BrowserSession
 
 
 class SessionNavigationHeaderTests(unittest.TestCase):
+    def test_default_browser_session_uses_global_transport_impersonate(self):
+        with patch.object(session_module, "Session") as factory:
+            session = BrowserSession(proxy="", detect_exit_geo=False)
+
+        factory.assert_called_once_with(impersonate="chrome146")
+        self.assertEqual(session.transport_impersonate, "chrome146")
+        self.assertEqual(session.browser_profile["chrome_major"], "146")
+        session.close()
+        factory.return_value.close.assert_called_once_with()
+
+    def test_explicit_transport_override_reaches_curl_session_only(self):
+        with patch.object(session_module, "Session") as factory:
+            session = BrowserSession(
+                proxy="",
+                detect_exit_geo=False,
+                transport_impersonate="chrome124",
+            )
+
+        factory.assert_called_once_with(impersonate="chrome124")
+        self.assertEqual(session.transport_impersonate, "chrome124")
+        self.assertEqual(session.browser_profile["chrome_major"], "146")
+        self.assertNotIn("transport_impersonate", session.browser_profile)
+        self.assertNotIn("transport_impersonate", session.fingerprint_summary())
+        self.assertNotIn("chrome124", session.fingerprint_summary_text())
+        self.assertEqual(session_module.IMPERSONATE, "chrome146")
+        session.close()
+        factory.return_value.close.assert_called_once_with()
+
+    def test_invalid_transport_override_falls_back_before_curl_session(self):
+        with patch.object(session_module, "Session") as factory:
+            session = BrowserSession(
+                proxy="",
+                detect_exit_geo=False,
+                transport_impersonate="invalid-profile",
+            )
+
+        factory.assert_called_once_with(impersonate="chrome124")
+        self.assertEqual(session.transport_impersonate, "chrome124")
+        session.close()
+        factory.return_value.close.assert_called_once_with()
+
     def test_vietnam_exit_uses_matching_locale_and_timezone(self):
         profile = build_browser_environment({
             "country": "VN",

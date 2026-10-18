@@ -6,6 +6,14 @@ import main
 
 
 class ProtocolPreflightSessionRotationTests(unittest.TestCase):
+    def test_registration_factory_uses_global_browser_transport_default(self):
+        session = object()
+        with patch.object(main, "BrowserSession", return_value=session) as create_session:
+            result = main._new_protocol_registration_session(None)
+
+        self.assertIs(result, session)
+        create_session.assert_called_once_with(proxy=None)
+
     def test_retryable_preflight_rebuilds_session_before_otp(self):
         first = object()
         second = object()
@@ -19,7 +27,6 @@ class ProtocolPreflightSessionRotationTests(unittest.TestCase):
         self.assertEqual(preflight.call_count, 2)
         create_session.assert_called_once_with(
             proxy=None,
-            transport_impersonate=main._browser_cfg.REGISTRATION_IMPERSONATE,
         )
         close_session.assert_called_once_with(first)
 
@@ -49,7 +56,6 @@ class ProtocolPreflightSessionRotationTests(unittest.TestCase):
         signin.assert_called_once_with(second, "csrf-token", "user@example.com")
         create_session.assert_called_once_with(
             proxy=None,
-            transport_impersonate=main._browser_cfg.REGISTRATION_IMPERSONATE,
         )
         close_session.assert_called_once_with(first)
 
@@ -82,7 +88,6 @@ class ProtocolPreflightSessionRotationTests(unittest.TestCase):
         self.assertEqual(follow.call_args_list[1].args, (second, "authorize-2"))
         create_session.assert_called_once_with(
             proxy=None,
-            transport_impersonate=main._browser_cfg.REGISTRATION_IMPERSONATE,
         )
         close_session.assert_called_once_with(first)
 
@@ -115,7 +120,6 @@ class ProtocolPreflightSessionRotationTests(unittest.TestCase):
         self.assertEqual(authorize.call_args_list[1].args[1:], ("", "user@example.com"))
         create_session.assert_called_once_with(
             proxy="",
-            transport_impersonate=main._browser_cfg.REGISTRATION_IMPERSONATE,
         )
         close_session.assert_called_once_with(first)
 
@@ -168,7 +172,6 @@ class ProtocolPreflightSessionRotationTests(unittest.TestCase):
         self.assertEqual(result, (second, "email-verification"))
         create_session.assert_called_once_with(
             proxy=None,
-            transport_impersonate=main._browser_cfg.REGISTRATION_IMPERSONATE,
             traffic_tracker=tracker,
         )
 
@@ -194,7 +197,6 @@ class ProtocolPreflightSessionRotationTests(unittest.TestCase):
         self.assertIs(result, second)
         create_session.assert_called_once_with(
             proxy=None,
-            transport_impersonate=main._browser_cfg.REGISTRATION_IMPERSONATE,
             traffic_tracker=tracker,
         )
 
@@ -231,7 +233,6 @@ class ProtocolPreflightSessionRotationTests(unittest.TestCase):
         self.assertIs(preflight.call_args_list[1].kwargs["traffic_tracker"], tracker)
         create_session.assert_called_once_with(
             proxy=None,
-            transport_impersonate=main._browser_cfg.REGISTRATION_IMPERSONATE,
             traffic_tracker=tracker,
         )
 
@@ -264,7 +265,6 @@ class ProtocolPreflightSessionRotationTests(unittest.TestCase):
         self.assertIs(start.call_args_list[1].kwargs["traffic_tracker"], tracker)
         create_session.assert_called_once_with(
             proxy=None,
-            transport_impersonate=main._browser_cfg.REGISTRATION_IMPERSONATE,
             traffic_tracker=tracker,
         )
 
@@ -297,7 +297,6 @@ class ProtocolPreflightSessionRotationTests(unittest.TestCase):
         self.assertIs(authorize.call_args_list[1].kwargs["traffic_tracker"], tracker)
         create_session.assert_called_once_with(
             proxy="",
-            transport_impersonate=main._browser_cfg.REGISTRATION_IMPERSONATE,
             traffic_tracker=tracker,
         )
 

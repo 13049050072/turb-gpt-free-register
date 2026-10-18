@@ -37,7 +37,7 @@ MAC_OS_UA_VERSION = "10_15_7"
 # 必须同步为 146；不能出现跨版本拼接指纹。
 IMPERSONATE = "chrome146"
 
-# 传输层兼容例外，供查活与协议注册共享。该值只选择 curl_cffi 的 TLS/HTTP impersonate，不能用于
+# 查活传输层兼容例外。该值只选择 curl_cffi 的 TLS/HTTP impersonate，不能用于
 # 改写 USER_AGENT、Client Hints、Sentinel/JS 画像或账号持久化的浏览器状态。
 # 允许值刻意保持为唯一完整查活链已验证的 chrome124。chrome131 目前只有
 # 浅层请求成功且完整 BrowserSession 超时，chrome146 已在目标代理上复现 403；
@@ -422,6 +422,3 @@ def validate_browser_profile(profile: dict) -> list[str]:
 # ---- .env overrides for WebUI editable fields ----
 apply_env_overrides(globals(), {'LIVENESS_IMPERSONATE': 'str', 'BROWSER_LOCALE_PROFILE': 'str', 'AUTO_BROWSER_LOCALE_FROM_IP': 'bool', 'IP_GEO_TIMEOUT': 'float', 'REJECT_CLOUD_PROXY': 'bool', 'BROWSER_DATA_SAVER_MODE': 'bool', 'BROWSER_DATA_SAVER_BLOCKED_PROXY_HOSTS': 'list_str_multiline', 'BROWSER_DATA_SAVER_DEEP_MODE': 'bool', 'BROWSER_DATA_SAVER_BLOCKED_RESOURCE_TYPES': 'list_str_multiline', 'BROWSER_DATA_SAVER_BLOCKED_URL_PATTERNS': 'list_str_multiline', 'BROWSER_TRAFFIC_DETAIL_LOG': 'bool', 'BROWSER_TRAFFIC_DETAIL_MAX_ENTRIES': 'int', 'BROWSER_JS_COVERAGE_LOG': 'bool', 'BROWSER_JS_COVERAGE_MAX_ENTRIES': 'int'})
 LIVENESS_IMPERSONATE = normalize_liveness_impersonate(LIVENESS_IMPERSONATE)
-# Protocol registration shares the fully validated liveness transport profile.
-# This is an alias, not an independently configurable browser fingerprint.
-REGISTRATION_IMPERSONATE = LIVENESS_IMPERSONATE

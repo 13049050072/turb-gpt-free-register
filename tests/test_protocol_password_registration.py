@@ -164,10 +164,7 @@ class ProtocolPasswordRegistrationTests(unittest.TestCase):
 
         self.assertEqual(create_session.call_count, 2)
         for call in create_session.call_args_list:
-            self.assertEqual(
-                call.kwargs["transport_impersonate"],
-                main._browser_cfg.REGISTRATION_IMPERSONATE,
-            )
+            self.assertNotIn("transport_impersonate", call.kwargs)
             self.assertIsNotNone(call.kwargs.get("traffic_tracker"))
         self.assertEqual(saved["extra"]["registration_password"], "ValidPassword9!")
         self.assertLess(events.index("password_page"), events.index("register_user"))

@@ -11,8 +11,6 @@ from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from typing import Callable
 
 from config import REGISTER_EMAIL, REGISTER_NAME  # 这两个一般不在 WebUI 改
-# Read transport configuration through the module so config reloads stay visible.
-from config import browser as _browser_cfg
 # 可热改的，按模块属性方式读
 from config import twofa as _twofa_cfg
 from config import email as _email_cfg
@@ -68,11 +66,8 @@ def _new_protocol_registration_session(
     *,
     traffic_tracker: ProtocolTrafficTracker | None = None,
 ) -> BrowserSession:
-    """Create protocol registration sessions with the shared validated transport."""
-    kwargs = {
-        "proxy": proxy,
-        "transport_impersonate": _browser_cfg.REGISTRATION_IMPERSONATE,
-    }
+    """Create protocol registration sessions with the global transport default."""
+    kwargs = {"proxy": proxy}
     if traffic_tracker is not None:
         kwargs["traffic_tracker"] = traffic_tracker
     return BrowserSession(**kwargs)

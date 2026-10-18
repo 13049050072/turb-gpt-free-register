@@ -118,7 +118,7 @@ class BrowserSession:
                              套餐查询等短请求可关闭，避免额外网络等待。
             transport_impersonate: 可选的 curl_cffi TLS/HTTP 传输画像覆盖。
                                    不传时继续使用全局 IMPERSONATE；覆盖值只接受
-                                   查活与协议注册共用的传输兼容白名单，且不修改 browser_profile。
+                                   查活传输兼容白名单，且不修改 browser_profile。
             traffic_tracker: 可选的单调用方流量观测器；不传时保持原有行为。
         """
         # The observer is installed before constructor-time GeoIP traffic.

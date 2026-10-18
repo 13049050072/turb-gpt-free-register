@@ -9,6 +9,7 @@ from unittest.mock import patch
 import config as config_pkg
 from config import env_loader
 from config import browser
+from config import openai_protocol
 from webui import config_editor
 
 
@@ -28,6 +29,21 @@ def _browser_source_defaults(*, liveness_impersonate: str = ""):
     finally:
         env_loader._LOADED = old_loaded
         importlib.reload(browser)
+        config_pkg._refresh_top_level_constants()
+
+
+@contextmanager
+def _protocol_source_defaults(*, auth_bootstrap_enabled: str = ""):
+    old_loaded = env_loader._LOADED
+    try:
+        with patch.dict(os.environ, {"CHATGPT_AUTH_BOOTSTRAP_ENABLED": auth_bootstrap_enabled}, clear=False):
+            env_loader._LOADED = True
+            importlib.reload(openai_protocol)
+            config_pkg._refresh_top_level_constants()
+            yield
+    finally:
+        env_loader._LOADED = old_loaded
+        importlib.reload(openai_protocol)
         config_pkg._refresh_top_level_constants()
 
 
@@ -126,6 +142,19 @@ class ConfigDefaultFallbackTests(unittest.TestCase):
         self.assertIn("BROWSER_TRAFFIC_DETAIL_MAX_ENTRIES: int = 2000", source)
         self.assertIn('BROWSER_TRAFFIC_DETAIL_LOG="False"', env_example)
         self.assertIn('BROWSER_TRAFFIC_DETAIL_MAX_ENTRIES="2000"', env_example)
+
+    def test_protocol_authenticated_bootstrap_defaults_off_and_supports_opt_in(self):
+        with _protocol_source_defaults():
+            self.assertFalse(openai_protocol.CHATGPT_AUTH_BOOTSTRAP_ENABLED)
+            self.assertFalse(config_pkg.CHATGPT_AUTH_BOOTSTRAP_ENABLED)
+            self.assertTrue(openai_protocol.CHATGPT_ANON_BOOTSTRAP_ENABLED)
+
+        with _protocol_source_defaults(auth_bootstrap_enabled="True"):
+            self.assertTrue(openai_protocol.CHATGPT_AUTH_BOOTSTRAP_ENABLED)
+            self.assertTrue(config_pkg.CHATGPT_AUTH_BOOTSTRAP_ENABLED)
+
+        env_example = Path(".env.example").read_text(encoding="utf-8")
+        self.assertIn('CHATGPT_AUTH_BOOTSTRAP_ENABLED="False"', env_example)
 
     def test_browser_data_saver_defaults_block_google_gsi(self):
         with _browser_source_defaults():

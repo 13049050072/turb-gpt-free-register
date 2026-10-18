@@ -46,7 +46,9 @@ SEND_SENTINEL_ON_EMAIL_OTP_VALIDATE = True
 
 # 是否补齐 HAR 中 ChatGPT Web 首屏 bootstrap 预热链路。
 CHATGPT_ANON_BOOTSTRAP_ENABLED = True
-CHATGPT_AUTH_BOOTSTRAP_ENABLED = True
+# 注册拿到 OAuth session 后的可选预热默认关闭，减少非注册必需请求。
+# 需要恢复旧流量行为时，可在 .env 中显式设为 True。
+CHATGPT_AUTH_BOOTSTRAP_ENABLED = False
 # True 时预热失败会中断主流程；默认 False，仅记录日志并继续。
 CHATGPT_BOOTSTRAP_STRICT = False
 
@@ -64,6 +66,7 @@ OPENAI_DIRECT_FALLBACK_ON_PROXY_FAILURE = False
 
 
 apply_env_overrides(globals(), {
+    "CHATGPT_AUTH_BOOTSTRAP_ENABLED": "bool",
     "OPENAI_PROXY_RETRY_MAX_ATTEMPTS": "int",
     "OPENAI_PROXY_RETRY_DELAY": "float",
     "OPENAI_PREFLIGHT_TIMEOUT": "float",

@@ -797,7 +797,7 @@ def run_registration(
                 email,
                 callback_referer="https://auth.openai.com/email-verification",
             )
-            if getattr(_protocol_cfg, "CHATGPT_AUTH_BOOTSTRAP_ENABLED", True):
+            if getattr(_protocol_cfg, "CHATGPT_AUTH_BOOTSTRAP_ENABLED", False):
                 from core.chatgpt_bootstrap import authenticated_bootstrap
                 authenticated_bootstrap(
                     session,
@@ -845,7 +845,7 @@ def run_registration(
 
             # 步骤13: 拉 /api/auth/session 提取 accessToken
             session_info, access_token = _finalize_registration_session(session, continue_url, email)
-            if getattr(_protocol_cfg, "CHATGPT_AUTH_BOOTSTRAP_ENABLED", True):
+            if getattr(_protocol_cfg, "CHATGPT_AUTH_BOOTSTRAP_ENABLED", False):
                 from core.chatgpt_bootstrap import authenticated_bootstrap
                 authenticated_bootstrap(
                     session,

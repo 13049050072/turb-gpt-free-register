@@ -268,7 +268,10 @@ class CredentialHealthSchedulerTests(unittest.TestCase):
         secret_error = (
             'Authorization: Bearer short-secret authorization=Basic c2hvcnQ= '
             '"access_token": "abc123" refresh_token=rt123 '
-            'callback=https://secret.example/cb?token=hidden'
+            'proxy=FAKE_PROXY_USER:FAKE_PROXY_PASS@proxy.example.test:8080 '
+            'upstream_proxy=FAKE_UPSTREAM_USER:FAKE_UPSTREAM_PASS@upstream.example.test:9000 '
+            'socks5://FAKE_SOCKS_USER:FAKE_SOCKS_PASS@socks.example.test:1080 '
+            'callback=https://secret.example/cb?token=hidden status=token expired'
         )
         self.scheduler._jobs["sub2api_401"] = lambda _run_id: InspectionResult(
             outcome="failed", failed=1, error=secret_error
@@ -277,8 +280,13 @@ class CredentialHealthSchedulerTests(unittest.TestCase):
         self.scheduler.run_due(self.now)
         self.executor.run()
         error = self.scheduler.state("sub2api_401")["error"]
-        for secret in ("short-secret", "c2hvcnQ=", "abc123", "rt123", "secret.example", "hidden"):
+        for secret in (
+            "short-secret", "c2hvcnQ=", "abc123", "rt123", "secret.example", "hidden",
+            "FAKE_PROXY_USER", "FAKE_PROXY_PASS", "FAKE_UPSTREAM_USER", "FAKE_UPSTREAM_PASS",
+            "FAKE_SOCKS_USER", "FAKE_SOCKS_PASS",
+        ):
             self.assertNotIn(secret, error)
+        self.assertIn("token expired", error)
         persisted = self.path.read_text(encoding="utf-8")
         self.assertNotIn("abc123", persisted)
         self.assertNotIn("short-secret", persisted)

@@ -583,6 +583,13 @@ def create_app(auth_code: str | None = None) -> Flask:
             return jsonify({"ok": False, "error": "账号不存在"}), 404
         return jsonify({"ok": True, "deleted": True})
 
+    @app.post("/api/accounts/delete-deactivated")
+    def api_accounts_delete_deactivated():
+        data = request.get_json(silent=True)
+        if not isinstance(data, dict) or data.get("archived") not in ("0", "only", "all"):
+            return jsonify({"ok": False, "error": "请指定 archived：0、only 或 all"}), 400
+        return jsonify({"ok": True, "deleted_count": db.delete_deactivated_accounts(data["archived"])})
+
     @app.post("/api/accounts/delete-bulk")
     def api_accounts_delete_bulk():
         """批量删除已注册账号记录。Body {account_ids: [...]} 或 {ids: [...]}。"""
@@ -907,6 +914,32 @@ def create_app(auth_code: str | None = None) -> Flask:
         except (ValueError, TypeError):
             return jsonify({"ok": False, "error": "page 必须为正整数且不能超出范围"}), 400
         return jsonify({"ok": True, **account_inspection_service.list_inspections(limit=20, offset=(page - 1) * 20)})
+
+    @app.get("/api/accounts/inspections/<int(signed=True):inspection_id>/failures")
+    def api_account_inspection_failures(inspection_id):
+        def response(payload, status):
+            result = make_response(jsonify(payload), status)
+            result.headers["Cache-Control"] = "no-store, max-age=0"
+            result.headers["Pragma"] = "no-cache"
+            result.headers["X-Content-Type-Options"] = "nosniff"
+            return result
+
+        if type(inspection_id) is not int or not 1 <= inspection_id <= 2**63 - 1:
+            return response({"ok": False, "error": "inspection_id 必须为正的 SQLite 64 位整数"}, 400)
+        try:
+            page = int(request.args.get("page", 1))
+            if not 1 <= page <= 1 + (2**63 - 1) // 20:
+                raise ValueError("page 超出范围")
+        except (ValueError, TypeError, OverflowError):
+            return response({"ok": False, "error": "page 必须为正整数且不能超出范围"}, 400)
+        try:
+            result = db.list_account_inspection_failures(inspection_id, limit=20, offset=(page - 1) * 20)
+        except Exception as exc:
+            logger.error("读取巡检失败详情异常: %s", type(exc).__name__)
+            return response({"ok": False, "error": "巡检失败详情暂时不可用"}, 503)
+        if result is None:
+            return response({"ok": False, "error": "巡检任务不存在"}, 404)
+        return response({"ok": True, **result}, 200)
 
     @app.post("/api/accounts/inspections")
     def api_start_account_inspection():

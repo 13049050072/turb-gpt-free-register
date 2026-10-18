@@ -45,7 +45,7 @@ def _check_live(account: dict, executor: ThreadPoolExecutor) -> dict:
         trigger="inspection", return_future=True, executor=executor,
     )
     if not queued.get("accepted"):
-        return {"ok": False, "error": queued.get("error") or "查活入队被拒绝"}
+        return {"ok": False, "status": "rejected", "error": queued.get("error") or "查活入队被拒绝"}
     return queued["future"].result()
 
 
@@ -65,24 +65,40 @@ def _run(run: dict) -> None:
     run["account_ids"] = account_ids
     run["total_count"] = len(account_ids)
     run.setdefault("skipped_count", 0)
+    run.setdefault("deactivated_skipped_count", 0)
     pending = iter(account_ids)
     claim_lock = threading.Lock()
     stats_lock = threading.Lock()
+    stopped = threading.Event()
 
-    def persist():
-        if not db.save_account_inspection(run):
+    def persist(failure=None):
+        saved = db.save_account_inspection(run, failure=failure) if failure is not None else db.save_account_inspection(run)
+        if not saved:
             raise InspectionStopped("巡检任务已结束或被中断")
 
-    def record(**counts):
+    def record(*, failure=None, **counts):
         with stats_lock:
+            previous = {key: run[key] for key in counts}
             for key, value in counts.items():
                 run[key] += value
-            persist()
+            try:
+                persist(failure)
+            except BaseException:
+                # 明细落库失败时不能让 finally 单独保存已经增加的失败计数。
+                run.update(previous)
+                raise
 
     def inspect_account(account_id, stage_executor):
         account = db.get_account(account_id)
         if account is None:
             record(skipped_count=1)
+            return
+        if str(account.get("live_check_status") or "").strip().lower() == "deactivated":
+            record(skipped_count=1, deactivated_skipped_count=1, failure=dict(
+                account_id=account_id, email=account.get("email", ""), status="deactivated_skipped",
+                error="账号已标记为已废，本次巡检跳过，不执行 AT 检查、查活及查套餐。"
+                      + ((" 原因：" + str(account["live_check_error"])) if account.get("live_check_error") else ""),
+            ))
             return
         invalid = token_needs_refresh(account.get("access_token", ""))
         record(checked_count=1, invalid_count=int(invalid))
@@ -90,23 +106,35 @@ def _run(run: dict) -> None:
             return
         try:
             live_result = _check_live(account, stage_executor)
-        except Exception:
+        except Exception as exc:
             logger.exception("巡检查活异常 account_id=%s", account_id)
-            live_result = {"ok": False}
+            live_result = {"ok": False, "status": "error", "error": f"{type(exc).__name__}: {str(exc)[:1500]}"}
         live_ok = bool(live_result.get("ok"))
         counts = {"live_success_count" if live_ok else "live_failed_count": 1}
         if live_ok:
             plan_ok = bool((live_result.get("plan_result") or {}).get("ok"))
             counts["plan_success_count" if plan_ok else "plan_failed_count"] = 1
-        record(**counts)
+        failure = None if live_ok else dict(
+            account_id=account_id, email=account.get("email", ""),
+            status=live_result.get("status") or "failed",
+            error=live_result.get("error") or "查活失败，未返回具体原因",
+        )
+        record(failure=failure, **counts)
 
     def worker(stage_executor):
         while True:
             with claim_lock:
+                if stopped.is_set():
+                    return
                 account_id = next(pending, None)
             if account_id is None:
                 return
-            inspect_account(account_id, stage_executor)
+            try:
+                inspect_account(account_id, stage_executor)
+            except BaseException:
+                # 一个 worker 发生存储/执行故障后，不应让其他 worker 继续领取整份清单。
+                stopped.set()
+                raise
 
     try:
         workers = validate_workers(run.get("workers", DEFAULT_WORKERS))

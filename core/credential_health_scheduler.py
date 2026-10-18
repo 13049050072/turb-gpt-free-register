@@ -5,7 +5,6 @@ from __future__ import annotations
 import copy
 import json
 import os
-import re
 import threading
 import uuid
 from concurrent.futures import Future, ThreadPoolExecutor
@@ -14,6 +13,8 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Callable, Mapping
 
+from core.error_redaction import redact_error
+
 JOB_NAMES = ("sub2api_401", "chatgpt2api_401")
 MIN_INTERVAL_MINUTES = 5
 MAX_INTERVAL_MINUTES = 1440
@@ -21,19 +22,6 @@ DEFAULT_INTERVAL_MINUTES = 30
 _ALLOWED_PHASES = {"disabled", "idle", "running", "waiting_for_queue", "interrupted"}
 _ALLOWED_OUTCOMES = {"", "success", "partial", "failed", "skipped_busy", "interrupted"}
 _PROGRESS_KEYS = ("detected", "actionable", "submitted", "completed", "failed", "skipped")
-_SECRET_NAME = (
-    r"access[_ -]?token|refresh[_ -]?token|id[_ -]?token|api[_ -]?key|password|secret|"
-    r"callback(?:_url)?|oauth[_ -]?code|authorization"
-)
-_QUOTED_SECRET_RE = re.compile(
-    rf"(?is)([\"']?(?:{_SECRET_NAME})[\"']?\s*[:=]\s*)([\"']).*?\2"
-)
-_UNQUOTED_SECRET_RE = re.compile(
-    rf"(?i)([\"']?(?:{_SECRET_NAME})[\"']?\s*[:=]\s*)(?:(?:bearer|basic)\s+)?[^\s,;]+"
-)
-_AUTH_SCHEME_RE = re.compile(r"(?i)\b(?:bearer|basic)\s+[^\s,;]+")
-_URL_RE = re.compile(r"https?://[^\s,;]+", re.I)
-_TOKENISH_RE = re.compile(r"(?<![A-Za-z0-9])[A-Za-z0-9_+/=-]{20,}(?:\.[A-Za-z0-9_+/=-]{8,})*")
 _REGISTRY_LOCK = threading.Lock()
 _REGISTRY: dict[str, "CredentialHealthScheduler"] = {}
 
@@ -87,13 +75,8 @@ def _bounded_count(value: object) -> int:
 
 
 def _safe_error(value: object) -> str:
-    text = " ".join(str(value or "").replace("\x00", " ").replace("\r", " ").replace("\n", " ").split())
-    text = _QUOTED_SECRET_RE.sub(r"\1\2[redacted]\2", text)
-    text = _UNQUOTED_SECRET_RE.sub(r"\1[redacted]", text)
-    text = _AUTH_SCHEME_RE.sub("authorization [redacted]", text)
-    text = _URL_RE.sub("[url-redacted]", text)
-    text = _TOKENISH_RE.sub("[token-redacted]", text)
-    return text[:500]
+    """Compatibility wrapper for existing scheduler callers and tests."""
+    return redact_error(value)
 
 
 def _state_registry_key(path: str | Path | None) -> str:

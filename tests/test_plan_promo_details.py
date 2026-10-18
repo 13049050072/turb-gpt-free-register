@@ -1,4 +1,5 @@
 import copy
+from contextlib import contextmanager
 import unittest
 from unittest.mock import patch
 
@@ -36,7 +37,10 @@ class PlanPromoDetailsTests(unittest.TestCase):
     def test_persistence_list_polling_and_failure_preservation(self):
         rows = [{"id": 1, "email": "test@example.test"}]
         result = self.parse({"go": {"id": "go-offer"}})
-        with patch.object(db, "_load_accounts", return_value=rows), patch.object(db, "_save_accounts"):
+        @contextmanager
+        def account_for_update(*args, **kwargs):
+            yield rows[0]
+        with patch.object(db, "_account_for_update", side_effect=account_for_update):
             db.update_account_plan_check(acc_id=1, result=result)
             self.assertEqual(rows[0]["eligible_promo_campaigns"], result["eligible_promo_campaigns"])
             self.assertEqual(_compact_account_for_list(rows[0])["eligible_promo_campaigns"], result["eligible_promo_campaigns"])

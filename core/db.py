@@ -10,10 +10,12 @@ import sqlite3
 import threading
 import time
 import uuid
-from contextlib import closing
+from contextlib import closing, contextmanager
 from datetime import datetime
 from pathlib import Path
 from typing import Any
+
+from core.error_redaction import redact_error as _redact_inspection_error
 
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 _DATA_DIR = _PROJECT_ROOT
@@ -40,6 +42,9 @@ _LEGACY_CODEX_EXPORT_STATE = _PROJECT_ROOT / "codex_导出状态.json"
 _SQLITE_PATH = _PROJECT_ROOT / "turb.sqlite3"
 _SQLITE_LOCK = threading.RLock()
 _SQLITE_READY = False
+# Keep the initialization connection reachable so setup failures can close it
+# immediately instead of relying on garbage collection.
+_SQLITE_INITIALIZING_CONN: sqlite3.Connection | None = None
 _TABLES = {
     "accounts": "accounts",
     "outlook": "email_pool",
@@ -77,10 +82,19 @@ def _sqlite_conn() -> sqlite3.Connection:
     """创建短生命周期连接；WAL 允许 WebUI 读与注册线程写并行。"""
     _ensure_storage()
     conn = sqlite3.connect(str(_active_sqlite_path()), timeout=30)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA busy_timeout=30000")
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA synchronous=NORMAL")
+    try:
+        conn.row_factory = sqlite3.Row
+        # SQLite 内置 LOWER 只处理 ASCII；保持历史 Python str.lower 的邮箱匹配语义。
+        conn.create_function("account_email_lower", 1, lambda value: str(value or "").lower(), deterministic=True)
+        conn.execute("PRAGMA busy_timeout=30000")
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=NORMAL")
+    except BaseException:
+        try:
+            conn.close()
+        except Exception:
+            pass
+        raise
     return conn
 
 
@@ -110,9 +124,29 @@ def _read_legacy_sqlite_collection(collection: str) -> list[dict] | None:
         return None
 
 
-def _ensure_sqlite() -> None:
+def _migrate_inspection_snapshots(conn: sqlite3.Connection) -> None:
+    """Upgrade legacy inspection payloads to immutable ID snapshots once."""
+    if conn.execute("SELECT 1 FROM storage_meta WHERE key='inspection_snapshots_v1'").fetchone():
+        return
+    for record in conn.execute("SELECT id,payload FROM account_inspections").fetchall():
+        run = json.loads(record["payload"])
+        if "account_ids" not in run:
+            continue
+        ids = run.pop("account_ids")
+        conn.execute(
+            "INSERT OR IGNORE INTO account_inspection_snapshots(inspection_id,account_ids) VALUES (?,?)",
+            (record["id"], json.dumps(ids)),
+        )
+        conn.execute(
+            "UPDATE account_inspections SET payload=? WHERE id=?",
+            (json.dumps(run, ensure_ascii=False), record["id"]),
+        )
+    conn.execute("INSERT INTO storage_meta(key,value) VALUES ('inspection_snapshots_v1',?)", (_now(),))
+
+
+def _ensure_sqlite_impl() -> None:
     """首次运行将现有 JSON 一次性导入 SQLite，之后 SQLite 为唯一读写源。"""
-    global _SQLITE_READY, _SQLITE_READY_PATH
+    global _SQLITE_READY, _SQLITE_READY_PATH, _SQLITE_INITIALIZING_CONN
     active_path = _active_sqlite_path()
     if _SQLITE_READY and _SQLITE_READY_PATH == active_path:
         return
@@ -121,6 +155,7 @@ def _ensure_sqlite() -> None:
         if _SQLITE_READY and _SQLITE_READY_PATH == active_path:
             return
         conn = _sqlite_conn()
+        _SQLITE_INITIALIZING_CONN = conn
         conn.executescript("""
             CREATE TABLE IF NOT EXISTS accounts (
                 id INTEGER NOT NULL,
@@ -151,6 +186,26 @@ def _ensure_sqlite() -> None:
                 email TEXT NOT NULL DEFAULT '', filename TEXT NOT NULL DEFAULT '',
                 created_at TEXT NOT NULL DEFAULT '', updated_at TEXT NOT NULL DEFAULT '',
                 payload TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS account_inspections (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                status TEXT NOT NULL,
+                payload TEXT NOT NULL
+            );
+            CREATE UNIQUE INDEX IF NOT EXISTS one_active_account_inspection
+                ON account_inspections ((1)) WHERE status IN ('queued', 'running');
+            CREATE TABLE IF NOT EXISTS account_inspection_snapshots (
+                inspection_id INTEGER PRIMARY KEY,
+                account_ids TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS account_inspection_failures (
+                inspection_id INTEGER NOT NULL,
+                account_id INTEGER NOT NULL,
+                email TEXT NOT NULL,
+                status TEXT NOT NULL,
+                error TEXT NOT NULL,
+                failed_at TEXT NOT NULL,
+                PRIMARY KEY (inspection_id, account_id)
             );
             CREATE TABLE IF NOT EXISTS account_pool_imports (
                 account_id INTEGER PRIMARY KEY,
@@ -187,6 +242,8 @@ def _ensure_sqlite() -> None:
         conn.execute("CREATE INDEX IF NOT EXISTS idx_codex_accounts_created ON codex_accounts(created_at DESC)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_codex_agent_accounts_email ON codex_agent_accounts(email COLLATE NOCASE)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_codex_agent_accounts_updated ON codex_agent_accounts(updated_at DESC)")
+        # The composite primary key already indexes this exact column order.
+        conn.execute("DROP INDEX IF EXISTS idx_account_inspection_failures_task")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_account_pool_imports_due ON account_pool_imports(status, next_attempt_at, updated_at)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_account_pool_imports_email ON account_pool_imports(email COLLATE NOCASE)")
         migration_done = conn.execute(
@@ -347,9 +404,28 @@ def _ensure_sqlite() -> None:
             conn.execute("INSERT OR REPLACE INTO storage_meta(key, value) VALUES('legacy_import_completed', ?)", (_now(),))
         _reserve_account_id_floor(conn, int(conn.execute("SELECT COALESCE(MAX(id), 0) FROM accounts").fetchone()[0]))
         conn.commit()
+        _migrate_inspection_snapshots(conn)
+        conn.commit()
         conn.close()
+        _SQLITE_INITIALIZING_CONN = None
         _SQLITE_READY = True
         _SQLITE_READY_PATH = active_path
+
+
+def _ensure_sqlite() -> None:
+    """Initialize SQLite and close a partially initialized connection on failure."""
+    global _SQLITE_INITIALIZING_CONN
+    try:
+        _ensure_sqlite_impl()
+    except BaseException:
+        conn = _SQLITE_INITIALIZING_CONN
+        _SQLITE_INITIALIZING_CONN = None
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+        raise
 
 
 def _load_collection(collection: str) -> list[dict]:
@@ -839,6 +915,59 @@ def _save_imap_emails(rows: list[dict]) -> None:
 def _load_accounts() -> list[dict]:
     return _load_collection("accounts")
 
+
+def _select_account(conn, acc_id: int | None = None, email: str | None = None) -> dict | None:
+    """按主键读取一行；兼容历史 ID / 邮箱 OR 匹配时的首个账号语义。"""
+    target_email = (email or "").lower()
+    if acc_id is not None and not target_email:
+        record = conn.execute("SELECT payload FROM accounts WHERE id=?", (int(acc_id),)).fetchone()
+    elif target_email:
+        record = conn.execute(
+            "SELECT payload FROM accounts WHERE id=? OR account_email_lower(email)=? ORDER BY id LIMIT 1",
+            (int(acc_id) if acc_id is not None else None, target_email),
+        ).fetchone()
+    else:
+        return None
+    return json.loads(record["payload"]) if record else None
+
+
+@contextmanager
+def _account_for_update(
+    acc_id: int | None = None,
+    email: str | None = None,
+    *,
+    fallback_to_legacy: bool = False,
+):
+    """调用方持有 _LOCK；只读改写目标行，不全量重写账号集合。
+
+    SQLite 事务覆盖领取校验与写回；异常自动回滚，不插入已删除账号。
+    """
+    _ensure_sqlite()
+    with closing(_sqlite_conn()) as conn, conn:
+        conn.execute("BEGIN IMMEDIATE")
+        row = _select_account(conn, acc_id, email)
+        legacy_rows = None
+        if row is None and fallback_to_legacy:
+            legacy_rows = _load_accounts()
+            target_email = str(email or "").lower()
+            row = next((candidate for candidate in legacy_rows if
+                        (acc_id is not None and int(candidate.get("id") or 0) == int(acc_id))
+                        or (target_email and str(candidate.get("email") or "").lower() == target_email)), None)
+        before = json.dumps(row, ensure_ascii=False)
+        yield row
+        if row is None or json.dumps(row, ensure_ascii=False) == before:
+            return
+        row["copy_line"] = _account_line(row)
+        if legacy_rows is not None:
+            conn.commit()
+            _save_accounts(legacy_rows)
+            return
+        conn.execute(
+            "UPDATE accounts SET email=?,status=?,archived=?,created_at=?,updated_at=?,payload=? WHERE id=?",
+            (str(row.get("email") or ""), str(row.get("status") or ""),
+             int(bool(row.get("archived"))), str(row.get("created_at") or row.get("imported_at") or ""),
+             str(row.get("updated_at") or ""), json.dumps(row, ensure_ascii=False), int(row["id"])),
+        )
 
 def _save_accounts(rows: list[dict]) -> None:
     for row in rows:
@@ -1443,18 +1572,10 @@ def claim_account_plan_check(
     acc_id: int | None = None,
     email: str | None = None,
     trigger: str = "manual",
-    *,
-    run_id: str | None = None,
+    *, run_id: str | None = None,
 ) -> bool:
     """原子占用账号的套餐查询；已有未超时查询时返回 False。"""
-    with _LOCK:
-        accounts = _load_accounts()
-        target_email = (email or "").lower()
-        row = next((
-            r for r in accounts
-            if (acc_id is not None and int(r.get("id") or 0) == int(acc_id))
-            or (target_email and (r.get("email") or "").lower() == target_email)
-        ), None)
+    with _LOCK, _account_for_update(acc_id, email) as row:
         if row is None:
             return False
 
@@ -1478,15 +1599,11 @@ def claim_account_plan_check(
         row["plan_check_completed_at"] = None
         row["plan_check_error"] = None
         row["updated_at"] = now
-        _save_accounts(accounts)
         return True
-
 
 def mark_account_plan_check_running(acc_id: int, *, run_id: str | None = None, expected_account: dict | None = None) -> bool:
     """把已排队的套餐查询标记为执行中。"""
-    with _LOCK:
-        accounts = _load_accounts()
-        row = next((r for r in accounts if int(r.get("id") or 0) == int(acc_id)), None)
+    with _LOCK, _account_for_update(acc_id) as row:
         if row is None or row.get("plan_check_status") not in {"queued", "running"}:
             return False
         if run_id is not None and row.get("plan_check_run_id") not in (None, run_id):
@@ -1495,16 +1612,13 @@ def mark_account_plan_check_running(acc_id: int, *, run_id: str | None = None, e
             row.update(plan_check_status="failed", plan_check_ok=False,
                        plan_check_error="账号邮箱/AT 已变更，旧套餐任务已取消",
                        plan_check_completed_at=_now(), updated_at=_now())
-            _save_accounts(accounts)
             return False
         row["plan_check_status"] = "running"
         row["plan_check_run_id"] = run_id
         row["plan_check_started_at"] = _now()
         row["plan_check_error"] = None
         row["updated_at"] = _now()
-        _save_accounts(accounts)
         return True
-
 
 def recover_interrupted_plan_checks() -> int:
     """服务启动时把上次进程遗留的内存队列状态恢复为可重试失败。"""
@@ -1543,26 +1657,19 @@ def _matches_check_snapshot(row: dict, expected: dict | None) -> bool:
 def update_account_plan_check(acc_id: int | None = None, email: str | None = None, result: dict | None = None, *, expected_account: dict | None = None, expected_run_id: str | None = None) -> bool:
     """更新账号套餐/Plus 试用资格查询结果。"""
     result = result or {}
-    with _LOCK:
-        accounts = _load_accounts()
-        target_email = (email or "").lower()
-        row = next((
-            r for r in accounts
-            if (acc_id is not None and int(r.get("id") or 0) == int(acc_id))
-            or (target_email and (r.get("email") or "").lower() == target_email)
-        ), None)
+    with _LOCK, _account_for_update(acc_id, email, fallback_to_legacy=True) as row:
         if row is None:
             return False
         if expected_run_id is not None:
-            allowed = {"running"} if result.get("ok") else {"queued", "running"}
-            if row.get("plan_check_run_id") != expected_run_id or row.get("plan_check_status") not in allowed:
+            allowed_statuses = {"running"} if result.get("ok") else {"queued", "running"}
+            if row.get("plan_check_run_id") != expected_run_id or row.get("plan_check_status") not in allowed_statuses:
                 return False
         if not _matches_check_snapshot(row, expected_account):
+            # 只结束自己占用的旧查询，不动后续任务，也不覆盖已有套餐权益。
             if expected_run_id is not None:
                 row.update(plan_check_status="failed", plan_check_ok=False,
                            plan_check_error="账号邮箱/AT 已变更，旧套餐结果已丢弃",
                            plan_check_completed_at=_now(), updated_at=_now())
-                _save_accounts(accounts)
             return False
 
         ok = bool(result.get("ok"))
@@ -1629,9 +1736,7 @@ def update_account_plan_check(acc_id: int | None = None, email: str | None = Non
                 row[key] = result[key]
         row["plan_check_result_json"] = json.dumps(result, ensure_ascii=False)
         row["updated_at"] = _now()
-        _save_accounts(accounts)
         return True
-
 
 def claim_account_extract(acc_id: int, trigger: str = "manual", link_type: str = "pix") -> bool:
     """原子占用账号提链任务；已有未超时任务时返回 False。"""
@@ -2033,13 +2138,23 @@ def list_accounts_page(
 
 def get_account(acc_id: int) -> dict | None:
     with _LOCK:
-        row = next((r for r in _load_accounts() if int(r.get("id") or 0) == int(acc_id)), None)
+        _ensure_sqlite()
+        with closing(_sqlite_conn()) as conn:
+            record = conn.execute("SELECT payload FROM accounts WHERE id=?", (int(acc_id),)).fetchone()
+            row = json.loads(record["payload"]) if record else None
         return _decorate_account(row) if row else None
 
 
 def get_account_by_email(email: str) -> dict | None:
     with _LOCK:
-        row = _find_by_email(_load_accounts(), email)
+        _ensure_sqlite()
+        with closing(_sqlite_conn()) as conn:
+            if not email:
+                record = conn.execute("SELECT payload FROM accounts WHERE email='' ORDER BY id LIMIT 1").fetchone()
+            else:
+                target = str(email).lower()
+                record = conn.execute("SELECT payload FROM accounts WHERE account_email_lower(email)=? ORDER BY id LIMIT 1", (target,)).fetchone()
+            row = json.loads(record["payload"]) if record else None
         return _decorate_account(row) if row else None
 
 
@@ -2326,9 +2441,7 @@ def recover_interrupted_email_changes() -> int:
 def update_account_liveness(acc_id: int, result: dict | None = None, *, expected_account: dict | None = None, expected_run_id: str | None = None) -> bool:
     """写回账号查活结果；成功时同步刷新最新 access_token 和账号基础信息。"""
     result = result or {}
-    with _LOCK:
-        rows = _load_accounts()
-        row = next((r for r in rows if int(r.get("id") or 0) == int(acc_id)), None)
+    with _LOCK, _account_for_update(acc_id) as row:
         if row is None:
             return False
         if expected_run_id is not None and (row.get("live_check_run_id") != expected_run_id
@@ -2338,7 +2451,6 @@ def update_account_liveness(acc_id: int, result: dict | None = None, *, expected
             if expected_run_id is not None:
                 row.update(live_check_status="failed", live_check_ok=False, live_checked_at=_now(),
                            live_check_error="账号邮箱/AT 已变更，旧查活结果已丢弃", updated_at=_now())
-                _save_accounts(rows)
             return False
 
         now = _now()
@@ -2354,6 +2466,7 @@ def update_account_liveness(acc_id: int, result: dict | None = None, *, expected
             token = str(result.get("access_token") or "").strip()
             if token:
                 row["access_token"] = token
+                # token 元数据属于当前 AT，不能等到套餐成功才清理旧 AT 的过期标记。
                 try:
                     from core.chatgpt_plan import token_claims
                     claims = token_claims(token)
@@ -2379,9 +2492,7 @@ def update_account_liveness(acc_id: int, result: dict | None = None, *, expected
             row["live_check_error"] = None
 
         row["copy_line"] = _account_line(row)
-        _save_accounts(rows)
         return True
-
 
 def claim_account_totp_setup(acc_id: int, trigger: str = "manual") -> bool:
     """原子占用账号 2FA 设置任务；已有未超时任务时返回 False。"""
@@ -2599,9 +2710,7 @@ def recover_interrupted_chatgpt_passwords() -> int:
 
 def claim_account_live_check(acc_id: int, trigger: str = "manual", *, run_id: str | None = None, expected_email: str | None = None) -> bool:
     """原子占用账号查活任务；已有 queued/running 时返回 False。"""
-    with _LOCK:
-        rows = _load_accounts()
-        row = next((r for r in rows if int(r.get("id") or 0) == int(acc_id)), None)
+    with _LOCK, _account_for_update(acc_id) as row:
         if row is None or (expected_email is not None
                            and str(row.get("email") or "").strip().lower() != expected_email.strip().lower()):
             return False
@@ -2624,9 +2733,7 @@ def claim_account_live_check(acc_id: int, trigger: str = "manual", *, run_id: st
         row["live_checked_at"] = None
         row["live_check_error"] = None
         row["updated_at"] = now
-        _save_accounts(rows)
         return True
-
 
 def recover_interrupted_live_checks() -> int:
     """服务启动时恢复上次进程中断的查活状态，避免 queued/running 卡死。"""
@@ -2650,9 +2757,7 @@ def recover_interrupted_live_checks() -> int:
 
 def mark_account_live_check_running(acc_id: int, *, run_id: str | None = None) -> bool:
     """把账号查活任务标记为运行中。"""
-    with _LOCK:
-        rows = _load_accounts()
-        row = next((r for r in rows if int(r.get("id") or 0) == int(acc_id)), None)
+    with _LOCK, _account_for_update(acc_id) as row:
         if row is None or row.get("live_check_status") not in {"queued", "running"}:
             return False
         if run_id is not None and row.get("live_check_run_id") != run_id:
@@ -2662,9 +2767,7 @@ def mark_account_live_check_running(acc_id: int, *, run_id: str | None = None) -
         row["live_check_started_at"] = now
         row["live_check_error"] = None
         row["updated_at"] = now
-        _save_accounts(rows)
         return True
-
 
 def update_accounts_note(account_ids: list[int] | None, note: str) -> tuple[list[dict], list[dict]]:
     """
@@ -2767,6 +2870,21 @@ def delete_account(acc_id: int | None = None, email: str | None = None) -> bool:
                 conn.executemany("DELETE FROM codex_agent_accounts WHERE account_id=?", [(x,) for x in deleted_ids])
                 conn.commit()
         return True
+
+
+def delete_deactivated_accounts(archived: str = "0") -> int:
+    """按归档范围删除已废账号及其 Agent 凭证，保持巡检历史。"""
+    if archived not in {"0", "only", "all"}:
+        raise ValueError("archived 必须为 0、only 或 all")
+    where = "lower(trim(COALESCE(json_extract(payload, '$.live_check_status'), ''))) = 'deactivated'"
+    params = ()
+    if archived != "all":
+        where += " AND archived=?"
+        params = (int(archived == "only"),)
+    with _LOCK, closing(_sqlite_conn()) as conn, conn:
+        conn.execute("BEGIN IMMEDIATE")
+        conn.execute("DELETE FROM codex_agent_accounts WHERE account_id IN (SELECT id FROM accounts WHERE " + where + ")", params)
+        return int(conn.execute("DELETE FROM accounts WHERE " + where, params).rowcount or 0)
 
 
 def delete_accounts(account_ids: list[int] | None = None, emails: list[str] | None = None) -> tuple[list[dict], list[dict]]:
@@ -4109,16 +4227,13 @@ def delete_domain_email(email: str) -> bool:
 # 巡检任务与账号业务状态分开持久化，唯一索引保证跨线程/进程启动防重。
 def _inspection_conn():
     _ensure_sqlite()
-    conn = _sqlite_conn()
-    conn.execute("""CREATE TABLE IF NOT EXISTS account_inspections (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        status TEXT NOT NULL,
-        payload TEXT NOT NULL
-    )""")
-    conn.execute("""CREATE UNIQUE INDEX IF NOT EXISTS one_active_account_inspection
-        ON account_inspections ((1)) WHERE status IN ('queued', 'running')""")
-    conn.commit()
-    return conn
+    return _sqlite_conn()
+
+
+def _inspection_payload(run):
+    payload = {k: v for k, v in run.items() if k != "account_ids"}
+    payload["error"] = _redact_inspection_error(payload.get("error") or "")
+    return json.dumps(payload, ensure_ascii=False)
 
 
 def create_account_inspection(account_ids: list[int] | None = None, workers: int = 3, archived: str = "0") -> tuple[dict, bool]:
@@ -4128,7 +4243,10 @@ def create_account_inspection(account_ids: list[int] | None = None, workers: int
         conn.execute("BEGIN IMMEDIATE")
         active = conn.execute("SELECT payload FROM account_inspections WHERE status IN ('queued','running')").fetchone()
         if active:
-            return json.loads(active[0]), False
+            existing = json.loads(active[0])
+            snapshot = conn.execute("SELECT account_ids FROM account_inspection_snapshots WHERE inspection_id=?", (existing["id"],)).fetchone()
+            existing["account_ids"] = json.loads(snapshot[0]) if snapshot else []
+            return existing, False
         if account_ids is None:
             # 与任务占用处于同一事务中，避免 OFFSET 分页遇到新增/归档/删除时漏账号。
             sql = "SELECT id FROM accounts"
@@ -4138,23 +4256,46 @@ def create_account_inspection(account_ids: list[int] | None = None, workers: int
                 params = (int(archived == "only"),)
             account_ids = [row[0] for row in conn.execute(sql + " ORDER BY id DESC", params)]
         run = dict(status="queued", workers=workers, archived=archived, created_at=_now(), finished_at=None,
-                   total_count=len(account_ids), checked_count=0, skipped_count=0, invalid_count=0,
-                   live_success_count=0, live_failed_count=0,
-                   plan_success_count=0, plan_failed_count=0, error="",
-                   account_ids=account_ids)
-        cursor = conn.execute("INSERT INTO account_inspections(status,payload) VALUES (?,?)", (run["status"], json.dumps(run)))
+                   total_count=len(account_ids), checked_count=0, skipped_count=0,
+                   deactivated_skipped_count=0, invalid_count=0, live_success_count=0,
+                   live_failed_count=0, plan_success_count=0, plan_failed_count=0, error="",
+                   failure_details_available=True, account_ids=account_ids)
+        cursor = conn.execute("INSERT INTO account_inspections(status,payload) VALUES (?,?)", (run["status"], _inspection_payload(run)))
         run["id"] = cursor.lastrowid
-        conn.execute("UPDATE account_inspections SET payload=? WHERE id=?", (json.dumps(run), run["id"]))
+        conn.execute("UPDATE account_inspections SET payload=? WHERE id=?", (_inspection_payload(run), run["id"]))
+        conn.execute("INSERT INTO account_inspection_snapshots(inspection_id,account_ids) VALUES (?,?)", (run["id"], json.dumps(account_ids)))
         return run, True
 
 
-def save_account_inspection(run: dict) -> bool:
-    # 终态不可覆盖，防止旧线程把已中断任务重新写为 running 或冲突新任务唯一索引。
+def save_account_inspection(run: dict, *, failure: dict | None = None) -> bool:
+    # 终态不可覆盖，且统计与失败明细在同一事务提交。
     with closing(_inspection_conn()) as conn, conn:
         cursor = conn.execute("""UPDATE account_inspections SET status=?,payload=?
                                  WHERE id=? AND status IN ('queued', 'running')""",
-                              (run["status"], json.dumps(run, ensure_ascii=False), run["id"]))
-        return cursor.rowcount == 1
+                              (run["status"], _inspection_payload(run), run["id"]))
+        saved = cursor.rowcount == 1
+        if saved and failure is not None:
+            conn.execute("""INSERT INTO account_inspection_failures
+                (inspection_id,account_id,email,status,error,failed_at) VALUES (?,?,?,?,?,?)
+                ON CONFLICT(inspection_id,account_id) DO NOTHING""",
+                (run["id"], int(failure["account_id"]), str(failure.get("email") or "")[:320],
+                 str(failure.get("status") or "failed")[:40], _redact_inspection_error(failure.get("error") or "查活失败，未返回具体原因"),
+                 str(failure.get("failed_at") or _now())))
+        return saved
+
+
+def list_account_inspection_failures(inspection_id: int, limit: int = 20, offset: int = 0) -> dict | None:
+    with closing(_inspection_conn()) as conn:
+        conn.execute("BEGIN")
+        task = conn.execute("SELECT payload FROM account_inspections WHERE id=?", (inspection_id,)).fetchone()
+        if task is None:
+            return None
+        run = json.loads(task[0])
+        items = conn.execute("SELECT account_id,email,status,error,failed_at FROM account_inspection_failures WHERE inspection_id=? ORDER BY account_id LIMIT ? OFFSET ?", (inspection_id, limit, offset)).fetchall()
+        total = conn.execute("SELECT COUNT(*) FROM account_inspection_failures WHERE inspection_id=?", (inspection_id,)).fetchone()[0]
+    return dict(task={k: v for k, v in run.items() if k != "account_ids"} | {"error": _redact_inspection_error(run.get("error") or "")},
+                items=[{**dict(row), "error": _redact_inspection_error(row["error"])} for row in items], total=total,
+                details_available=bool(run.get("failure_details_available")), limit=limit, offset=offset)
 
 
 def list_account_inspections(limit: int = 50, offset: int = 0) -> dict:
@@ -4164,17 +4305,23 @@ def list_account_inspections(limit: int = 50, offset: int = 0) -> dict:
         active = conn.execute("SELECT payload FROM account_inspections WHERE status IN ('queued','running')").fetchone()
         total = conn.execute("SELECT COUNT(*) FROM account_inspections").fetchone()[0]
     def public(payload):
-        return {k: v for k, v in json.loads(payload).items() if k != "account_ids"}
+        result = {k: v for k, v in json.loads(payload).items() if k != "account_ids"}
+        result["error"] = _redact_inspection_error(result.get("error") or "")
+        return result
     return dict(items=[public(r[0]) for r in rows], total=total,
                 active=public(active[0]) if active else None)
 
 
 def recover_interrupted_account_inspections(error: str = "WebUI 重启，巡检已中断；统计保留已完成部分") -> int:
     with closing(_inspection_conn()) as conn, conn:
+        # 没有待恢复任务时是纯读操作，不能为每次空闲轮询竞争 SQLite 写锁。
+        if not conn.execute("SELECT 1 FROM account_inspections WHERE status IN ('queued','running') LIMIT 1").fetchone():
+            return 0
         conn.execute("BEGIN IMMEDIATE")
+        # 加锁后重新读取，避免使用竞争写锁之前的旧快照。
         rows = conn.execute("SELECT payload FROM account_inspections WHERE status IN ('queued','running')").fetchall()
         for row in rows:
             run = json.loads(row[0])
             run.update(status="interrupted", finished_at=_now(), error=error)
-            conn.execute("UPDATE account_inspections SET status=?,payload=? WHERE id=?", (run["status"], json.dumps(run, ensure_ascii=False), run["id"]))
+            conn.execute("UPDATE account_inspections SET status=?,payload=? WHERE id=?", (run["status"], _inspection_payload(run), run["id"]))
         return len(rows)

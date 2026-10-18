@@ -2347,6 +2347,7 @@
           <button type="button" class="jobs-tb-btn jobs-tb-btn--good" id="btnCopySelectedLoginCredentialsV2" disabled title="把选中账号按“邮箱---密码（未设置时为未设置）---2FA密钥”格式复制到剪贴板">复制登录凭据</button>
           <button type="button" class="jobs-tb-btn" id="btnArchiveSelectedAccountsV2" disabled title="归档选中的账号；默认账号列表将不再查询/显示这些账号">归档选中</button>
           <button type="button" class="jobs-tb-btn jobs-tb-btn--danger" id="btnDeleteSelectedAccountsV2" disabled title="删除选中的本地账号/token记录">删除</button>
+          <button type="button" class="jobs-tb-btn jobs-tb-btn--danger" id="btnDeleteDeactivatedAccounts" onclick="deleteDeactivatedAccounts()" title="删除当前归档范围内全部已废账号，不限当前页；不受其他筛选影响">一键删除已废</button>
         </div>
         <div class="acc-v2-btn-group">
           <span class="acc-v2-btn-group-title">全部</span>
@@ -2908,7 +2909,10 @@ async function copyText(text) {
 }
 async function api(url, opts) {
   const r = await fetch(url, opts);
-  const j = await r.json().catch(()=>({}));
+  const j = await r.json().catch(error => {
+    if (opts?.signal?.aborted || error?.name === 'AbortError') throw error;
+    return {};
+  });
   if (!r.ok) throw new Error(j.error || ('HTTP '+r.status));
   return j;
 }
@@ -3359,6 +3363,8 @@ async function pollLog() {
 
 // ---------- 账号 ----------
 let accountsLoading = false;
+let accountsReloadPending = false;
+let accountsReloadInvalidated = false;
 let planStatusLoading = false;
 let planStatusRevision = '';
 function getAccountsQuery() {
@@ -3387,9 +3393,15 @@ function getAccountsPlanFilter() {
   if (SHOW_FREE_ACCOUNTS_ONLY) return 'free_no_trial';
   return '';
 }
-async function loadAccounts() {
-  if (accountsLoading) return;
+async function loadAccounts(options = {}) {
+  if (accountsLoading) {
+    accountsReloadPending = true;
+    accountsReloadInvalidated = accountsReloadInvalidated || !!options.invalidate;
+    return;
+  }
   accountsLoading = true;
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 30000);
   try {
     const archived = SHOW_ARCHIVED_ACCOUNTS ? 'only' : '0';
     const plan = getAccountsPlanFilter();
@@ -3399,14 +3411,25 @@ async function loadAccounts() {
     const dateFrom = document.getElementById('dateFromAccountsV2')?.value || '';
     const dateTo = document.getElementById('dateToAccountsV2')?.value || '';
     const p = PAGERS.accounts;
-    const res = await api(`/api/accounts?paged=1&page=${encodeURIComponent(p.page)}&page_size=${encodeURIComponent(p.size)}&archived=${encodeURIComponent(archived)}&plan=${encodeURIComponent(plan)}&codex_status=${encodeURIComponent(codex)}&totp_status=${encodeURIComponent(totp)}&q=${encodeURIComponent(q)}&date_from=${encodeURIComponent(dateFrom)}&date_to=${encodeURIComponent(dateTo)}`);
-    ACCOUNTS = res.items || [];
-    ACCOUNTS_TOTAL = Number(res.total || ACCOUNTS.length || 0);
-    const totalPages = Math.max(1, Math.ceil(ACCOUNTS_TOTAL / p.size));
-    if (p.page > totalPages) { p.page = totalPages; accountsLoading = false; return loadAccounts(); }
-    renderAccounts();
-  } catch(e) { showToast('加载账号失败: ' + e.message); }
-  finally { accountsLoading = false; }
+    const res = await api(`/api/accounts?paged=1&page=${encodeURIComponent(p.page)}&page_size=${encodeURIComponent(p.size)}&archived=${encodeURIComponent(archived)}&plan=${encodeURIComponent(plan)}&codex_status=${encodeURIComponent(codex)}&totp_status=${encodeURIComponent(totp)}&q=${encodeURIComponent(q)}&date_from=${encodeURIComponent(dateFrom)}&date_to=${encodeURIComponent(dateTo)}`, {signal: controller.signal});
+    if (!accountsReloadInvalidated) {
+      ACCOUNTS = res.items || [];
+      ACCOUNTS_TOTAL = Number(res.total || ACCOUNTS.length || 0);
+      const totalPages = Math.max(1, Math.ceil(ACCOUNTS_TOTAL / p.size));
+      if (p.page > totalPages) { p.page = totalPages; accountsReloadPending = true; return; }
+      renderAccounts();
+    }
+  } catch(e) {
+    if (!accountsReloadPending) showToast(controller.signal.aborted ? '加载账号超时，请重试' : '加载账号失败: ' + e.message);
+  } finally {
+    clearTimeout(timeout);
+    accountsLoading = false;
+    if (accountsReloadPending) {
+      accountsReloadPending = false;
+      accountsReloadInvalidated = false;
+      return loadAccounts();
+    }
+  }
 }
 async function pollAccountPlanStatuses() {
   if (planStatusLoading || accountsLoading) return;
@@ -5091,9 +5114,10 @@ async function deleteAccount(id, email, btn) {
     await api(`/api/accounts/${id}/delete`, { method:'POST', headers:{'Content-Type':'application/json'}, body: '{}' });
     ACCOUNT_SELECTED.delete(Number(id));
     showToast('账号已删除');
-    loadAccounts(); loadSummary();
+    loadAccounts({invalidate:true}); loadSummary();
   } catch(err) {
     showToast('删除失败: ' + err.message);
+    loadAccounts({invalidate:true});
     btn.disabled = false;
   }
 }
@@ -5114,9 +5138,10 @@ async function archiveOneAccount(id, archived, btn) {
     });
     ACCOUNT_SELECTED.delete(Number(id));
     showToast(archived ? '账号已归档' : '账号已恢复');
-    loadAccounts(); loadSummary();
+    loadAccounts({invalidate:true}); loadSummary();
   } catch(err) {
     showToast(`${action}失败: ` + err.message);
+    loadAccounts({invalidate:true});
     btn.disabled = false;
     btn.textContent = old;
   }
@@ -5141,9 +5166,10 @@ async function archiveSelectedAccounts() {
     (r.updated || []).forEach(item => ACCOUNT_SELECTED.delete(Number(item.id)));
     const skippedCount = (r.skipped || []).length;
     showToast(skippedCount ? `已${action} ${r.updated_count || 0} 个，跳过 ${skippedCount} 个` : `已${action} ${r.updated_count || 0} 个`);
-    loadAccounts(); loadSummary();
+    loadAccounts({invalidate:true}); loadSummary();
   } catch(err) {
     showToast(`批量${action}失败: ` + err.message);
+    loadAccounts({invalidate:true});
     updateAccountSelectionUi();
   } finally {
     btn.textContent = old;
@@ -5164,9 +5190,10 @@ async function deleteSelectedAccounts() {
     (r.deleted || []).forEach(item => ACCOUNT_SELECTED.delete(Number(item.id)));
     const skippedCount = (r.skipped || []).length;
     showToast(skippedCount ? `已删除 ${r.deleted_count || 0} 个，跳过 ${skippedCount} 个` : `已删除 ${r.deleted_count || 0} 个`);
-    loadAccounts(); loadSummary();
+    loadAccounts({invalidate:true}); loadSummary();
   } catch(err) {
     showToast('批量删除失败: ' + err.message);
+    loadAccounts({invalidate:true});
     updateAccountSelectionUi();
   }
 }

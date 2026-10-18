@@ -16,6 +16,7 @@ import json
 import os
 import threading
 import time
+from decimal import Decimal, InvalidOperation
 import uuid
 from urllib.parse import urlparse
 
@@ -39,6 +40,19 @@ from webui import config_editor
 logger = logging.getLogger(__name__)
 
 _POOL_SOURCE_VALUES = frozenset(("all", "outlook", "generic_api", "imap", "cloudflare_domain"))
+_ACCOUNT_TRAFFIC_REQUIRED_INT_FIELDS = (
+    "total_bytes",
+    "upload_bytes",
+    "download_bytes",
+    "request_count",
+    "http_error_count",
+    "transport_error_count",
+)
+_ACCOUNT_TRAFFIC_OPTIONAL_INT_FIELDS = (
+    "unknown_size_request_count",
+    "incomplete_size_request_count",
+)
+_ACCOUNT_TRAFFIC_MAX_SAFE_NUMBER = 9_007_199_254_740_991
 
 
 def _pool_source_arg(default: str = "outlook") -> str:
@@ -88,6 +102,48 @@ def _paginate_items(items: list[dict], *, page: int, page_size: int) -> dict:
     }
 
 
+def _account_traffic_number(value: object, *, integer: bool) -> int | float | None:
+    """Coerce one persisted aggregate without returning attacker-controlled text."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, str):
+        value = value.strip()
+        if not value or len(value) > 64:
+            return None
+    try:
+        number = Decimal(str(value))
+    except (InvalidOperation, TypeError, ValueError):
+        return None
+    if not number.is_finite() or number < 0 or number > _ACCOUNT_TRAFFIC_MAX_SAFE_NUMBER:
+        return None
+    if integer:
+        if number != number.to_integral_value():
+            return None
+        return int(number)
+    return float(number)
+
+
+def _compact_account_traffic(value: object) -> dict | None:
+    """Return only the aggregate traffic fields used by the account table."""
+    if not isinstance(value, dict) or value.get("available") is not True:
+        return None
+    out: dict[str, bool | int | float] = {"available": True}
+    for key in _ACCOUNT_TRAFFIC_REQUIRED_INT_FIELDS:
+        number = _account_traffic_number(value.get(key), integer=True)
+        if number is None:
+            return None
+        out[key] = number
+    elapsed = _account_traffic_number(value.get("request_elapsed_seconds"), integer=False)
+    if elapsed is None:
+        return None
+    out["request_elapsed_seconds"] = elapsed
+    for key in _ACCOUNT_TRAFFIC_OPTIONAL_INT_FIELDS:
+        number = _account_traffic_number(value.get(key), integer=True)
+        if number is not None:
+            out[key] = number
+    return out
+
+
 def _compact_account_for_list(row: dict) -> dict:
     """账号列表轻量对象：只返回当前表格渲染和按钮判断必需字段。
 
@@ -113,6 +169,8 @@ def _compact_account_for_list(row: dict) -> dict:
             extra = {}
     elif isinstance(extra_raw, dict):
         extra = extra_raw
+    if not isinstance(extra, dict):
+        extra = {}
     password = str(
         extra.get("registration_password")
         or row.get("registration_password")
@@ -120,6 +178,9 @@ def _compact_account_for_list(row: dict) -> dict:
     ).strip()
     if password:
         out["password"] = password
+    traffic = _compact_account_traffic(extra.get("network_traffic"))
+    if traffic is not None:
+        out["network_traffic"] = traffic
 
     # 这些是列表固定列直接展示字段。
     for key in (

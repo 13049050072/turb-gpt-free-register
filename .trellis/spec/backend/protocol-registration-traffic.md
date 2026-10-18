@@ -53,6 +53,12 @@ The bounded aggregate is stored under `result["network_traffic"]`, registration-
 
 Telemetry is observational. Initialization, extraction, freeze, or logging failures return an unavailable summary or omit one observation, but never replace a registration response or exception and never alter proxy, cookie, fingerprint, retry, circuit-breaker, email recovery, or account-persistence behavior.
 
+### Account-list projection
+
+The paged account-list API reads the persisted aggregate from account `extra_json["network_traffic"]` and exposes a separate compact projection. That projection requires `available=true` plus finite, non-negative numeric `total_bytes`, `upload_bytes`, `download_bytes`, `request_count`, `request_elapsed_seconds`, `http_error_count`, and `transport_error_count`. It may additionally expose finite, non-negative `unknown_size_request_count` and `incomplete_size_request_count`. Integer counters and byte fields must remain integers within the JavaScript safe-integer range; numeric strings may be coerced to numbers. Missing, unavailable, non-object, non-finite, negative, oversized, or otherwise malformed required values omit the whole projection, so old rows render `-`.
+
+This is a fixed allowlist. Request details, URLs, arbitrary account extras, headers, bodies, credentials, tokens, exception text, and every other traffic field must not enter the compact account response. The V2 and Legacy account tables render the column immediately after the plan: total bytes on the main line, upload/download bytes on the subline, and request count, elapsed time, HTTP/transport failures, plus present unknown/incomplete counts in a numeric-only tooltip. Registration-job traffic rendering remains unchanged.
+
 ### Detail and confidentiality
 
 `BROWSER_TRAFFIC_DETAIL_LOG` controls optional request rows for both browser traffic and protocol registration. Aggregate accounting remains active when this option is false. `BROWSER_TRAFFIC_DETAIL_MAX_ENTRIES` is normalized to `1..10000` and enforced during collection; aggregate counters continue after the detail cap. Detail rows are emitted to the task log only and are not persisted in `network_traffic`.
@@ -90,7 +96,8 @@ Protocol detail URLs contain only a validated `http`/`https` scheme, host, and b
 - `tests/test_protocol_password_registration.py`: success aggregate persistence and freeze-before-2FA behavior.
 - `tests/test_protocol_traffic_integration.py`: constructor/ordinary failure summaries, registration-job success/failure persistence, unavailable-summary fallback, and non-protocol driver isolation.
 - `tests/test_config_defaults.py`: existing detail defaults and limits remain unchanged.
-- Quality gates: focused tests, related registration/session regressions, full discovery compared with clean HEAD, `py_compile`, `compileall`, and `git diff --check`.
+- `tests/test_webui_account_traffic.py`: compact account-list allowlist, numeric coercion/malformed persistence handling, absent/unavailable omission, V2/Legacy column placement, numeric-only rendering, tooltip contents, and unavailable-row fallback.
+- Quality gates: focused tests, related WebUI and registration/session regressions, both templates extracted for `node --check`, full discovery compared with clean HEAD when required, `py_compile`, `compileall`, and `git diff --check`.
 
 ## 7. Wrong vs Correct
 

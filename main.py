@@ -11,6 +11,8 @@ from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from typing import Callable
 
 from config import REGISTER_EMAIL, REGISTER_NAME  # 这两个一般不在 WebUI 改
+# Read transport configuration through the module so config reloads stay visible.
+from config import browser as _browser_cfg
 # 可热改的，按模块属性方式读
 from config import twofa as _twofa_cfg
 from config import email as _email_cfg
@@ -58,6 +60,14 @@ logger = logging.getLogger(__name__)
 
 _FINALIZE_SESSION_MAX_ATTEMPTS = 5
 _FINALIZE_SESSION_BACKOFF_BASE = 2.0
+
+
+def _new_protocol_registration_session(proxy: str | None) -> BrowserSession:
+    """Create protocol registration sessions with the shared validated transport."""
+    return BrowserSession(
+        proxy=proxy,
+        transport_impersonate=_browser_cfg.REGISTRATION_IMPERSONATE,
+    )
 
 
 def _reset_retryable_session_circuit(session: BrowserSession) -> None:
@@ -111,7 +121,7 @@ def _network_preflight_with_session_rotation(
                 close_browser_session(session)
             except Exception:
                 logger.debug("[预检] 关闭失败会话时出现异常", exc_info=True)
-            session = BrowserSession(proxy=requested_proxy)
+            session = _new_protocol_registration_session(requested_proxy)
     raise RuntimeError("网络预检重试耗尽但无异常记录")
 
 
@@ -171,7 +181,7 @@ def _start_chatgpt_auth_with_session_rotation(
                 close_browser_session(session)
             except Exception:
                 logger.debug("[认证] 关闭失败会话时出现异常", exc_info=True)
-            session = BrowserSession(proxy=requested_proxy)
+            session = _new_protocol_registration_session(requested_proxy)
     raise RuntimeError("OTP 前认证链路重试耗尽但无异常记录")
 
 
@@ -223,7 +233,7 @@ def _run_pre_otp_authorization_with_session_rotation(
             except Exception:
                 logger.debug("[认证] 关闭失败会话时出现异常", exc_info=True)
             try:
-                session = BrowserSession(proxy=requested_proxy)
+                session = _new_protocol_registration_session(requested_proxy)
             except Exception as reopen_exc:
                 if attempt >= max_attempts or not _is_retryable_authorize_error(reopen_exc):
                     raise
@@ -263,7 +273,7 @@ def _run_pre_otp_authorization_with_direct_fallback(
             close_browser_session(session)
         except Exception:
             logger.debug("[认证] 关闭代理会话时出现异常", exc_info=True)
-        direct_session = BrowserSession(proxy="")
+        direct_session = _new_protocol_registration_session(proxy="")
         return _run_pre_otp_authorization_with_session_rotation(
             direct_session,
             "",
@@ -488,7 +498,7 @@ def run_registration(
             on_email_acquired(email)
 
     # 创建浏览器会话（proxy=None 时自动从 config.PROXY_POOL 随机抽一个）
-    session = BrowserSession(proxy=proxy)
+    session = _new_protocol_registration_session(proxy)
 
     # 从代理 URL 中抽取 sid 段做日志，避免把账号密码完整打印
     proxy_label = "无"

@@ -60,9 +60,10 @@ class ProtocolPasswordRegistrationTests(unittest.TestCase):
             saved.update(kwargs)
             return 42
 
+        session_factory = patch.object(main, "BrowserSession", return_value=session)
         patches = [
             patch.object(main._roxy_cfg, "REGISTRATION_DRIVER", "protocol"),
-            patch.object(main, "BrowserSession", return_value=session),
+            session_factory,
             patch.object(main, "close_browser_session"),
             patch.object(main, "_run_pre_otp_authorization_with_direct_fallback", side_effect=authorize),
             patch.object(main, "navigate_create_account_password", side_effect=password_page),
@@ -91,7 +92,9 @@ class ProtocolPasswordRegistrationTests(unittest.TestCase):
 
         with ExitStack() as stack:
             for item in patches:
-                stack.enter_context(item)
+                active_patch = stack.enter_context(item)
+                if item is session_factory:
+                    create_session = active_patch
             result = main.run_registration(
                 email="user@example.com",
                 name="Test User",
@@ -99,6 +102,10 @@ class ProtocolPasswordRegistrationTests(unittest.TestCase):
             )
 
         self.assertTrue(result["success"])
+        create_session.assert_called_once_with(
+            proxy=None,
+            transport_impersonate=main._browser_cfg.REGISTRATION_IMPERSONATE,
+        )
         self.assertEqual(saved["extra"]["registration_password"], "ValidPassword9!")
         self.assertLess(events.index("password_page"), events.index("register_user"))
         self.assertLess(events.index("register_user"), events.index("otp_send"))

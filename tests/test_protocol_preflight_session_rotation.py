@@ -17,7 +17,10 @@ class ProtocolPreflightSessionRotationTests(unittest.TestCase):
 
         self.assertIs(result, second)
         self.assertEqual(preflight.call_count, 2)
-        create_session.assert_called_once_with(proxy=None)
+        create_session.assert_called_once_with(
+            proxy=None,
+            transport_impersonate=main._browser_cfg.REGISTRATION_IMPERSONATE,
+        )
         close_session.assert_called_once_with(first)
 
     def test_csrf_403_restarts_the_complete_pre_otp_chain(self):
@@ -44,7 +47,10 @@ class ProtocolPreflightSessionRotationTests(unittest.TestCase):
         self.assertEqual(providers.call_count, 2)
         self.assertEqual(csrf.call_count, 2)
         signin.assert_called_once_with(second, "csrf-token", "user@example.com")
-        create_session.assert_called_once_with(proxy=None)
+        create_session.assert_called_once_with(
+            proxy=None,
+            transport_impersonate=main._browser_cfg.REGISTRATION_IMPERSONATE,
+        )
         close_session.assert_called_once_with(first)
 
     def test_authorize_403_restarts_the_complete_pre_otp_chain(self):
@@ -74,7 +80,10 @@ class ProtocolPreflightSessionRotationTests(unittest.TestCase):
         self.assertEqual(start.call_args_list[1].kwargs, {"max_attempts": 1})
         self.assertEqual(follow.call_args_list[0].args, (first, "authorize-1"))
         self.assertEqual(follow.call_args_list[1].args, (second, "authorize-2"))
-        create_session.assert_called_once_with(proxy=None)
+        create_session.assert_called_once_with(
+            proxy=None,
+            transport_impersonate=main._browser_cfg.REGISTRATION_IMPERSONATE,
+        )
         close_session.assert_called_once_with(first)
 
     def test_proxy_failure_can_fall_back_to_direct_before_otp(self):
@@ -104,7 +113,10 @@ class ProtocolPreflightSessionRotationTests(unittest.TestCase):
         self.assertEqual(result, (direct, final_url))
         self.assertEqual(authorize.call_args_list[0].args, (first, None, "user@example.com"))
         self.assertEqual(authorize.call_args_list[1].args[1:], ("", "user@example.com"))
-        create_session.assert_called_once_with(proxy="")
+        create_session.assert_called_once_with(
+            proxy="",
+            transport_impersonate=main._browser_cfg.REGISTRATION_IMPERSONATE,
+        )
         close_session.assert_called_once_with(first)
 
     def test_explicit_proxy_does_not_fall_back_to_direct(self):
@@ -127,6 +139,35 @@ class ProtocolPreflightSessionRotationTests(unittest.TestCase):
 
         authorize.assert_called_once_with(first, "http://proxy.example:8080", "user@example.com")
         create_session.assert_not_called()
+
+    def test_retryable_reopen_error_uses_shared_transport(self):
+        first = object()
+        second = object()
+
+        with patch.object(
+            main,
+            "_start_chatgpt_auth_with_session_rotation",
+            side_effect=[(first, "authorize-1"), (second, "authorize-2")],
+        ), patch.object(
+            main,
+            "follow_authorize",
+            side_effect=[RuntimeError("HTTP Error 403"), "email-verification"],
+        ), patch.object(
+            main,
+            "BrowserSession",
+            side_effect=[RuntimeError("HTTP Error 403"), second],
+        ) as create_session, patch.object(main, "close_browser_session"):
+            result = main._run_pre_otp_authorization_with_session_rotation(
+                first,
+                None,
+                "user@example.com",
+            )
+
+        self.assertEqual(result, (second, "email-verification"))
+        create_session.assert_called_once_with(
+            proxy=None,
+            transport_impersonate=main._browser_cfg.REGISTRATION_IMPERSONATE,
+        )
 
 
 if __name__ == "__main__":

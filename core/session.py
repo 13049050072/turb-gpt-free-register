@@ -117,7 +117,7 @@ class BrowserSession:
                              套餐查询等短请求可关闭，避免额外网络等待。
             transport_impersonate: 可选的 curl_cffi TLS/HTTP 传输画像覆盖。
                                    不传时继续使用全局 IMPERSONATE；覆盖值只接受
-                                   查活兼容白名单，且不修改 browser_profile。
+                                   查活与协议注册共用的传输兼容白名单，且不修改 browser_profile。
         """
         # proxy=None  → 从池里随机抽（默认行为），并按代理池上游配置决定是否链式
         # proxy=""    → 禁用代理（直连）

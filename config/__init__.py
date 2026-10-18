@@ -77,6 +77,7 @@ from config.browser import (
     IMPERSONATE,
     LIVENESS_IMPERSONATE,
     LIVENESS_IMPERSONATE_ALLOWED,
+    REGISTRATION_IMPERSONATE,
     normalize_liveness_impersonate,
     REQUEST_TIMEOUT,
 )
@@ -294,7 +295,7 @@ __all__ = [
     "NAVIGATOR_PROTO_SAMPLES", "DOCUMENT_KEY_SAMPLES", "WINDOW_KEY_SAMPLES", "WINDOW_FEATURE_FLAGS",
     "build_browser_environment", "validate_browser_profile",
     "BROWSER_PROFILE_POOL", "pick_browser_profile",
-    "IMPERSONATE", "LIVENESS_IMPERSONATE", "LIVENESS_IMPERSONATE_ALLOWED",
+    "IMPERSONATE", "LIVENESS_IMPERSONATE", "LIVENESS_IMPERSONATE_ALLOWED", "REGISTRATION_IMPERSONATE",
     "normalize_liveness_impersonate", "REQUEST_TIMEOUT",
     # openai_protocol
     "OPENAI_CLIENT_ID", "OPENAI_SCOPE", "OPENAI_AUDIENCE", "OPENAI_REDIRECT_URI",

@@ -1,8 +1,10 @@
 # -*- coding: utf-8 -*-
 import logging
+import sys
 import tempfile
 import unittest
 from pathlib import Path
+from types import ModuleType
 from urllib.error import HTTPError
 from unittest.mock import Mock, patch
 
@@ -11,6 +13,45 @@ from core import registration_service as service
 
 
 class RegistrationTaskRegressionTests(unittest.TestCase):
+    def test_non_protocol_registration_drivers_do_not_use_protocol_session_helper(self):
+        drivers = (
+            ("roxy", "core.roxy_registration", "run_roxy_registration"),
+            ("cloak", "core.cloakbrowser_registration", "run_cloak_registration"),
+            ("browser_use", "core.browser_use_registration", "run_browser_use_registration"),
+            ("skyvern", "core.skyvern_registration", "run_skyvern_registration"),
+        )
+
+        for driver, module_name, function_name in drivers:
+            with self.subTest(driver=driver):
+                module = ModuleType(module_name)
+                sentinel = object()
+                function = Mock(return_value=sentinel)
+                setattr(module, function_name, function)
+                with (
+                    patch.object(main._roxy_cfg, "REGISTRATION_DRIVER", driver),
+                    patch.dict(sys.modules, {module_name: module}),
+                    patch.object(main, "_new_protocol_registration_session") as new_session,
+                ):
+                    result = main.run_registration(
+                        email="synthetic@example.com",
+                        name="Synthetic Name",
+                        birthday="1990-01-01",
+                        proxy="http://proxy.example:8080",
+                        otp_code="123456",
+                    )
+
+                self.assertIs(result, sentinel)
+                function.assert_called_once_with(
+                    email="synthetic@example.com",
+                    name="Synthetic Name",
+                    birthday="1990-01-01",
+                    proxy="http://proxy.example:8080",
+                    otp_code="123456",
+                    batch_dir=None,
+                    on_email_acquired=None,
+                )
+                new_session.assert_not_called()
+
     def test_job_log_context_captures_info_and_restores_root_level(self):
         root = logging.getLogger()
         previous_level = root.level

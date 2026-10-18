@@ -18,8 +18,27 @@ class ProtocolPasswordRegistrationTests(unittest.TestCase):
         )
         events = []
         saved = {}
+        tracker_box = {}
 
-        def authorize(_session, *_args):
+        def observe_request(tracker, url):
+            tracker.observe(
+                method="GET",
+                url=url,
+                response=SimpleNamespace(
+                    status_code=200,
+                    request_size=10,
+                    upload_size=0,
+                    download_size=4,
+                    header_size=6,
+                    response_size=10,
+                    elapsed=0.1,
+                    redirect_count=0,
+                ),
+            )
+
+        def authorize(_session, *_args, **kwargs):
+            tracker_box["tracker"] = kwargs["traffic_tracker"]
+            observe_request(kwargs["traffic_tracker"], "https://auth.openai.com/authorize")
             return _session, "https://auth.openai.com/email-verification"
 
         def password_page(*_args):
@@ -60,6 +79,11 @@ class ProtocolPasswordRegistrationTests(unittest.TestCase):
             saved.update(kwargs)
             return 42
 
+        def setup_twofa(*_args, **_kwargs):
+            events.append("twofa")
+            observe_request(tracker_box["tracker"], "https://chatgpt.com/backend-api/accounts/mfa/enroll")
+            return None
+
         session_factory = patch.object(main, "BrowserSession", return_value=session)
         patches = [
             patch.object(main._roxy_cfg, "REGISTRATION_DRIVER", "protocol"),
@@ -78,11 +102,11 @@ class ProtocolPasswordRegistrationTests(unittest.TestCase):
             patch.object(main, "request_sentinel_token", return_value={"token": "create-challenge"}),
             patch.object(main, "create_account", side_effect=create),
             patch.object(main, "_finalize_registration_session", return_value=({"user": {}}, "access-token")),
-            patch.object(main, "setup_2fa"),
+            patch.object(main, "setup_2fa", side_effect=setup_twofa),
             patch.object(main, "_run_optional_codex_oauth", return_value={"status": "skipped", "ok": False}),
             patch.object(main, "save_account_data", side_effect=save),
             patch.object(main, "human_delay"),
-            patch.object(main._twofa_cfg, "ENABLE_2FA", False),
+            patch.object(main._twofa_cfg, "ENABLE_2FA", True),
             patch.object(main._email_cfg, "USE_EMAIL_SERVICE", True),
             patch.object(main._protocol_cfg, "SEND_SENTINEL_ON_EMAIL_OTP_VALIDATE", False),
             patch.object(main._protocol_cfg, "CHATGPT_AUTH_BOOTSTRAP_ENABLED", False),
@@ -102,16 +126,22 @@ class ProtocolPasswordRegistrationTests(unittest.TestCase):
             )
 
         self.assertTrue(result["success"])
-        create_session.assert_called_once_with(
-            proxy=None,
-            transport_impersonate=main._browser_cfg.REGISTRATION_IMPERSONATE,
+        create_session.assert_called_once()
+        self.assertEqual(
+            create_session.call_args.kwargs["transport_impersonate"],
+            main._browser_cfg.REGISTRATION_IMPERSONATE,
         )
+        self.assertIsNotNone(create_session.call_args.kwargs.get("traffic_tracker"))
+        self.assertEqual(result["network_traffic"], saved["extra"]["network_traffic"])
+        self.assertEqual(result["network_traffic"]["request_count"], 1)
+        self.assertEqual(result["network_traffic"]["total_bytes"], 20)
         self.assertEqual(saved["extra"]["registration_password"], "ValidPassword9!")
         self.assertLess(events.index("password_page"), events.index("register_user"))
         self.assertLess(events.index("register_user"), events.index("otp_send"))
         self.assertLess(events.index("otp_send"), events.index("otp_validate"))
         self.assertLess(events.index("otp_validate"), events.index("create_account"))
-        self.assertLess(events.index("create_account"), events.index("save"))
+        self.assertLess(events.index("create_account"), events.index("twofa"))
+        self.assertLess(events.index("twofa"), events.index("save"))
 
 
 if __name__ == "__main__":

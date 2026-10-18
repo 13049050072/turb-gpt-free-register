@@ -131,9 +131,9 @@ BROWSER_DATA_SAVER_BLOCKED_URL_PATTERNS: list[str] = [
     "**://accounts.google.com/gsi/client**",
 ]
 
-# ---------- Roxy/Cloak 浏览器流量明细日志 ----------
-# 默认关闭；开启后在每次注册结束时按单请求总字节降序输出资源 URL、类型、状态和大小。
-# URL 查询参数值会脱敏，不保存请求/响应 body 或完整 Header 内容。
+# ---------- 浏览器/协议注册流量明细日志 ----------
+# 默认关闭；开启后，Roxy/Cloak 浏览器和 protocol 注册都会在结束时输出有界的单请求明细。
+# protocol 仅记录 curl_cffi 请求；URL 只保留 scheme/host/path，查询值、凭据、Header、body 不保存。
 BROWSER_TRAFFIC_DETAIL_LOG: bool = False
 BROWSER_TRAFFIC_DETAIL_MAX_ENTRIES: int = 2000
 

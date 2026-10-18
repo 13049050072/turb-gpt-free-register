@@ -105,6 +105,7 @@ class BrowserSession:
         browser_profile: dict | None = None,
         fingerprint_seed: str | None = None,
         transport_impersonate: str | None = None,
+        traffic_tracker=None,
     ):
         """
         初始化会话。
@@ -118,7 +119,10 @@ class BrowserSession:
             transport_impersonate: 可选的 curl_cffi TLS/HTTP 传输画像覆盖。
                                    不传时继续使用全局 IMPERSONATE；覆盖值只接受
                                    查活与协议注册共用的传输兼容白名单，且不修改 browser_profile。
+            traffic_tracker: 可选的单调用方流量观测器；不传时保持原有行为。
         """
+        # The observer is installed before constructor-time GeoIP traffic.
+        self.traffic_tracker = traffic_tracker
         # proxy=None  → 从池里随机抽（默认行为），并按代理池上游配置决定是否链式
         # proxy=""    → 禁用代理（直连）
         # proxy="..." → 使用指定代理，不套用代理池上游
@@ -401,6 +405,44 @@ class BrowserSession:
     def chatgpt_cookie_header(self) -> str:
         return self._cookie_header_for_domain("chatgpt.com") or f"oai-did={self.device_id}"
 
+    def _send_with_traffic(self, method: str, url: str, sender, **kwargs):
+        """Invoke curl exactly once and observe only after it returns or raises."""
+        tracker = getattr(self, "traffic_tracker", None)
+        if tracker is None:
+            return sender(url, **kwargs)
+        started = time.monotonic()
+        response = None
+        try:
+            response = sender(url, **kwargs)
+        except Exception as exc:
+            try:
+                response = getattr(exc, "response", None)
+            except Exception:
+                response = None
+            try:
+                tracker.observe(
+                    method=method,
+                    url=url,
+                    response=response,
+                    error_kind="transport_error",
+                    elapsed_seconds=max(0.0, time.monotonic() - started),
+                    streaming=bool(kwargs.get("stream")),
+                )
+            except Exception:
+                logger.debug("BrowserSession traffic observer failed", exc_info=True)
+            raise
+        try:
+            tracker.observe(
+                method=method,
+                url=url,
+                response=response,
+                elapsed_seconds=max(0.0, time.monotonic() - started),
+                streaming=bool(kwargs.get("stream")),
+            )
+        except Exception:
+            logger.debug("BrowserSession traffic observer failed", exc_info=True)
+        return response
+
     def _detect_exit_geo(self) -> dict:
         """通过当前代理检测出口 IP 地理信息；失败返回空 dict 并回退到默认地区画像。"""
         try:
@@ -421,7 +463,7 @@ class BrowserSession:
         headers = {"User-Agent": USER_AGENT, "Accept": "application/json"}
         for url in endpoints:
             try:
-                resp = self.session.get(url, headers=headers, timeout=timeout)
+                resp = self._send_with_traffic("GET", url, self.session.get, headers=headers, timeout=timeout)
                 if resp.status_code != 200:
                     continue
                 data = resp.json()
@@ -799,12 +841,12 @@ class BrowserSession:
         """发送 GET 请求"""
         self._raise_if_circuit_open()
         headers = self._attach_openai_target_headers_for_url(url, headers)
-        resp = self.session.get(url, headers=headers, **kwargs)
+        resp = self._send_with_traffic("GET", url, self.session.get, headers=headers, **kwargs)
         return self._observe_response_for_circuit_breaker(resp, url)
 
     def post(self, url: str, headers: dict = None, **kwargs):
         """发送 POST 请求"""
         self._raise_if_circuit_open()
         headers = self._attach_openai_target_headers_for_url(url, headers)
-        resp = self.session.post(url, headers=headers, **kwargs)
+        resp = self._send_with_traffic("POST", url, self.session.post, headers=headers, **kwargs)
         return self._observe_response_for_circuit_breaker(resp, url)

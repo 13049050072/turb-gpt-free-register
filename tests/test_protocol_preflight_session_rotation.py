@@ -143,6 +143,7 @@ class ProtocolPreflightSessionRotationTests(unittest.TestCase):
     def test_retryable_reopen_error_uses_shared_transport(self):
         first = object()
         second = object()
+        tracker = object()
 
         with patch.object(
             main,
@@ -161,13 +162,145 @@ class ProtocolPreflightSessionRotationTests(unittest.TestCase):
                 first,
                 None,
                 "user@example.com",
+                traffic_tracker=tracker,
             )
 
         self.assertEqual(result, (second, "email-verification"))
         create_session.assert_called_once_with(
             proxy=None,
             transport_impersonate=main._browser_cfg.REGISTRATION_IMPERSONATE,
+            traffic_tracker=tracker,
         )
+
+    def test_shared_tracker_is_propagated_to_preflight_rotation_factory(self):
+        first = object()
+        second = object()
+        tracker = object()
+        with patch.object(
+            main,
+            "network_preflight",
+            side_effect=[RuntimeError("HTTP Error 403"), None],
+        ), patch.object(
+            main,
+            "BrowserSession",
+            return_value=second,
+        ) as create_session, patch.object(main, "close_browser_session"):
+            result = main._network_preflight_with_session_rotation(
+                first,
+                None,
+                traffic_tracker=tracker,
+            )
+
+        self.assertIs(result, second)
+        create_session.assert_called_once_with(
+            proxy=None,
+            transport_impersonate=main._browser_cfg.REGISTRATION_IMPERSONATE,
+            traffic_tracker=tracker,
+        )
+
+    def test_shared_tracker_is_propagated_to_auth_rotation_factory(self):
+        first = object()
+        second = object()
+        tracker = object()
+        with patch.object(main._protocol_cfg, "CHATGPT_ANON_BOOTSTRAP_ENABLED", False), patch.object(
+            main,
+            "_network_preflight_with_session_rotation",
+            side_effect=[first, second],
+        ) as preflight, patch.object(main, "get_providers", return_value={}), patch.object(
+            main,
+            "get_csrf_token",
+            side_effect=[RuntimeError("HTTP Error 403"), "csrf-token"],
+        ), patch.object(
+            main,
+            "signin_openai",
+            return_value="https://auth.openai.com/authorize",
+        ), patch.object(
+            main,
+            "BrowserSession",
+            return_value=second,
+        ) as create_session, patch.object(main, "close_browser_session"), patch.object(main, "human_delay"):
+            result = main._start_chatgpt_auth_with_session_rotation(
+                first,
+                None,
+                "user@example.com",
+                traffic_tracker=tracker,
+            )
+
+        self.assertEqual(result, (second, "https://auth.openai.com/authorize"))
+        self.assertIs(preflight.call_args_list[0].kwargs["traffic_tracker"], tracker)
+        self.assertIs(preflight.call_args_list[1].kwargs["traffic_tracker"], tracker)
+        create_session.assert_called_once_with(
+            proxy=None,
+            transport_impersonate=main._browser_cfg.REGISTRATION_IMPERSONATE,
+            traffic_tracker=tracker,
+        )
+
+    def test_shared_tracker_is_propagated_to_authorize_reopen_factory(self):
+        first = object()
+        second = object()
+        tracker = object()
+        with patch.object(
+            main,
+            "_start_chatgpt_auth_with_session_rotation",
+            side_effect=[(first, "authorize-1"), (second, "authorize-2")],
+        ) as start, patch.object(
+            main,
+            "follow_authorize",
+            side_effect=[RuntimeError("HTTP Error 403"), "email-verification"],
+        ), patch.object(
+            main,
+            "BrowserSession",
+            return_value=second,
+        ) as create_session, patch.object(main, "close_browser_session"):
+            result = main._run_pre_otp_authorization_with_session_rotation(
+                first,
+                None,
+                "user@example.com",
+                traffic_tracker=tracker,
+            )
+
+        self.assertEqual(result, (second, "email-verification"))
+        self.assertIs(start.call_args_list[0].kwargs["traffic_tracker"], tracker)
+        self.assertIs(start.call_args_list[1].kwargs["traffic_tracker"], tracker)
+        create_session.assert_called_once_with(
+            proxy=None,
+            transport_impersonate=main._browser_cfg.REGISTRATION_IMPERSONATE,
+            traffic_tracker=tracker,
+        )
+
+    def test_shared_tracker_is_propagated_to_retry_and_direct_fallback_sessions(self):
+        first = object()
+        direct = object()
+        tracker = object()
+        with patch.object(
+            main._protocol_cfg,
+            "OPENAI_DIRECT_FALLBACK_ON_PROXY_FAILURE",
+            True,
+        ), patch.object(
+            main,
+            "_run_pre_otp_authorization_with_session_rotation",
+            side_effect=[RuntimeError("HTTP Error 403"), (direct, "https://auth.openai.com/email-verification")],
+        ) as authorize, patch.object(
+            main,
+            "BrowserSession",
+            return_value=object(),
+        ) as create_session, patch.object(main, "close_browser_session"):
+            result = main._run_pre_otp_authorization_with_direct_fallback(
+                first,
+                None,
+                "user@example.com",
+                traffic_tracker=tracker,
+            )
+
+        self.assertEqual(result, (direct, "https://auth.openai.com/email-verification"))
+        self.assertIs(authorize.call_args_list[0].kwargs["traffic_tracker"], tracker)
+        self.assertIs(authorize.call_args_list[1].kwargs["traffic_tracker"], tracker)
+        create_session.assert_called_once_with(
+            proxy="",
+            transport_impersonate=main._browser_cfg.REGISTRATION_IMPERSONATE,
+            traffic_tracker=tracker,
+        )
+
 
 
 if __name__ == "__main__":

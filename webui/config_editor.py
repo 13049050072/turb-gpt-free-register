@@ -587,11 +587,11 @@ EDITABLE_FIELDS = [
     },
     {
         "key": "BROWSER_TRAFFIC_DETAIL_LOG", "file": "browser.py", "type": "bool", "group": "浏览器画像",
-        "label": "本地浏览器流量明细日志", "help": "仅 Roxy/Cloak 生效；注册结束时输出每个资源的 URL、类型、方法、状态码和上传/下载大小；URL 查询值会脱敏，默认关闭",
+        "label": "浏览器/协议流量明细日志", "help": "Roxy/Cloak 输出浏览器资源明细；protocol 注册输出 curl_cffi 请求明细且 URL 仅保留 scheme/host/path；两者都不记录凭据、Header 和 body，默认关闭",
     },
     {
         "key": "BROWSER_TRAFFIC_DETAIL_MAX_ENTRIES", "file": "browser.py", "type": "int", "group": "浏览器画像",
-        "label": "流量明细最多条数", "help": "按单请求总字节降序输出，默认 2000，最大 10000；用于后续分析可屏蔽资源",
+        "label": "流量明细最多条数", "help": "浏览器和 protocol 注册都按此上限在采集时限制明细存储；默认 2000，最大 10000；汇总计数不受限制",
     },
     {
         "key": "BROWSER_JS_COVERAGE_LOG", "file": "browser.py", "type": "bool", "group": "浏览器画像",

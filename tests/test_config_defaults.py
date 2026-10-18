@@ -111,6 +111,22 @@ class ConfigDefaultFallbackTests(unittest.TestCase):
         self.assertEqual(fields["BROWSER_JS_COVERAGE_LOG"]["type"], "bool")
         self.assertEqual(fields["BROWSER_JS_COVERAGE_MAX_ENTRIES"]["type"], "int")
 
+    def test_protocol_traffic_uses_existing_detail_config_defaults_and_editor_copy(self):
+        fields = {field["key"]: field for field in config_editor.EDITABLE_FIELDS}
+        detail_log = fields["BROWSER_TRAFFIC_DETAIL_LOG"]
+        detail_limit = fields["BROWSER_TRAFFIC_DETAIL_MAX_ENTRIES"]
+        source = Path("config/browser.py").read_text(encoding="utf-8")
+        env_example = Path(".env.example").read_text(encoding="utf-8")
+
+        self.assertIn("浏览器/协议", detail_log["label"])
+        self.assertIn("protocol", detail_log["help"])
+        self.assertIn("scheme/host/path", detail_log["help"])
+        self.assertIn("protocol", detail_limit["help"])
+        self.assertIn("BROWSER_TRAFFIC_DETAIL_LOG: bool = False", source)
+        self.assertIn("BROWSER_TRAFFIC_DETAIL_MAX_ENTRIES: int = 2000", source)
+        self.assertIn('BROWSER_TRAFFIC_DETAIL_LOG="False"', env_example)
+        self.assertIn('BROWSER_TRAFFIC_DETAIL_MAX_ENTRIES="2000"', env_example)
+
     def test_browser_data_saver_defaults_block_google_gsi(self):
         with _browser_source_defaults():
             self.assertIn(

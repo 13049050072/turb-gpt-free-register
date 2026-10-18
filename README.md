@@ -96,7 +96,7 @@ EMAIL_SOURCE = "outlook,generic_api,imap"
 - 批量补跑 Codex，补跑线程数每次提交即时生效。
 - 管理账号、邮箱池、Codex 凭证；账号页支持单个/批量换绑邮箱并指定新邮箱来源，换绑后同时展示原邮箱与当前邮箱，支持查看换绑日志，并自动查活刷新 AT。
 - 邮箱池导入默认不创建账号；勾选“导入后默认视为注册成功账号”后，会将邮箱池标记为已用并同步显示在账号页，可直接批量补跑 Codex。
-- Roxy/Cloak 浏览器注册完成后统计整个浏览器会话的上传、下载和总流量，任务列表与账号扩展信息均会保存结果；Browser Use/Skyvern 云端浏览器不启用本地流量监听、资源拦截或 JS 覆盖率采集。
+- Roxy/Cloak 浏览器注册会统计浏览器会话流量；protocol 注册会统计 curl_cffi 请求流量。两类结果都保存到任务列表和账号扩展信息；Browser Use/Skyvern 云端浏览器不启用本地流量监听、资源拦截或 JS 覆盖率采集。
 - 配置页支持热加载，保存后无需重启。
 - Roxy 团队/项目可在配置页获取并保存。
 
@@ -116,6 +116,8 @@ EMAIL_SOURCE = "outlook,generic_api,imap"
 - WebSocket 帧 payload 字节（如流程使用 WebSocket）。
 
 现代/Legacy WebUI 的注册任务列表会显示总流量，完整结构保存在任务记录的 `network_traffic` 和成功账号的 `extra_json` 中。Roxy 新建代理池环境，以及使用代理池或显式 HTTP/SOCKS5 代理的 Cloak，会通过本地代理中继统计浏览器双向传输，包含 TLS、启动阶段和后台请求；页面可见的计数另存为 `browser_observed_*`，资源明细仍为页面口径，不能与传输总量相加。无代理、复用已有 Roxy 环境或使用未支持代理协议时仍使用页面可见统计，可能漏掉其他 target。传输统计不包含 TCP/IP 开销、重传或代理商特有计费项，也不包含邮箱 API、Roxy API 或 CDP 控制通道流量。
+
+Protocol 注册从首个 `BrowserSession` 构造开始统计 curl_cffi GET/POST，并在进入独立 2FA 阶段前冻结。`upload_bytes` 取原生 `request_size`，不会再次叠加请求 body；`download_bytes` 包含响应 Header 与编码后的 body。原生字段缺失时只累计已知分项，并通过 unknown counters 标记，不把缺项当作 0。
 
 #### 省流量模式
 
@@ -156,18 +158,16 @@ CSS 通常不是注册接口必需，但会影响隐藏元素、布局和可见�
 
 SOCKS5 CONNECT 握手错误码 `1/3/4/6` 最多自动重试三次，等待 0.25 秒和 0.5 秒；只有浏览器数据转发前才重试，不重放 HTTP/TLS 数据。认证、规则拒绝及端口拒绝等错误不会重试。代理中继关闭引起的连接终止不计作故障，Roxy 收尾仅汇总重试/恢复/失败数量。
 
-#### 资源明细日志
+#### 资源/协议请求明细日志
 
-需要分析注册流程中哪些资源占流量时，开启：
+需要分析浏览器注册资源或 `REGISTRATION_DRIVER=protocol` 注册请求时，开启：
 
 ```dotenv
 BROWSER_TRAFFIC_DETAIL_LOG=True
 BROWSER_TRAFFIC_DETAIL_MAX_ENTRIES=2000
 ```
 
-启用统计的 Roxy/Cloak 注册任务结束后，日志会输出 `[资源明细]` 行，包含资源 URL、类型、HTTP 方法、状态码、上传大小、下载大小、响应 body/header 大小，以及 `failed`、`blocked`、`unfinished`、`cache` 状态；明细按单请求总字节从大到小排列。Browser Use/Skyvern 云端浏览器不启用该监听。`ws_upload/ws_download` 表示 WebSocket 帧 payload。Playwright 缓存状态在无法从 API 确认时显示 `unknown`，Selenium/CDP 能识别时显示 `hit` 或 `miss`。URL 查询参数值、data/blob URL 内容不会写入日志。
-
-把一轮注册的 `[资源明细]` 日志发回后，可以按域名、路径、资源类型和实际字节量判断下一步是否适合继续拦截；`stylesheet`、`font` 等类型需要结合注册是否受影响再启用。
+Roxy/Cloak 会输出 `[资源明细]`；protocol 会输出 `[协议流量明细]`。两者均在采集时限制明细条数，汇总计数不受限制。protocol 只统计注册 `BrowserSession` 的 curl_cffi GET/POST（包括 GeoIP、重试、重开和 direct fallback），不拦截请求；2FA、邮箱提供商轮询、Codex 和其他后置工作不计入冻结后的注册摘要。protocol 明细 URL 只保留 scheme/host/path；查询值、URL 凭据、Header、Cookie、请求/响应 body、OTP 和密码不会写入 protocol telemetry。
 
 #### JS 执行函数覆盖率
 

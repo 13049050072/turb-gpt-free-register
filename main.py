@@ -20,6 +20,7 @@ from config import roxybrowser as _roxy_cfg
 from config import openai_protocol as _protocol_cfg
 from config import codex as _codex_cfg
 from core.session import BrowserSession, close_browser_session
+from core.protocol_traffic import ProtocolTrafficTracker
 from core.chatgpt_auth import get_providers, get_csrf_token, signin_openai
 from core.openai_auth import (
     follow_authorize,
@@ -62,12 +63,19 @@ _FINALIZE_SESSION_MAX_ATTEMPTS = 5
 _FINALIZE_SESSION_BACKOFF_BASE = 2.0
 
 
-def _new_protocol_registration_session(proxy: str | None) -> BrowserSession:
+def _new_protocol_registration_session(
+    proxy: str | None,
+    *,
+    traffic_tracker: ProtocolTrafficTracker | None = None,
+) -> BrowserSession:
     """Create protocol registration sessions with the shared validated transport."""
-    return BrowserSession(
-        proxy=proxy,
-        transport_impersonate=_browser_cfg.REGISTRATION_IMPERSONATE,
-    )
+    kwargs = {
+        "proxy": proxy,
+        "transport_impersonate": _browser_cfg.REGISTRATION_IMPERSONATE,
+    }
+    if traffic_tracker is not None:
+        kwargs["traffic_tracker"] = traffic_tracker
+    return BrowserSession(**kwargs)
 
 
 def _reset_retryable_session_circuit(session: BrowserSession) -> None:
@@ -85,6 +93,7 @@ def _network_preflight_with_session_rotation(
     requested_proxy: str | None,
     *,
     max_attempts: int | None = None,
+    traffic_tracker: ProtocolTrafficTracker | None = None,
 ) -> BrowserSession:
     """预检失败后重建会话，给动态代理机会分配新的出口 IP。
 
@@ -121,7 +130,10 @@ def _network_preflight_with_session_rotation(
                 close_browser_session(session)
             except Exception:
                 logger.debug("[预检] 关闭失败会话时出现异常", exc_info=True)
-            session = _new_protocol_registration_session(requested_proxy)
+            session = _new_protocol_registration_session(
+                requested_proxy,
+                **({"traffic_tracker": traffic_tracker} if traffic_tracker is not None else {}),
+            )
     raise RuntimeError("网络预检重试耗尽但无异常记录")
 
 
@@ -131,6 +143,7 @@ def _start_chatgpt_auth_with_session_rotation(
     email: str,
     *,
     max_attempts: int | None = None,
+    traffic_tracker: ProtocolTrafficTracker | None = None,
 ) -> tuple[BrowserSession, str]:
     """执行 OTP 前完整 ChatGPT 链路，并在可重试错误后更换会话。"""
     max_attempts = max_attempts if max_attempts is not None else getattr(
@@ -145,6 +158,7 @@ def _start_chatgpt_auth_with_session_rotation(
                 session,
                 requested_proxy,
                 max_attempts=1,
+                **({"traffic_tracker": traffic_tracker} if traffic_tracker is not None else {}),
             )
             human_delay("navigate")
 
@@ -181,7 +195,10 @@ def _start_chatgpt_auth_with_session_rotation(
                 close_browser_session(session)
             except Exception:
                 logger.debug("[认证] 关闭失败会话时出现异常", exc_info=True)
-            session = _new_protocol_registration_session(requested_proxy)
+            session = _new_protocol_registration_session(
+                requested_proxy,
+                **({"traffic_tracker": traffic_tracker} if traffic_tracker is not None else {}),
+            )
     raise RuntimeError("OTP 前认证链路重试耗尽但无异常记录")
 
 
@@ -189,6 +206,8 @@ def _run_pre_otp_authorization_with_session_rotation(
     session: BrowserSession,
     requested_proxy: str | None,
     email: str,
+    *,
+    traffic_tracker: ProtocolTrafficTracker | None = None,
 ) -> tuple[BrowserSession, str]:
     """在 OTP 触发前完成登录页到 authorize 的链路，并支持整链重启。
 
@@ -208,6 +227,7 @@ def _run_pre_otp_authorization_with_session_rotation(
                 requested_proxy,
                 email,
                 max_attempts=1,
+                **({"traffic_tracker": traffic_tracker} if traffic_tracker is not None else {}),
             )
             authorize_final_url = follow_authorize(session, authorize_url)
             if attempt > 1:
@@ -233,7 +253,10 @@ def _run_pre_otp_authorization_with_session_rotation(
             except Exception:
                 logger.debug("[认证] 关闭失败会话时出现异常", exc_info=True)
             try:
-                session = _new_protocol_registration_session(requested_proxy)
+                session = _new_protocol_registration_session(
+                    requested_proxy,
+                    **({"traffic_tracker": traffic_tracker} if traffic_tracker is not None else {}),
+                )
             except Exception as reopen_exc:
                 if attempt >= max_attempts or not _is_retryable_authorize_error(reopen_exc):
                     raise
@@ -251,6 +274,8 @@ def _run_pre_otp_authorization_with_direct_fallback(
     session: BrowserSession,
     requested_proxy: str | None,
     email: str,
+    *,
+    traffic_tracker: ProtocolTrafficTracker | None = None,
 ) -> tuple[BrowserSession, str]:
     """Optionally switch a pool-proxy failure to direct networking before OTP."""
     try:
@@ -258,6 +283,7 @@ def _run_pre_otp_authorization_with_direct_fallback(
             session,
             requested_proxy,
             email,
+            **({"traffic_tracker": traffic_tracker} if traffic_tracker is not None else {}),
         )
     except Exception as exc:
         enabled = bool(getattr(_protocol_cfg, "OPENAI_DIRECT_FALLBACK_ON_PROXY_FAILURE", False))
@@ -273,11 +299,15 @@ def _run_pre_otp_authorization_with_direct_fallback(
             close_browser_session(session)
         except Exception:
             logger.debug("[认证] 关闭代理会话时出现异常", exc_info=True)
-        direct_session = _new_protocol_registration_session(proxy="")
+        direct_session = _new_protocol_registration_session(
+            proxy="",
+            **({"traffic_tracker": traffic_tracker} if traffic_tracker is not None else {}),
+        )
         return _run_pre_otp_authorization_with_session_rotation(
             direct_session,
             "",
             email,
+            **({"traffic_tracker": traffic_tracker} if traffic_tracker is not None else {}),
         )
 
 
@@ -300,6 +330,100 @@ def configure_logging(verbose: bool = False) -> None:
 def _is_success(result: dict) -> bool:
     """判断单次注册结果是否成功，集中收敛批量统计规则。"""
     return isinstance(result, dict) and bool(result.get("success"))
+
+
+def _create_protocol_traffic_tracker() -> ProtocolTrafficTracker | None:
+    try:
+        return ProtocolTrafficTracker()
+    except Exception:
+        logger.debug("Protocol traffic tracker initialization failed", exc_info=True)
+        return None
+
+
+def _unavailable_protocol_traffic() -> dict:
+    return {
+        "available": False,
+        "method": "curl_cffi.protocol",
+        "label": "Protocol",
+        "note": "Protocol traffic accounting unavailable",
+    }
+
+
+def _freeze_protocol_traffic(
+    tracker: ProtocolTrafficTracker | None,
+    snapshot: dict | None = None,
+) -> dict:
+    """Freeze/report telemetry without allowing it to affect registration."""
+    try:
+        if isinstance(snapshot, dict):
+            return dict(snapshot)
+        if tracker is None:
+            return _unavailable_protocol_traffic()
+        try:
+            frozen = tracker.freeze()
+            snapshot = dict(frozen) if isinstance(frozen, dict) else _unavailable_protocol_traffic()
+        except Exception:
+            snapshot = _unavailable_protocol_traffic()
+        try:
+            tracker.report(logger)
+        except Exception:
+            pass
+        return dict(snapshot)
+    except Exception:
+        return _unavailable_protocol_traffic()
+
+
+def _protocol_registration_failure_result(
+    *,
+    email: str | None,
+    error: Exception,
+    create_acknowledged: bool,
+    traffic_tracker: ProtocolTrafficTracker | None,
+    traffic_snapshot: dict | None = None,
+) -> dict:
+    """Build the single protocol failure result and preserve email recovery rules."""
+    snapshot = _freeze_protocol_traffic(traffic_tracker, traffic_snapshot)
+    logger.error(f"[失败] {email}: {type(error).__name__}: {error}")
+    logger.debug("详细错误信息:", exc_info=True)
+
+    from core.openai_auth import AccountUnusableError
+    account_dead = isinstance(error, AccountUnusableError)
+    try:
+        if email:
+            from core.email_provider import release_email
+            if account_dead:
+                src = release_email(
+                    email,
+                    status="failed",
+                    note=f"账号已废弃，邮箱不可用: {str(error)[:180]}",
+                )
+                logger.warning(f"[邮箱:{src}] {email} 账号已废弃，标记为 failed，不再重新注册")
+            elif create_acknowledged:
+                src = release_email(
+                    email,
+                    status="failed",
+                    note=f"创建接口已通过但后续失败，已废弃: {str(error)[:180]}",
+                )
+                logger.warning(f"[邮箱:{src}] {email} 已创建但后续失败，标记为 failed，不再重新注册")
+            else:
+                from core.email_provider import release_email_if_unconsumed, resolve_email_source
+                source = resolve_email_source(email)
+                changed = release_email_if_unconsumed(
+                    email,
+                    note=f"上次失败: {str(error)[:180]}",
+                )
+                if changed:
+                    logger.info(f"[邮箱:{source}] {email} 已恢复 available")
+                else:
+                    logger.info(f"[邮箱:{source}] {email} 未回收：已存在注册账号或邮箱已被其他状态占用")
+    except Exception:
+        pass
+    return {
+        "success": False,
+        "email": email,
+        "error": str(error),
+        "network_traffic": dict(snapshot),
+    }
 
 
 def _finalize_registration_session(
@@ -497,31 +621,55 @@ def run_registration(
         if on_email_acquired:
             on_email_acquired(email)
 
-    # 创建浏览器会话（proxy=None 时自动从 config.PROXY_POOL 随机抽一个）
-    session = _new_protocol_registration_session(proxy)
-
-    # 从代理 URL 中抽取 sid 段做日志，避免把账号密码完整打印
-    proxy_label = "无"
-    if session.proxy:
-        # 形如 socks5h://user-region-JP-sid-XXXX-t-5:pass@host:port
-        try:
-            sid_part = next(
-                (seg for seg in session.proxy.split("@")[0].split("-") if len(seg) == 8),
-                "***",
-            )
-            proxy_label = f"{session.proxy.split('://')[0]}://...sid-{sid_part}...@{session.proxy.split('@')[-1]}"
-        except Exception:
-            proxy_label = "已配置"
-
-    if not birthday:
-        birthday = generate_random_birthday()
-
-    logger.info(f"[注册] 开始：{email}，代理={proxy_label}")
-    logger.info(f"[注册] 本次随机生日: {birthday}")
-    logger.debug(f"[注册] 设备ID={session.device_id}，会话日志ID={session.auth_session_logging_id}")
-
+    # Each protocol registration owns one collector. It is created before the first
+    # BrowserSession so constructor-time GeoIP requests are included.
+    traffic_tracker = _create_protocol_traffic_tracker()
+    traffic_snapshot = None
     create_acknowledged = False
     registration_password = None
+    try:
+        session = _new_protocol_registration_session(
+            proxy,
+            traffic_tracker=traffic_tracker,
+        )
+    except Exception as exc:
+        return _protocol_registration_failure_result(
+            email=email,
+            error=exc,
+            create_acknowledged=create_acknowledged,
+            traffic_tracker=traffic_tracker,
+            traffic_snapshot=traffic_snapshot,
+        )
+
+    try:
+        # 从代理 URL 中抽取 sid 段做日志，避免把账号密码完整打印
+        proxy_label = "无"
+        if session.proxy:
+            # 形如 socks5h://user-region-JP-sid-XXXX-t-5:pass@host:port
+            try:
+                sid_part = next(
+                    (seg for seg in session.proxy.split("@")[0].split("-") if len(seg) == 8),
+                    "***",
+                )
+                proxy_label = f"{session.proxy.split('://')[0]}://...sid-{sid_part}...@{session.proxy.split('@')[-1]}"
+            except Exception:
+                proxy_label = "已配置"
+
+        if not birthday:
+            birthday = generate_random_birthday()
+
+        logger.info(f"[注册] 开始：{email}，代理={proxy_label}")
+        logger.info(f"[注册] 本次随机生日: {birthday}")
+        logger.debug(f"[注册] 设备ID={session.device_id}，会话日志ID={session.auth_session_logging_id}")
+    except Exception as exc:
+        return _protocol_registration_failure_result(
+            email=email,
+            error=exc,
+            create_acknowledged=create_acknowledged,
+            traffic_tracker=traffic_tracker,
+            traffic_snapshot=traffic_snapshot,
+        )
+
     try:
         # 网络预检、bootstrap、providers、CSRF、signin、authorize 必须作为一个完整前置链路；
         # OTP 尚未可靠触发时，任一可重试 403 都可以安全换会话重来。
@@ -529,6 +677,7 @@ def run_registration(
             session,
             proxy,
             email,
+            traffic_tracker=traffic_tracker,
         )
 
         # 协议注册必须先走密码页，再提交 user/register；否则会创建无密码账号。
@@ -705,6 +854,10 @@ def run_registration(
                 )
             human_delay("post_auth")
 
+        # Freeze before the shared session enters 2FA. The session remains open and
+        # retains its cookies/circuit state, but later requests cannot change totals.
+        traffic_snapshot = _freeze_protocol_traffic(traffic_tracker)
+
         # ==================== 阶段7: 设置 2FA（受 config.ENABLE_2FA 控制）====================
         totp_secret = None
         if _twofa_cfg.ENABLE_2FA:
@@ -760,6 +913,7 @@ def run_registration(
                 "browser_profile": getattr(session, "browser_profile", None),
                 "registration_password": registration_password,
                 "codex": codex_result,
+                "network_traffic": dict(traffic_snapshot or _freeze_protocol_traffic(traffic_tracker)),
             },
         )
 
@@ -821,46 +975,17 @@ def run_registration(
                 "access_token": access_token, "totp_secret": totp_secret,
                 "flow": flow_result, "codex": codex_result,
                 "chatgpt2api": pool_import_result,
-                "error": task_error}
+                "error": task_error,
+                "network_traffic": dict(traffic_snapshot or _freeze_protocol_traffic(traffic_tracker))}
 
     except Exception as e:
-        logger.error(f"[失败] {email}: {type(e).__name__}: {e}")
-        logger.debug("详细错误信息:", exc_info=True)
-        # 邮箱状态回收策略，三种情况：
-        #   1. 账号已废（account_deactivated 等）：邮箱素材本身不可用，标 failed 直接剔除。
-        #   2. 创建接口通过后失败：远端已消耗这个邮箱，直接废弃，避免重复注册。
-        #   3. 创建接口通过前的普通失败：邮箱还可以下次继续尝试，放回 available。
-        from core.openai_auth import AccountUnusableError
-        account_dead = isinstance(e, AccountUnusableError)
-        try:
-            if email:
-                from core.email_provider import release_email
-                if account_dead:
-                    src = release_email(
-                        email, status="failed",
-                        note=f"账号已废弃，邮箱不可用: {str(e)[:180]}",
-                    )
-                    logger.warning(f"[邮箱:{src}] {email} 账号已废弃，标记为 failed，不再重新注册")
-                elif create_acknowledged:
-                    src = release_email(
-                        email, status="failed",
-                        note=f"创建接口已通过但后续失败，已废弃: {str(e)[:180]}",
-                    )
-                    logger.warning(f"[邮箱:{src}] {email} 已创建但后续失败，标记为 failed，不再重新注册")
-                else:
-                    from core.email_provider import release_email_if_unconsumed, resolve_email_source
-                    source = resolve_email_source(email)
-                    changed = release_email_if_unconsumed(
-                        email,
-                        note=f"上次失败: {str(e)[:180]}",
-                    )
-                    if changed:
-                        logger.info(f"[邮箱:{source}] {email} 已恢复 available")
-                    else:
-                        logger.info(f"[邮箱:{source}] {email} 未回收：已存在注册账号或邮箱已被其他状态占用")
-        except Exception:
-            pass
-        return {"success": False, "email": email, "error": str(e)}
+        return _protocol_registration_failure_result(
+            email=email,
+            error=e,
+            create_acknowledged=create_acknowledged,
+            traffic_tracker=traffic_tracker,
+            traffic_snapshot=traffic_snapshot,
+        )
 
 
 def main():

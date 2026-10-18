@@ -6,6 +6,8 @@ Use this contract when `REGISTRATION_DRIVER=protocol` creates a `BrowserSession`
 
 The observer covers constructor-time GeoIP GETs and raw curl_cffi GET/POST calls made by `BrowserSession`. It observes after a transport call returns or raises. It never retries, raises status, resets a circuit, reads a response body, consumes a stream, or changes request arguments. The tracker freezes before the separate 2FA stage.
 
+Protocol registration also passes the normalized `config.browser.LIVENESS_IMPERSONATE` profile (`chrome124`) to every `BrowserSession` it creates through its dedicated factory, including retries, reopen recovery, and direct fallback. This does not change the global `IMPERSONATE=chrome146` default or unrelated session callers; the transport override affects curl_cffi TLS/HTTP only.
+
 ### Post-authenticated bootstrap traffic policy
 
 `CHATGPT_AUTH_BOOTSTRAP_ENABLED` defaults to `True` for protocol registration, preserving the existing authenticated ChatGPT warm-up after OAuth callback handling has produced `/api/auth/session` and an access token. Set `CHATGPT_AUTH_BOOTSTRAP_ENABLED=False` in `.env` to skip this optional traffic. The default does not change anonymous bootstrap, network preflight, Sentinel, OAuth/OTP/account-creation requests, callback/session persistence, or any existing retry/fallback behavior. Both protocol registration completion branches keep their conditional call.
@@ -70,6 +72,7 @@ The paged and legacy non-paged account-list API paths, plus both V2/Legacy accou
 
 | Condition | Required result |
 | --- | --- |
+| Protocol session is created or reopened | Pass normalized `LIVENESS_IMPERSONATE` (`chrome124`) and the shared traffic tracker; leave global `IMPERSONATE=chrome146` unchanged |
 | `BrowserSession` has no tracker | Preserve the exact existing call and response behavior |
 | A tracked GET/POST returns 2xx/3xx | Count one completed request and native known byte/timing fields |
 | A tracked GET/POST returns HTTP 4xx/5xx | Count one failed request and one `http_error`; preserve the response |

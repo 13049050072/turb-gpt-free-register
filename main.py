@@ -10,6 +10,7 @@ import time
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from typing import Callable
 
+from config import browser as _browser_cfg
 from config import REGISTER_EMAIL, REGISTER_NAME  # 这两个一般不在 WebUI 改
 # 可热改的，按模块属性方式读
 from config import twofa as _twofa_cfg
@@ -66,8 +67,13 @@ def _new_protocol_registration_session(
     *,
     traffic_tracker: ProtocolTrafficTracker | None = None,
 ) -> BrowserSession:
-    """Create protocol registration sessions with the global transport default."""
-    kwargs = {"proxy": proxy}
+    """Create protocol registration sessions with the validated liveness transport profile."""
+    kwargs = {
+        "proxy": proxy,
+        "transport_impersonate": _browser_cfg.normalize_liveness_impersonate(
+            _browser_cfg.LIVENESS_IMPERSONATE
+        ),
+    }
     if traffic_tracker is not None:
         kwargs["traffic_tracker"] = traffic_tracker
     return BrowserSession(**kwargs)

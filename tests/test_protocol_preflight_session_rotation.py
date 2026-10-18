@@ -6,13 +6,28 @@ import main
 
 
 class ProtocolPreflightSessionRotationTests(unittest.TestCase):
-    def test_registration_factory_uses_global_browser_transport_default(self):
+    def test_registration_factory_uses_validated_liveness_transport(self):
         session = object()
         with patch.object(main, "BrowserSession", return_value=session) as create_session:
             result = main._new_protocol_registration_session(None)
 
         self.assertIs(result, session)
-        create_session.assert_called_once_with(proxy=None)
+        create_session.assert_called_once_with(
+            proxy=None,
+            transport_impersonate="chrome124",
+        )
+
+    def test_registration_factory_normalizes_unverified_liveness_profile(self):
+        session = object()
+        with patch.object(main._browser_cfg, "LIVENESS_IMPERSONATE", "chrome146"), \
+             patch.object(main, "BrowserSession", return_value=session) as create_session:
+            result = main._new_protocol_registration_session("")
+
+        self.assertIs(result, session)
+        create_session.assert_called_once_with(
+            proxy="",
+            transport_impersonate="chrome124",
+        )
 
     def test_retryable_preflight_rebuilds_session_before_otp(self):
         first = object()
@@ -27,6 +42,7 @@ class ProtocolPreflightSessionRotationTests(unittest.TestCase):
         self.assertEqual(preflight.call_count, 2)
         create_session.assert_called_once_with(
             proxy=None,
+            transport_impersonate="chrome124",
         )
         close_session.assert_called_once_with(first)
 
@@ -56,6 +72,7 @@ class ProtocolPreflightSessionRotationTests(unittest.TestCase):
         signin.assert_called_once_with(second, "csrf-token", "user@example.com")
         create_session.assert_called_once_with(
             proxy=None,
+            transport_impersonate="chrome124",
         )
         close_session.assert_called_once_with(first)
 
@@ -88,6 +105,7 @@ class ProtocolPreflightSessionRotationTests(unittest.TestCase):
         self.assertEqual(follow.call_args_list[1].args, (second, "authorize-2"))
         create_session.assert_called_once_with(
             proxy=None,
+            transport_impersonate="chrome124",
         )
         close_session.assert_called_once_with(first)
 
@@ -120,6 +138,7 @@ class ProtocolPreflightSessionRotationTests(unittest.TestCase):
         self.assertEqual(authorize.call_args_list[1].args[1:], ("", "user@example.com"))
         create_session.assert_called_once_with(
             proxy="",
+            transport_impersonate="chrome124",
         )
         close_session.assert_called_once_with(first)
 
@@ -173,6 +192,7 @@ class ProtocolPreflightSessionRotationTests(unittest.TestCase):
         create_session.assert_called_once_with(
             proxy=None,
             traffic_tracker=tracker,
+            transport_impersonate="chrome124",
         )
 
     def test_shared_tracker_is_propagated_to_preflight_rotation_factory(self):
@@ -198,6 +218,7 @@ class ProtocolPreflightSessionRotationTests(unittest.TestCase):
         create_session.assert_called_once_with(
             proxy=None,
             traffic_tracker=tracker,
+            transport_impersonate="chrome124",
         )
 
     def test_shared_tracker_is_propagated_to_auth_rotation_factory(self):
@@ -234,6 +255,7 @@ class ProtocolPreflightSessionRotationTests(unittest.TestCase):
         create_session.assert_called_once_with(
             proxy=None,
             traffic_tracker=tracker,
+            transport_impersonate="chrome124",
         )
 
     def test_shared_tracker_is_propagated_to_authorize_reopen_factory(self):
@@ -266,6 +288,7 @@ class ProtocolPreflightSessionRotationTests(unittest.TestCase):
         create_session.assert_called_once_with(
             proxy=None,
             traffic_tracker=tracker,
+            transport_impersonate="chrome124",
         )
 
     def test_shared_tracker_is_propagated_to_retry_and_direct_fallback_sessions(self):
@@ -298,6 +321,7 @@ class ProtocolPreflightSessionRotationTests(unittest.TestCase):
         create_session.assert_called_once_with(
             proxy="",
             traffic_tracker=tracker,
+            transport_impersonate="chrome124",
         )
 
 

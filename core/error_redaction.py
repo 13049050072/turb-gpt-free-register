@@ -27,6 +27,7 @@ _BARE_PROXY_CREDENTIAL_RE = re.compile(
     rf"(?i)(?<![A-Za-z0-9._~%!$&()*+=-]){_PROXY_USERINFO}@{_PROXY_HOST}:\d{{1,5}}(?!\d)"
 )
 _AUTH_SCHEME_RE = re.compile(r"(?i)\b(?:bearer|basic)\s+[^\s,;]+")
+_PROVIDER_SESSION_RE = re.compile(r"(?i)-sid-[A-Za-z0-9]{8,64}-t-\d{1,4}")
 _URL_RE = re.compile(r"\b(?:https?|socks(?:4a?|5h?)?)://[^\s,;]+", re.I)
 _TOKENISH_RE = re.compile(r"(?<![A-Za-z0-9])[A-Za-z0-9_+/=-]{20,}(?:\.[A-Za-z0-9_+/=-]{8,})*")
 
@@ -43,6 +44,7 @@ def redact_error(value: object) -> str:
     text = _QUOTED_SECRET_RE.sub(r"\1\2[redacted]\2", text)
     text = _UNQUOTED_SECRET_RE.sub(r"\1[redacted]", text)
     text = _AUTH_SCHEME_RE.sub("authorization [redacted]", text)
+    text = _PROVIDER_SESSION_RE.sub("-sid-[redacted]-t-[redacted]", text)
     text = _URL_RE.sub("[url-redacted]", text)
     text = _TOKENISH_RE.sub("[token-redacted]", text)
     return text[:MAX_REDACTED_ERROR_LENGTH]

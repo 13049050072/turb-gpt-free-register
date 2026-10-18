@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import random
+import secrets
 import threading
 import uuid
 from concurrent.futures import ThreadPoolExecutor
@@ -13,6 +14,9 @@ from pathlib import Path
 from core import db
 from core.account_liveness import check_account_liveness, log_path
 from core.chatgpt_plan import _mask_proxy, open_plan_check_proxy, resolve_plan_check_route
+from core.error_redaction import redact_error
+from core.openai_auth import detect_account_unusable_text
+from core.proxy_utils import is_1024proxy_dynamic_gateway, liveness_proxy_url
 
 logger = logging.getLogger(__name__)
 
@@ -30,6 +34,8 @@ _NETWORK_RETRY_HINTS = (
 
 def _configured_live_check_proxies(proxy_cfg) -> list[str]:
     """查活优先使用套餐专用代理池，未配置时使用注册代理池。"""
+    if str(getattr(proxy_cfg, "PLAN_CHECK_PROXY_MODE", "auto") or "auto").strip().lower() == "direct":
+        return []
     values = list(getattr(proxy_cfg, "PLAN_CHECK_PROXY", []) or [])
     if not values:
         values = list(getattr(proxy_cfg, "PROXY_POOL", []) or [])
@@ -51,6 +57,8 @@ def _retryable_live_check_result(result: dict) -> bool:
     if result.get("ok") or result.get("status") == "deactivated":
         return False
     text = str(result.get("error") or "").lower()
+    if detect_account_unusable_text(text):
+        return False
     return any(hint in text for hint in _NETWORK_RETRY_HINTS)
 
 
@@ -76,17 +84,23 @@ def _append_log(email: str, line: str, *, clear: bool = False) -> None:
 def _safe_append_log(email: str, line: str, *, clear: bool = False) -> None:
     """辅助日志失败不能覆盖查活结果或阻止保存已经刷新的 AT。"""
     try:
-        _append_log(email, line, clear=clear)
-    except Exception:
-        logger.warning("[查活] 日志写入失败: %s", email, exc_info=True)
+        _append_log(email, redact_error(line), clear=clear)
+    except Exception as exc:
+        logger.warning(
+            "[查活] 日志写入失败: %s (%s: %s)",
+            email, type(exc).__name__, redact_error(exc), exc_info=False,
+        )
 
 
 def _close_relay(relay) -> None:
     if relay is not None:
         try:
             relay.close()
-        except Exception:
-            logger.warning("[查活] 代理中继关闭失败", exc_info=True)
+        except Exception as exc:
+            logger.warning(
+                "[查活] 代理中继关闭失败 (%s: %s)",
+                type(exc).__name__, redact_error(exc), exc_info=False,
+            )
 
 
 def complete_authenticated_live_check(*, account_id: int, expected_account: dict, result: dict, session, run_id: str | None = None) -> dict:
@@ -100,14 +114,33 @@ def complete_authenticated_live_check(*, account_id: int, expected_account: dict
             access_token=result["access_token"], session=session,
         )
     except Exception as exc:
-        logger.exception("[查活] 自动查套餐异常: account_id=%s", account_id)
-        result["plan_result"] = {"ok": False, "error": f"{type(exc).__name__}: {str(exc)[:200]}"}
+        logger.error(
+            "[查活] 自动查套餐异常: account_id=%s error=%s",
+            account_id, redact_error(exc),
+        )
+        result["plan_result"] = {
+            "ok": False,
+            "error": f"{type(exc).__name__}: {redact_error(exc)[:200]}",
+        }
+    plan_result = result.get("plan_result") or {}
+    if isinstance(plan_result, dict) and plan_result.get("error") is not None:
+        plan_result = dict(plan_result)
+        plan_result["error"] = redact_error(plan_result["error"])
+        result["plan_result"] = plan_result
     _safe_append_log(expected_account["email"], "[查活] 自动查套餐：" +
-                     ("成功" if result["plan_result"].get("ok") else "失败 " + str(result["plan_result"].get("error") or "")))
+                     ("成功" if plan_result.get("ok") else "失败 " + str(plan_result.get("error") or "")))
     return result
 
 
-def _run_live_check(*, account_id: int, email: str, proxy: str | None, trigger: str, run_id: str | None = None) -> dict:
+def _run_live_check(
+    *,
+    account_id: int,
+    email: str,
+    proxy: str | None,
+    trigger: str,
+    run_id: str | None = None,
+    release_queue_slot: bool = True,
+) -> dict:
     relay = None
     expected_account = {"email": email}
     completed_in_session = False
@@ -127,12 +160,14 @@ def _run_live_check(*, account_id: int, email: str, proxy: str | None, trigger: 
         from config import proxy as proxy_cfg
         candidates = _configured_live_check_proxies(proxy_cfg)
         route = resolve_plan_check_route(explicit_proxy=proxy)
-        # 查活规则独立于套餐查询的 direct/auto 选择：只要任一代理池有数据，
-        # 就禁止直连，并从池中随机选择一个出口。
-        if candidates and not str(route.get("proxy") or "").strip():
+        # 查活规则遵循套餐网络模式；direct 模式保留直连，auto/proxy 模式从
+        # 配置池选择代理。动态 1024Proxy 模板可在同一网关上轮换 sticky session，
+        # 其他代理与已有 sticky URL 保留既有 fallback 行为。
+        if candidates and proxy is None and not str(route.get("proxy") or "").strip():
             route = _live_proxy_route(random.choice(candidates), proxy_cfg)
             route["selected_from_pool"] = True
-        selected_proxy = str(route.get("proxy") or "").strip()
+        route_template = str(route.get("proxy") or "").strip()
+        selected_proxy = route_template
         timeout = float(getattr(proxy_cfg, "PLAN_CHECK_TIMEOUT", 15.0) or 15.0)
         # 查活必须沿用账号注册时记录的邮箱来源。不能只调用
         # resolve_email_source(email)：Remail 等临时邮箱的上下文只在领取进程
@@ -155,14 +190,27 @@ def _run_live_check(*, account_id: int, email: str, proxy: str | None, trigger: 
             f"fallback_reason={route.get('proxy_fallback_reason') or '-'}"
         )
         # 每个代理出口使用独立 BrowserSession/指纹/Cookie。网络类失败后换池中
-        # 尚未使用的代理；池非空时绝不直连。
+        # 尚未使用的代理；自动派生的 1024Proxy 模板可保持网关并换 sticky session，
+        # 已有 sticky URL 和其他代理继续使用既有直连兜底。
+        liveness_run_nonce = secrets.token_hex(16)
         max_routes = max(1, int(getattr(proxy_cfg, "PLAN_CHECK_MAX_ATTEMPTS", 3) or 3))
         used_proxies: set[str] = set()
         result: dict = {"ok": False, "status": "failed", "error": "查活未执行"}
         for route_attempt in range(1, max_routes + 1):
-            selected_proxy = str(route.get("proxy") or "").strip()
-            if selected_proxy:
-                used_proxies.add(selected_proxy)
+            proxy_template = route_template
+            selected_proxy = liveness_proxy_url(
+                proxy_template,
+                account_key=expected_account.get("email") or email,
+                route_attempt=route_attempt,
+                run_nonce=liveness_run_nonce,
+            )
+            auto_sticky_session = bool(
+                proxy_template
+                and selected_proxy != proxy_template
+                and is_1024proxy_dynamic_gateway(proxy_template)
+            )
+            if proxy_template:
+                used_proxies.add(proxy_template)
             effective_proxy, relay = open_plan_check_proxy(
                 route, selected_proxy, timeout=timeout,
             )
@@ -181,6 +229,9 @@ def _run_live_check(*, account_id: int, email: str, proxy: str | None, trigger: 
                 fingerprint_state={"force_fresh": route_attempt > 1},
                 on_authenticated=authenticated,
             )
+            if isinstance(result, dict) and result.get("error") is not None:
+                result = dict(result)
+                result["error"] = redact_error(result["error"])
             if relay is not None:
                 _close_relay(relay)
                 relay = None
@@ -196,9 +247,18 @@ def _run_live_check(*, account_id: int, email: str, proxy: str | None, trigger: 
                     f"{_mask_proxy(next_proxy)}",
                 )
                 route = _live_proxy_route(next_proxy, proxy_cfg)
+                route_template = str(next_proxy).strip()
                 continue
 
-            # 保留原有显式代理的独立直连兜底行为；池内随机路线则仅换下一出口。
+            # 1024Proxy 网关即使只有一个入口也支持通过新的 -sid- 获取
+            # 新出口；不能因为模板 URL 相同而提前退到直连。其他代理继续
+            # 保留原有显式代理/单池入口的独立直连兜底行为。
+            if auto_sticky_session and route_attempt < max_routes:
+                _safe_append_log(
+                    email,
+                    "[查活] 1024Proxy 网关网络/403错误，保留网关模板并创建新的会话",
+                )
+                continue
             if selected_proxy and route_attempt < max_routes:
                 _safe_append_log(
                     email,
@@ -208,6 +268,7 @@ def _run_live_check(*, account_id: int, email: str, proxy: str | None, trigger: 
                     "proxy": "", "network_route": "direct", "proxy_mode": "direct",
                     "proxy_used": None, "proxy_fallback_reason": "代理路线失败，直连兜底",
                 }
+                route_template = ""
                 continue
             break
         if not completed_in_session and not db.update_account_liveness(account_id, result, expected_account=expected_account, expected_run_id=run_id):
@@ -231,13 +292,19 @@ def _run_live_check(*, account_id: int, email: str, proxy: str | None, trigger: 
             "ok": False,
             "status": "failed",
             "checked_at": datetime.now().isoformat(timespec="seconds"),
-            "error": f"{type(exc).__name__}: {str(exc)[:500]}",
+            "error": f"{type(exc).__name__}: {redact_error(exc)[:500]}",
         }
         try:
             db.update_account_liveness(account_id, result, expected_account=expected_account, expected_run_id=run_id)
-        except Exception:
-            logger.exception("[查活] 写入异常状态失败: account_id=%s", account_id)
-        logger.exception("[查活] 后台异常: %s", email)
+        except Exception as db_exc:
+            logger.error(
+                "[查活] 写入异常状态失败: account_id=%s error=%s",
+                account_id, redact_error(db_exc),
+            )
+        logger.error(
+            "[查活] 后台异常: account_id=%s error=%s",
+            account_id, redact_error(exc),
+        )
         try:
             _safe_append_log(email, f"[查活] 后台异常：{result['error']}")
         except Exception:
@@ -250,7 +317,8 @@ def _run_live_check(*, account_id: int, email: str, proxy: str | None, trigger: 
         finally:
             with _LOCK:
                 _RUNNING.discard(int(account_id))
-            _QUEUE_SLOTS.release()
+            if release_queue_slot:
+                _QUEUE_SLOTS.release()
 
 
 def run_account_live_check(
@@ -297,8 +365,11 @@ def _release_cancelled_check(future, account_id: int, run_id: str | None = None)
               "checked_at": datetime.now().isoformat(timespec="seconds")}
     try:
         db.update_account_liveness(account_id, result, expected_run_id=run_id)
-    except Exception:
-        logger.exception("写入取消状态失败: account_id=%s", account_id)
+    except Exception as exc:
+        logger.error(
+            "[查活] 写入取消状态失败: account_id=%s error=%s",
+            account_id, redact_error(exc),
+        )
     finally:
         with _LOCK:
             _RUNNING.discard(account_id)
@@ -351,13 +422,16 @@ def enqueue_account_live_check(*, account_id: int, email: str, trigger: str = "m
             "ok": False,
             "status": "failed",
             "checked_at": datetime.now().isoformat(timespec="seconds"),
-            "error": f"查活入队失败: {type(exc).__name__}: {str(exc)[:160]}",
+            "error": f"查活入队失败: {type(exc).__name__}: {redact_error(exc)[:160]}",
         }
         db.update_account_liveness(account_id, result, expected_run_id=run_id)
         try:
             _append_log(email, result["error"])
-        except Exception:
-            logger.exception("[查活] 入队失败日志写入异常")
+        except Exception as log_exc:
+            logger.error(
+                "[查活] 入队失败日志写入异常: %s",
+                redact_error(log_exc), exc_info=False,
+            )
         return {"accepted": False, "busy": False, "error": result["error"]}
 
     return {

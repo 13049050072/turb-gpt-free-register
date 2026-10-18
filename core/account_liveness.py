@@ -11,6 +11,8 @@ from typing import Callable
 
 from core import db
 from core.session import BrowserSession, close_browser_session
+from core.proxy_utils import mask_proxy_url
+from core.error_redaction import redact_error
 from core.codex_oauth import _account_registration_password, _account_totp_secret, _account_totp_code
 from core.humanize import delay as human_delay
 from core.chatgpt_auth import get_csrf_token, get_providers, probe_auth_session, signin_openai
@@ -32,6 +34,15 @@ from core.account_export import (
 from core.email_provider import wait_for_otp
 
 logger = logging.getLogger(__name__)
+
+
+class _RedactedLogFormatter(logging.Formatter):
+    """Keep per-account liveness files useful without copying secret-bearing errors."""
+
+    def format(self, record):
+        return redact_error(super().format(record))
+
+
 _LOG_DIR = Path(__file__).resolve().parent.parent / "注册日志"
 _RUNNING: set[str] = set()
 _RUNNING_LOCK = threading.Lock()
@@ -157,7 +168,7 @@ def _network_preflight_with_retry(
     for attempt in range(1, max_attempts + 1):
         logger.info(
             "[查活] 复用统一会话：proxy=%s device_id=%s oai_session_id=%s（网络预检第 %s/%s 次）",
-            session.proxy or "配置随机/直连", session.device_id,
+            mask_proxy_url(session.proxy) or "配置随机/直连", session.device_id,
             str(getattr(session, "oai_session_id", "") or "")[:12] + "...",
             attempt, max_attempts,
         )
@@ -180,10 +191,10 @@ def _network_preflight_with_retry(
             _clear_optional_bootstrap_circuit(session)
             logger.warning(
                 "[查活] 网络预检失败（%s/%s），保留当前 session/deviceId/CF Cookie 重试：%s",
-                attempt, max_attempts, str(exc)[:200],
+                attempt, max_attempts, redact_error(exc)[:200],
             )
             time.sleep(2)
-    raise RuntimeError(f"网络预检多次失败：{last_exc}")
+    raise RuntimeError(f"网络预检多次失败：{redact_error(last_exc)}")
 
 
 def _now() -> str:
@@ -312,7 +323,7 @@ def _follow_continue_and_fetch(session: BrowserSession, continue_url: str, *, re
             logger.warning(
                 "[查活] OAuth callback 临时失败（%s/%s），保留当前 "
                 "session/deviceId/CF Cookie，%.1fs 后重试：%s",
-                attempt, max_attempts, delay, str(exc)[:200],
+                attempt, max_attempts, delay, redact_error(exc)[:200],
             )
             time.sleep(delay)
 
@@ -327,7 +338,7 @@ def _follow_continue_and_fetch(session: BrowserSession, continue_url: str, *, re
             logger.warning(
                 "[查活] Session/AT 拉取临时失败（%s/%s），保留当前 "
                 "session/deviceId/CF Cookie，%.1fs 后重试：%s",
-                attempt, max_attempts, delay, str(exc)[:200],
+                attempt, max_attempts, delay, redact_error(exc)[:200],
             )
             time.sleep(delay)
     raise RuntimeError("查活 Session/AT 拉取重试耗尽")
@@ -339,7 +350,10 @@ def _stored_access_token(email: str) -> str:
         account = db.get_account_by_email(email)
         return str((account or {}).get("access_token") or "").strip()
     except Exception as exc:
-        logger.debug("[查活] 读取已有 accessToken 失败，改走备用登录链：%s: %s", type(exc).__name__, exc)
+        logger.debug(
+            "[查活] 读取已有 accessToken 失败，改走备用登录链：%s: %s",
+            type(exc).__name__, redact_error(exc),
+        )
         return ""
 
 
@@ -371,7 +385,10 @@ def _warm_authenticated_session(session: BrowserSession, access_token: str) -> N
         logger.info("[查活] accessToken 预热完成，继续走 reauth OTP")
     except Exception as exc:
         # strict=False 已经会吞掉大部分单接口错误；这里仅兜住初始化异常。
-        logger.warning("[查活] accessToken 预热失败，继续走 reauth OTP：%s: %s", type(exc).__name__, str(exc)[:180])
+        logger.warning(
+            "[查活] accessToken 预热失败，继续走 reauth OTP：%s: %s",
+            type(exc).__name__, redact_error(exc)[:180],
+        )
     finally:
         _clear_optional_bootstrap_circuit(session)
 
@@ -436,7 +453,7 @@ def _validate_reauth_with_retry(
                 "[查活] 重认证 OTP 无效/过期，重新发送后再取（%s/%s）：%s",
                 attempt,
                 max_otp_attempts,
-                str(exc)[:180],
+                redact_error(exc)[:180],
             )
             send_email_otp(session)
             otp_after_ts = time.time()
@@ -609,8 +626,11 @@ def _login_via_full_web_flow(
     except BaseException:
         try:
             close_browser_session(session)
-        except Exception:
-            logger.warning("[查活] 登录失败后的会话清理异常", exc_info=True)
+        except Exception as exc:
+            logger.warning(
+                "[查活] 登录失败后的会话清理异常 (%s: %s)",
+                type(exc).__name__, redact_error(exc), exc_info=False,
+            )
         raise
 
 
@@ -649,7 +669,7 @@ def _validate_with_retry(
             last_exc = exc
             if attempt >= max_otp_attempts:
                 break
-            logger.warning("[查活] OTP 无效/过期，重新发送后再取：%s", str(exc)[:180])
+            logger.warning("[查活] OTP 无效/过期，重新发送后再取：%s", redact_error(exc)[:180])
             send_email_otp(session)
             # 以“重新发送请求完成后”为新基准，避免刚刚失败的上一封旧码再次被 after 容忍窗口命中。
             otp_after_ts = time.time()
@@ -660,7 +680,10 @@ def _validate_with_retry(
             if attempt >= max_otp_attempts or not _is_retryable_network_error(exc):
                 raise
             last_exc = exc
-            logger.warning("[查活] OTP 验证网络抖动，重新发送后再取（%s/%s）：%s", attempt, max_otp_attempts, str(exc)[:180])
+            logger.warning(
+                "[查活] OTP 验证网络抖动，重新发送后再取（%s/%s）：%s",
+                attempt, max_otp_attempts, redact_error(exc)[:180],
+            )
             try:
                 send_email_otp(session)
             except Exception:
@@ -715,7 +738,7 @@ def check_account_liveness(
     try:
         fh = logging.FileHandler(str(path), encoding="utf-8")
         fh.setLevel(logging.DEBUG)
-        fh.setFormatter(logging.Formatter(
+        fh.setFormatter(_RedactedLogFormatter(
             "%(asctime)s [%(levelname)s] %(message)s",
             datefmt="%H:%M:%S",
         ))
@@ -735,7 +758,7 @@ def check_account_liveness(
             session = _new_fingerprint_pinned_session(email, proxy, task_fingerprint_state)
             logger.info(
                 "[查活] 会话创建完成：proxy=%s device_id=%s（复用2FA稳定链路）",
-                session.proxy or "直连/配置随机",
+                mask_proxy_url(session.proxy) or "直连/配置随机",
                 session.device_id,
             )
             logger.info("[查活] 指纹摘要：%s", session.fingerprint_summary_text())
@@ -757,7 +780,7 @@ def check_account_liveness(
                 failed_proxy = session.proxy if proxy is None else proxy
                 logger.warning(
                     "[查活] AT reauth 链临时失败，切换干净会话执行纯协议完整登录：%s",
-                    str(reauth_exc)[:240],
+                    redact_error(reauth_exc)[:240],
                 )
                 try:
                     close_browser_session(session)
@@ -796,7 +819,7 @@ def check_account_liveness(
             "checked_at": checked_at,
             "access_token": access_token,
             "session": session_info,
-            "proxy_used": session.proxy or None,
+            "proxy_used": mask_proxy_url(session.proxy) or None,
             "fingerprint": fp,
             "fingerprint_text": _safe_fingerprint_text_for_account(session),
         }
@@ -809,7 +832,10 @@ def check_account_liveness(
             _wait_for_rate_slot()
             result["plan_result"] = check_account_plan(access_token, session=session)
         except Exception as exc:
-            result["plan_result"] = {"ok": False, "error": f"{type(exc).__name__}: {str(exc)[:200]}"}
+            result["plan_result"] = {
+                "ok": False,
+                "error": f"{type(exc).__name__}: {redact_error(exc)[:200]}",
+            }
         return result
 
     except AccountUnusableError as exc:
@@ -821,8 +847,13 @@ def check_account_liveness(
         if code:
             logger.warning("[查活] 已废号：%s %s", email, code)
             return {"ok": False, "status": "deactivated", "checked_at": checked_at, "error": code}
-        logger.warning("[查活] 失败：%s %s: %s", email, type(exc).__name__, str(exc)[:260])
-        return {"ok": False, "status": "failed", "checked_at": checked_at, "error": f"{type(exc).__name__}: {str(exc)[:500]}"}
+        logger.warning("[查活] 失败：%s %s: %s", email, type(exc).__name__, redact_error(exc)[:260])
+        return {
+            "ok": False,
+            "status": "failed",
+            "checked_at": checked_at,
+            "error": f"{type(exc).__name__}: {redact_error(exc)[:500]}",
+        }
     finally:
         try:
             logger.info("[查活] 结束：%s", email)
@@ -835,9 +866,12 @@ def check_account_liveness(
                 root_logger.removeHandler(fh)
                 try:
                     fh.close()
-                except Exception:
+                except Exception as exc:
                     # 已保存的查活/套餐结果不应被日志文件关闭异常覆盖。
-                    logger.warning("[查活] 日志文件关闭失败", exc_info=True)
+                    logger.warning(
+                        "[查活] 日志文件关闭失败 (%s: %s)",
+                        type(exc).__name__, redact_error(exc), exc_info=False,
+                    )
         finally:
             with _RUNNING_LOCK:
                 _RUNNING.discard(key)

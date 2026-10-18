@@ -21,6 +21,7 @@ from config import (
     REQUEST_TIMEOUT, pick_proxy, pick_browser_profile, validate_browser_profile,
     BROWSER_PROFILE_POOL, build_browser_environment,
 )
+from core.proxy_utils import mask_proxy_url
 
 
 logger = logging.getLogger(__name__)
@@ -281,7 +282,7 @@ class BrowserSession:
         geo = profile.get("geo") or self.exit_geo or {}
         summary = {
             "device_id": self.device_id,
-            "proxy": self.proxy or "",
+            "proxy": mask_proxy_url(self.proxy) if self.proxy else "",
             "proxy_mode": "direct" if not self.proxy else "proxy",
             "browser_family": profile.get("browser_family") or "chrome",
             "browser_os": profile.get("browser_os") or "macOS",

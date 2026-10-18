@@ -1,12 +1,17 @@
 """Common parsing helpers for HTTP and SOCKS proxy URLs."""
 from __future__ import annotations
 
+import hashlib
+import re
+import secrets
 import socket
 from dataclasses import dataclass
-from urllib.parse import unquote, urlsplit
+from urllib.parse import unquote, urlsplit, urlunsplit
 
 
 SUPPORTED_PROXY_SCHEMES = frozenset({"http", "https", "socks5", "socks5h"})
+_1024PROXY_HOST_SUFFIXES = ("1024proxy.io", "1024proxy.com", "1024proxy.net")
+_STICKY_SESSION_MARKER = re.compile(r"-sid-[^:@\s]+-t-\d+(?:$|[-_])", re.IGNORECASE)
 
 
 @dataclass(frozen=True)
@@ -46,6 +51,99 @@ def parse_proxy_url(value: str, *, allow_bare: bool = False) -> ProxySpec:
         username=unquote(parsed.username or ""),
         password=unquote(parsed.password or ""),
     )
+
+
+def is_1024proxy_dynamic_gateway(value: str) -> bool:
+    """Return whether ``value`` is a supported 1024Proxy gateway URL.
+
+    The provider uses subdomains such as ``us.1024proxy.io`` for dynamic
+    gateways.  Only the provider's own DNS suffixes are accepted so an
+    arbitrary hostname containing the provider name cannot be rewritten.
+    """
+    text = str(value or "").strip()
+    if not text:
+        return False
+    try:
+        parsed = urlsplit(text)
+        host = (parsed.hostname or "").rstrip(".").lower()
+        try:
+            port = parsed.port
+        except ValueError:
+            return False
+        return (
+            parsed.scheme.lower() in SUPPORTED_PROXY_SCHEMES
+            and bool(port and 1 <= port <= 65535)
+            and any(host == suffix or host.endswith("." + suffix)
+                    for suffix in _1024PROXY_HOST_SUFFIXES)
+        )
+    except ValueError:
+        return False
+
+
+def _raw_proxy_username(parsed) -> str:
+    """Return the URL-encoded username without decoding userinfo."""
+    raw_at = parsed.netloc.rfind("@")
+    if raw_at < 0:
+        return ""
+    raw_userinfo = parsed.netloc[:raw_at]
+    raw_colon = raw_userinfo.find(":")
+    return raw_userinfo if raw_colon < 0 else raw_userinfo[:raw_colon]
+
+
+def _liveness_sticky_session_id(
+    proxy_url: str,
+    account_key: str,
+    route_attempt: int,
+    run_nonce: str | None = None,
+) -> str:
+    """Create a bounded opaque ID using a fresh in-memory run nonce."""
+    parsed = urlsplit(proxy_url)
+    host = (parsed.hostname or "").lower()
+    try:
+        port = parsed.port or 0
+    except ValueError:
+        port = 0
+    nonce = str(run_nonce or "").strip() or secrets.token_hex(16)
+    material = (
+        f"liveness:{nonce}:{str(account_key or '').strip().lower()}:"
+        f"{int(route_attempt)}:{host}:{port}"
+    )
+    return hashlib.sha256(material.encode("utf-8")).hexdigest()[:20]
+
+
+def liveness_proxy_url(
+    value: str,
+    *,
+    account_key: str,
+    route_attempt: int,
+    run_nonce: str | None = None,
+) -> str:
+    """Add a per-account, per-attempt 1024Proxy sticky session when needed.
+
+    Existing provider sticky parameters are deliberately returned byte-for-byte
+    unchanged.  A missing ``run_nonce`` creates a fresh cryptographically random
+    nonce for this invocation; callers may pass one in-memory nonce for a whole
+    liveness job.  For a new session only the raw username portion is extended;
+    encoded usernames/passwords, host, path and query are not decoded or
+    rebuilt, so credentials keep their original URL representation.
+    """
+    text = str(value or "").strip()
+    if not text or not is_1024proxy_dynamic_gateway(text):
+        return text
+    parsed = urlsplit(text)
+    raw_at = parsed.netloc.rfind("@")
+    if raw_at < 0:
+        return text
+    raw_userinfo = parsed.netloc[:raw_at]
+    raw_username = _raw_proxy_username(parsed)
+    raw_password = raw_userinfo[len(raw_username):]
+    if not raw_username or _STICKY_SESSION_MARKER.search(unquote(raw_username)):
+        return text
+    session_id = _liveness_sticky_session_id(
+        text, account_key, route_attempt, run_nonce=run_nonce,
+    )
+    updated_netloc = f"{raw_username}-sid-{session_id}-t-10{raw_password}{parsed.netloc[raw_at:]}"
+    return urlunsplit((parsed.scheme, updated_netloc, parsed.path, parsed.query, parsed.fragment))
 
 
 def mask_proxy_url(value: str) -> str:

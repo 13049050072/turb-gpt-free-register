@@ -138,7 +138,7 @@ class EmailChangeTests(unittest.TestCase):
 
     def test_post_change_live_check_reuses_current_session(self):
         session = MagicMock()
-        session.proxy = "socks5://127.0.0.1:7897"
+        session.proxy = "http://user:secret@us.1024proxy.io:8080"
         session_info = {
             "accessToken": "new-token",
             "user": {"id": "user-1", "email": "new@example.com"},
@@ -160,6 +160,9 @@ class EmailChangeTests(unittest.TestCase):
             )
         self.assertTrue(result["ok"])
         self.assertEqual(result["access_token"], "new-token")
+        self.assertEqual(result["proxy_used"], "http://***:***@us.1024proxy.io:8080")
+        self.assertNotIn("secret", result["proxy_used"])
+        self.assertNotIn("-sid-", result["proxy_used"])
         csrf.assert_called_once_with(session)
         signin.assert_called_once_with(session, "csrf", "new@example.com")
         follow.assert_called_once_with(session, "https://auth/authorize")

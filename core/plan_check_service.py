@@ -274,3 +274,130 @@ def queue_settings() -> dict:
         "min_interval": _float_setting("PLAN_CHECK_MIN_INTERVAL", 0.4, 0.0, 30.0),
         "jitter": _float_setting("PLAN_CHECK_JITTER", 0.3, 0.0, 30.0),
     }
+
+
+# ---------------------------------------------------------------------------
+# 全量套餐查询：把库里所有带 access_token 的账号依次塞进同一条套餐队列。
+# 队列有并发上限，所以用一个后台线程按剩余名额补位，避免一次性提交被拒。
+# ---------------------------------------------------------------------------
+
+_BULK_LOCK = threading.Lock()
+_BULK_STOP = threading.Event()
+_BULK_THREAD: threading.Thread | None = None
+_BULK_STATE: dict = {
+    "running": False,
+    "total": 0,
+    "processed": 0,
+    "queued": 0,
+    "skipped": 0,
+    "failed": 0,
+    "started_at": None,
+    "finished_at": None,
+    "trigger": None,
+}
+_BULK_QUEUE_WAIT_SECONDS = 0.5
+_BULK_QUEUE_MAX_WAIT_ROUNDS = 600  # 单个账号最多等 5 分钟空位
+
+
+def _bulk_snapshot() -> dict:
+    with _BULK_LOCK:
+        return dict(_BULK_STATE)
+
+
+def _bulk_bump(field: str) -> None:
+    with _BULK_LOCK:
+        _BULK_STATE[field] = int(_BULK_STATE.get(field) or 0) + 1
+
+
+def bulk_check_status() -> dict:
+    """返回全量套餐查询的进度快照。"""
+    return _bulk_snapshot()
+
+
+def _bulk_worker(ids: list[int], trigger: str) -> None:
+    global _BULK_THREAD
+    try:
+        for account_id in ids:
+            if _BULK_STOP.is_set():
+                break
+            row = None
+            try:
+                row = db.get_account(int(account_id))
+            except Exception:
+                logger.exception("[Plan] 全量查询读取账号失败: account_id=%s", account_id)
+            if not row or not str(row.get("access_token") or "").strip():
+                _bulk_bump("failed")
+                _bulk_bump("processed")
+                continue
+
+            wait_rounds = 0
+            while True:
+                if _BULK_STOP.is_set():
+                    break
+                queued = enqueue_account_plan_check(
+                    account_id=int(account_id),
+                    email=str(row.get("email") or ""),
+                    access_token=str(row.get("access_token") or ""),
+                    trigger=trigger,
+                )
+                if queued.get("accepted"):
+                    _bulk_bump("queued")
+                    break
+                if queued.get("busy"):
+                    _bulk_bump("skipped")
+                    break
+                if queued.get("queue_full"):
+                    wait_rounds += 1
+                    if wait_rounds >= _BULK_QUEUE_MAX_WAIT_ROUNDS:
+                        _bulk_bump("failed")
+                        break
+                    time.sleep(_BULK_QUEUE_WAIT_SECONDS)
+                    continue
+                _bulk_bump("failed")
+                break
+            _bulk_bump("processed")
+    finally:
+        with _BULK_LOCK:
+            _BULK_STATE["running"] = False
+            _BULK_STATE["finished_at"] = datetime.now().isoformat(timespec="seconds")
+            snapshot = dict(_BULK_STATE)
+        _BULK_THREAD = None
+        logger.info(
+            "[Plan] 全量查询结束: total=%s queued=%s skipped=%s failed=%s",
+            snapshot.get("total"), snapshot.get("queued"),
+            snapshot.get("skipped"), snapshot.get("failed"),
+        )
+
+
+def start_bulk_all_check(*, archived: bool = False, trigger: str = "manual_all") -> dict:
+    """对库里全部账号启动一次套餐查询；已在运行时直接返回当前进度。"""
+    global _BULK_THREAD
+    with _BULK_LOCK:
+        if _BULK_THREAD is not None and _BULK_THREAD.is_alive():
+            return {"started": False, "already_running": True, **_BULK_STATE}
+
+    rows = db.list_accounts(limit=100000, archived=archived)
+    ids = [
+        int(row["id"]) for row in rows
+        if row.get("id") is not None and str(row.get("access_token") or "").strip()
+    ]
+    _BULK_STOP.clear()
+    with _BULK_LOCK:
+        _BULK_STATE.update({
+            "running": True,
+            "total": len(ids),
+            "processed": 0,
+            "queued": 0,
+            "skipped": 0,
+            "failed": 0,
+            "started_at": datetime.now().isoformat(timespec="seconds"),
+            "finished_at": None,
+            "trigger": trigger,
+        })
+        thread = threading.Thread(
+            target=_bulk_worker, args=(ids, trigger), name="plan-check-bulk", daemon=True,
+        )
+        _BULK_THREAD = thread
+        thread.start()
+        snapshot = dict(_BULK_STATE)
+    return {"started": True, "already_running": False, **snapshot}

@@ -2332,6 +2332,7 @@
           <button type="button" class="jobs-tb-btn" onclick="openInspectionHistory()">巡检历史</button>
           <button type="button" class="jobs-tb-btn jobs-tb-btn--primary" id="btnCheckSelectedLiveV2" onclick="checkSelectedLive()" title="重新登录选中账号；成功且未封号则标记正常，并刷新最新 AT/accessToken">查活</button>
           <button type="button" class="jobs-tb-btn jobs-tb-btn--primary" id="btnCheckSelectedPlansV2" disabled title="查询选中账号当前套餐；free 账号会检查 Plus 试用资格">查套餐</button>
+          <button type="button" class="jobs-tb-btn" id="btnCheckAllPlansV2" onclick="checkAllPlans()" title="把全部账号加入套餐查询队列；普通 free 只查套餐，一个月免费试用会顺带检测支付方式">全部查套餐</button>
           <button type="button" class="jobs-tb-btn jobs-tb-btn--good" id="btnExtractSelectedLinksV2" disabled title="给选中的 free(可Plus试用) 账号批量提链，类型按配置 PIX/UPI/KAKAO_PAY/IDEAL">提链</button>
         </div>
         <div class="acc-v2-btn-group">
@@ -5068,6 +5069,55 @@ function downloadSelectedCodexAgents() {
       updateAccountSelectionUi();
     }, 1200);
   }
+}
+
+let PLAN_ALL_POLL = null;
+
+async function checkAllPlans() {
+  const btn = $('#btnCheckAllPlansV2');
+  if (!btn) return;
+  if (PLAN_ALL_POLL) { showToast('全量查套餐正在进行中'); return; }
+  if (!confirm('确定查询全部账号的套餐吗？\n\n按后台队列并发执行；普通 free 只查套餐，一个月免费试用会顺带检测支付方式。')) return;
+  const old = btn.textContent;
+  btn.disabled = true;
+  btn.textContent = '启动中…';
+  try {
+    const r = await api('/api/accounts/check-plan-all', {
+      method:'POST', headers:{'Content-Type':'application/json'}, body:'{}',
+    });
+    showToast(r.already_running ? '全量查套餐已在运行' : `已开始：共 ${r.total || 0} 个账号`);
+    startPlanAllPolling(old);
+  } catch (err) {
+    showToast('全量查套餐失败: ' + err.message);
+    btn.disabled = false;
+    btn.textContent = old;
+  }
+}
+
+function startPlanAllPolling(oldLabel) {
+  const btn = $('#btnCheckAllPlansV2');
+  if (!btn || PLAN_ALL_POLL) return;
+  const restore = oldLabel || '全部查套餐';
+  btn.disabled = true;
+  PLAN_ALL_POLL = setInterval(async () => {
+    try {
+      const st = await api('/api/accounts/check-plan-all-status');
+      btn.textContent = `查套餐 ${st.processed || 0}/${st.total || 0}`;
+      if (st.running) return;
+      clearInterval(PLAN_ALL_POLL);
+      PLAN_ALL_POLL = null;
+      btn.textContent = restore;
+      btn.disabled = false;
+      showToast(`全量查套餐完成：入队 ${st.queued || 0}，跳过 ${st.skipped || 0}，失败 ${st.failed || 0}`);
+      await loadAccounts();
+    } catch (err) {
+      clearInterval(PLAN_ALL_POLL);
+      PLAN_ALL_POLL = null;
+      btn.textContent = restore;
+      btn.disabled = false;
+      showToast('全量查套餐状态读取失败: ' + err.message);
+    }
+  }, 2000);
 }
 
 async function checkSelectedPlans() {

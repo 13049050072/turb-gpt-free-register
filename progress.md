@@ -86,3 +86,26 @@
 - Oracle 线上镜像由 `fb8b85c` 更新为 `turb-gpt-free-register:b673346`；回滚把 `compose.env` 的 `TURB_IMAGE` 改回 `turb-gpt-free-register:a731abd` 或 `fb8b85c` 再 `docker compose up -d --no-deps web`。
 - 磁盘清理删除了 16 个旧镜像标签（`787b8a4`、`09a8c76`、`e9165f8`、`58d953e`、`e6c823b`、`571ccf7`、`d6369ae`、`d008bf0`、`dfea160`、`6a59fa6`、`2ec3413`、`47c83ee`、`305983b`、`aeaa25c`、`a47ec76`、`s2adead-…`），如需这些版本回滚点需重新构建。
 - 新建目录 `/home/ubuntu/turb-gpt-free-register-build-b673346` 为本次构建上下文。
+
+## 2026-10-20 - Task: 一键检测全部账号套餐
+
+### What was done
+
+- 新增全量套餐查询：后台线程遍历库里所有带 `access_token` 的账号，按套餐队列剩余名额逐个入队，队列满时自动等待补位，全程复用现有队列、并发、限速与落库逻辑。
+- 新增接口：`POST /api/accounts/check-plan-all` 启动（重复调用返回当前进度），`GET /api/accounts/check-plan-all-status` 读进度。
+- 账号页“套餐/提链”工具栏新增“全部查套餐”按钮：确认后启动，按钮实时显示 `已处理/总数`，结束后汇总入队/跳过/失败数并刷新列表。
+
+### Testing
+
+- 新增 `tests/test_plan_check_bulk.py`（4 项）：全量入队、队列满重试、忙碌跳过、重复启动保护。
+- 新增 `tests/test_plan_check_bulk_api.py`（2 项）：启动与状态接口接线。
+- 相关回归 `tests.test_plan_check_bulk tests.test_plan_check_bulk_api tests.test_payment_method_detection tests.test_account_plan_filter tests.test_chatgpt_plan_retry` 共 49 项通过。
+- `py_compile`、`compileall`、模板 JS 语法检查、`git diff --check` 通过。
+
+### Notes
+
+- `core/plan_check_service.py`：新增 `start_bulk_all_check()` / `bulk_check_status()` 与后台补位线程，不改动单账号入队逻辑。
+- `webui/app.py`：新增两个全量查询接口。
+- `webui/templates/index.html`：新增“全部查套餐”按钮与轮询进度逻辑。
+- `tests/test_plan_check_bulk.py`、`tests/test_plan_check_bulk_api.py`：新增测试。
+- 回滚：`git revert` 本次提交，或还原上述 5 个文件。

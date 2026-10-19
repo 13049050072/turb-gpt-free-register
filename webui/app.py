@@ -1135,6 +1135,23 @@ def create_app(auth_code: str | None = None) -> Flask:
             "skipped_count": len(skipped),
         }), 202
 
+    @app.post("/api/accounts/check-plan-all")
+    def api_accounts_check_plan_all():
+        """把库里全部账号依次加入套餐查询队列（后台线程按队列余量补位）。"""
+        data = request.get_json(silent=True) or {}
+        archived = data.get("archived")
+        try:
+            result = plan_check_service.start_bulk_all_check(
+                archived=archived if isinstance(archived, bool) else False,
+            )
+        except Exception as exc:
+            return jsonify({"ok": False, "error": f"{type(exc).__name__}: {exc}"}), 500
+        return jsonify({"ok": True, **result}), 202
+
+    @app.get("/api/accounts/check-plan-all-status")
+    def api_accounts_check_plan_all_status():
+        return jsonify({"ok": True, **plan_check_service.bulk_check_status()})
+
     @app.get("/api/extract-link/cdk")
     def api_extract_link_cdk():
         """查询当前配置或传入 CDK 的剩余次数。"""

@@ -12,11 +12,12 @@ from core.session import BrowserSession
 
 
 class _Response:
-    def __init__(self, *, status_code=200, url="", payload=None, text=""):
+    def __init__(self, *, status_code=200, url="", payload=None, text="", headers=None):
         self.status_code = status_code
         self.url = url
         self._payload = payload or {}
         self.text = text
+        self.headers = headers or {}
 
     def json(self):
         return self._payload
@@ -111,7 +112,7 @@ class OpenAIRegistrationFlowTests(unittest.TestCase):
         self.assertEqual(session.requests[0][1]["sec-fetch-site"], "none")
         self.assertEqual(session.requests[0][3], 12.0)
 
-    def test_network_preflight_retries_status_403_on_same_session(self):
+    def test_network_preflight_retries_ordinary_403_on_same_session(self):
         class Session:
             def __init__(self):
                 self.calls = 0
@@ -136,6 +137,40 @@ class OpenAIRegistrationFlowTests(unittest.TestCase):
         self.assertEqual(session.calls, 2)
         self.assertEqual(session.reset_count, 1)
         sleep.assert_called_once_with(1.0)
+
+    def test_network_preflight_stops_on_interactive_challenge_403(self):
+        class Session:
+            def __init__(self):
+                self.calls = 0
+                self.reset_count = 0
+
+            def get_chatgpt_navigate_headers(self, referer=""):
+                return {"referer": referer}
+
+            def get(self, *_args, **_kwargs):
+                self.calls += 1
+                return _Response(
+                    status_code=403,
+                    text="provider body must not escape: secret-value",
+                    headers={"cf-mitigated": "challenge"},
+                )
+
+            def reset_circuit_breaker(self):
+                self.reset_count += 1
+
+        session = Session()
+        with patch.object(openai_auth, "_interruptible_sleep") as sleep:
+            with self.assertRaisesRegex(
+                openai_auth.InteractiveChallengeRequiredError,
+                "^interactive challenge required$",
+            ) as raised:
+                openai_auth.network_preflight(session)
+
+        self.assertEqual(session.calls, 1)
+        self.assertEqual(session.reset_count, 0)
+        self.assertFalse(openai_auth._is_retryable_authorize_error(raised.exception))
+        self.assertNotIn("secret-value", str(raised.exception))
+        sleep.assert_not_called()
 
     def test_sentinel_iframe_retries_socks5_proxy_failure(self):
         class ProxyError(RuntimeError):

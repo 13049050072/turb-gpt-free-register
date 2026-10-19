@@ -284,6 +284,49 @@ class PaymentMethodFlowTests(unittest.TestCase):
                 self.assertNotIn("provider.invalid", json.dumps(result))
                 self.assertNotIn("client_secret", json.dumps(result))
 
+    def test_checkout_400_unusual_activity_is_fixed_provider_restriction(self):
+        session = _Session(response=_Response(400, data={
+            "detail": "Request rejected because of unusual activity.",
+        }))
+
+        result = check_payment_method_availability(session, "token", self.eligible_plan())
+
+        self.assertEqual(result["payment_method_check_status"], "error")
+        self.assertEqual(result["payment_method_error"], "checkout: provider_activity_restricted")
+
+    def test_checkout_challenge_403_is_fixed_interactive_error(self):
+        response = _Response(403, data={"detail": "secret provider challenge body"})
+        response.headers["cf-mitigated"] = "challenge"
+        session = _Session(response=response)
+
+        result = check_payment_method_availability(session, "token", self.eligible_plan())
+
+        self.assertEqual(result["payment_method_error"], "checkout: interactive_challenge_required")
+        self.assertNotIn("secret provider challenge body", json.dumps(result))
+
+    def test_checkout_unknown_400_keeps_generic_http_status(self):
+        for detail in ("invalid checkout request", "unusual activity " + "x" * 512):
+            with self.subTest(detail_length=len(detail)):
+                session = _Session(response=_Response(400, data={"detail": detail}))
+
+                result = check_payment_method_availability(session, "token", self.eligible_plan())
+
+                self.assertEqual(result["payment_method_error"], "checkout: HTTP 400")
+
+    def test_checkout_400_diagnostic_never_contains_provider_detail(self):
+        secret = "sk-provider-secret-value"
+        for detail, expected in (
+            (f"unusual activity detected; reference={secret}", "checkout: provider_activity_restricted"),
+            (f"invalid request; reference={secret}", "checkout: HTTP 400"),
+        ):
+            with self.subTest(expected=expected):
+                session = _Session(response=_Response(400, data={"detail": detail}))
+
+                result = check_payment_method_availability(session, "token", self.eligible_plan())
+
+                self.assertEqual(result["payment_method_error"], expected)
+                self.assertNotIn(secret, json.dumps(result))
+
     def test_opaque_offer_ids_are_not_sent_as_product_name(self):
         # Production accounts/check returns opaque offer IDs, not product enums.
         # Include an unrelated campaign first to exercise Plus-specific selection.

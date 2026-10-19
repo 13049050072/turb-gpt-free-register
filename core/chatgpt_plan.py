@@ -525,9 +525,39 @@ class _PaymentResponseError(ValueError):
     """Only fixed local diagnostics may be placed in the public payment result."""
 
 
+_PAYMENT_PROVIDER_DETAIL_LIMIT = 512
+
+
+def _payment_response_header(response: object, name: str) -> str:
+    headers = getattr(response, "headers", {}) or {}
+    try:
+        return str(headers.get(name, "") or "").strip()
+    except (AttributeError, TypeError):
+        return ""
+
+
+def _is_provider_activity_restricted(response: object) -> bool:
+    try:
+        payload = response.json()
+    except Exception:
+        return False
+    if not isinstance(payload, dict):
+        return False
+    detail = payload.get("detail")
+    return (
+        isinstance(detail, str)
+        and len(detail) <= _PAYMENT_PROVIDER_DETAIL_LIMIT
+        and "unusual activity" in detail.casefold()
+    )
+
+
 def _payment_response_json(response: object, stage: str) -> dict:
     status = int(getattr(response, "status_code", 0) or 0)
     if not 200 <= status < 300:
+        if status == 400 and _is_provider_activity_restricted(response):
+            raise _PaymentResponseError(f"{stage}: provider_activity_restricted")
+        if status == 403 and _payment_response_header(response, "cf-mitigated").casefold() == "challenge":
+            raise _PaymentResponseError(f"{stage}: interactive_challenge_required")
         detail = f"HTTP {status}" if status else "HTTP status missing"
         raise _PaymentResponseError(f"{stage}: {detail}")
     try:

@@ -221,9 +221,28 @@ def _is_transient_network_error(exc: Exception) -> bool:
     return any(k in msg for k in transient_keywords)
 
 
+class InteractiveChallengeRequiredError(RuntimeError):
+    """The provider requires an interactive browser challenge."""
+
+
+def _is_interactive_challenge_response(response: object) -> bool:
+    try:
+        status = int(getattr(response, "status_code", 0) or 0)
+    except (TypeError, ValueError):
+        return False
+    headers = getattr(response, "headers", {}) or {}
+    try:
+        mitigation = str(headers.get("cf-mitigated", "") or "").strip().casefold()
+    except (AttributeError, TypeError):
+        return False
+    return status == 403 and mitigation == "challenge"
+
+
 def _is_retryable_authorize_error(exc: Exception) -> bool:
     """authorize 导航的 403/429/5xx 可在同一会话内复用新 CF Cookie 重试。"""
     response = getattr(exc, "response", None)
+    if isinstance(exc, InteractiveChallengeRequiredError) or _is_interactive_challenge_response(response):
+        return False
     try:
         status = int(getattr(response, "status_code", 0) or 0)
     except (TypeError, ValueError):
@@ -274,6 +293,8 @@ def _request_with_proxy_retry(session: BrowserSession, label: str, fn):
         _check_stop_requested()
         try:
             response = fn()
+            if _is_interactive_challenge_response(response):
+                raise InteractiveChallengeRequiredError("interactive challenge required")
             response.raise_for_status()
             if attempt > 1:
                 logger.info("[%s] 代理链路重试成功 (%s/%s)", label, attempt, max_attempts)

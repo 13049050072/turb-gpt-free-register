@@ -153,3 +153,21 @@
 - `webui/app.py`：启动接口校验 `workers`。
 - `webui/templates/index.html`：新增启动弹窗与并发输入，轮询改为按完成数推进。
 - `tests/test_plan_check_bulk.py`、`tests/test_plan_check_bulk_api.py`：同步更新。
+
+## 2026-10-20 - Task: 自定义并发的全量查套餐线上验证
+
+### What was done
+
+- 部署 `0235f94` 后用 `workers=6` 跑了一轮完整全量查询，验证并发参数、进度口径和完成判定。
+- 非法并发（`workers=99`）返回 400；合法启动返回 202 且状态里 `workers=6`。
+
+### Testing
+
+- 线上运行：`00:54:47 → 01:12:05`，`fed=657 / completed=657 / skipped=0 / failed=0`，`running=false`，耗时 17 分 18 秒。
+- 中间采样：20 秒时 `fed=510, completed=12`；约 5 分钟 `completed=160`；约 12 分钟 `completed=426`，随后正常收尾。
+- 结论：`running` 现在只在全部任务真正结束后才变 false，进度条不会再“刚入队就 100%”。
+
+### Notes
+
+- 线上镜像 `turb-gpt-free-register:0235f94`；回滚到 `turb-gpt-free-register:6ac66cf` 再 `up -d --no-deps web`，备份 `compose.env.before-0235f94-20261019T165214Z`。
+- 实际吞吐仍受 `PLAN_CHECK_MIN_INTERVAL=1.0` + `PLAN_CHECK_JITTER=0.8` 限制（约 0.55 个/秒），并发只决定同时在飞的请求数。

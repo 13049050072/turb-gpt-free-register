@@ -48,8 +48,12 @@ class _Session:
         self.blocked_until = 0
         self.blocked_reason = ""
 
-    def get_chatgpt_headers(self, **_kwargs):
-        return {"oai-device-id": self.device_id, "oai-session-id": self.oai_session_id}
+    def get_chatgpt_headers(self, **kwargs):
+        return {
+            "oai-device-id": self.device_id,
+            "oai-session-id": self.oai_session_id,
+            "referer": kwargs.get("referer", ""),
+        }
 
     def get(self, url, **_kwargs):
         self.gets.append(url)
@@ -179,6 +183,17 @@ class PaymentMethodParserTests(unittest.TestCase):
 
 
 class PaymentMethodFlowTests(unittest.TestCase):
+    def setUp(self):
+        # 风控令牌需要真实网络与 Node 运行时，单元测试里统一置空；
+        # 需要断言请求头的用例会单独 patch。
+        from core import chatgpt_plan
+
+        self._real_sentinel_headers = chatgpt_plan._payment_sentinel_headers
+        patcher = patch("core.chatgpt_plan._payment_sentinel_headers", return_value={})
+        self.sentinel_patcher = patcher
+        self.sentinel_mock = patcher.start()
+        self.addCleanup(patcher.stop)
+
     @staticmethod
     def eligible_plan(**overrides):
         result = {
@@ -331,7 +346,7 @@ class PaymentMethodFlowTests(unittest.TestCase):
         # Production accounts/check returns opaque offer IDs, not product enums.
         # Include an unrelated campaign first to exercise Plus-specific selection.
         plan = self.eligible_plan(
-            eligible_offer_ids=["opaque-offer-a", "opaque-offer-b"],
+            eligible_offer_ids=["opaque-offer-a"],
             eligible_promo_campaigns={
                 "team": {"id": "team-campaign", "offer_id": "opaque-offer-a"},
                 "plus": {"id": "campaign-1", "metadata": {}},
@@ -342,6 +357,74 @@ class PaymentMethodFlowTests(unittest.TestCase):
         self.assertTrue(session.contract_valid)
         self.assertEqual(result["payment_method_check_status"], "checked")
         self.assertNotIn("opaque-offer", json.dumps(session.posts[0][1]["json"]))
+
+    def test_ambiguous_offer_list_skips_checkout(self):
+        plan = self.eligible_plan(
+            eligible_offer_ids=["opaque-offer-a", "opaque-offer-b"],
+            eligible_promo_campaigns={
+                "plus": {"id": "campaign-1", "metadata": {}},
+            },
+        )
+        session = _Session()
+        result = check_payment_method_availability(session, "token", plan)
+        self.assertEqual(result["payment_method_check_status"], "not_applicable")
+        self.assertEqual(session.posts, [])
+
+    def test_checkout_request_carries_sentinel_headers(self):
+        self.sentinel_mock.return_value = {
+            "openai-sentinel-token": "fixture-token",
+            "openai-sentinel-so-token": "fixture-so",
+        }
+        session = _Session(response=_Response(200, data={"payment_method_types": ["card"]}))
+        check_payment_method_availability(session, "token", self.eligible_plan())
+        headers = session.posts[0][1]["headers"]
+        self.assertEqual(headers["openai-sentinel-token"], "fixture-token")
+        self.assertEqual(headers["openai-sentinel-so-token"], "fixture-so")
+        self.assertIn("?promo_campaign=campaign-1", headers["referer"])
+        self.sentinel_mock.assert_called_with(session, "campaign-1")
+
+    def test_provider_activity_restriction_is_retried_once(self):
+        session = _SequenceSession(
+            _Response(400, data={"detail": "unusual activity"}),
+            _Response(200, data={"payment_method_types": ["card"]}),
+        )
+        result = check_payment_method_availability(session, "token", self.eligible_plan())
+        self.assertEqual(result["payment_method_check_status"], "checked")
+        self.assertEqual(len(session.calls), 2)
+
+    def test_language_only_locale_is_not_used_as_country(self):
+        session = _Session(response=_Response(200, data={"payment_method_types": ["card"]}))
+        session.exit_geo = {}
+        session.browser_profile = {"navigator_language": "ja"}
+        result = check_payment_method_availability(session, "token", self.eligible_plan())
+        self.assertEqual(result["payment_method_check_status"], "error")
+        self.assertEqual(result["payment_method_error"], "payment region unavailable")
+        self.assertEqual(session.posts, [])
+
+    def test_locale_region_with_known_currency_is_accepted(self):
+        session = _Session(response=_Response(200, data={"payment_method_types": ["card"]}))
+        session.exit_geo = {}
+        session.browser_profile = {"navigator_language": "vi-VN"}
+        check_payment_method_availability(session, "token", self.eligible_plan())
+        body = session.posts[0][1]["json"]
+        self.assertEqual(body["billing_details"], {"country": "VN", "currency": "VND"})
+
+    def test_payment_sentinel_headers_use_checkout_flow_and_page_url(self):
+        with patch("core.openai_auth.request_sentinel_token", return_value={"token": "c"}) as minted, \
+             patch("core.openai_auth.build_sentinel_header", return_value=("hdr", "so-hdr")) as built:
+            headers = self._real_sentinel_headers(object(), "campaign-1")
+
+        self.assertEqual(headers, {
+            "openai-sentinel-token": "hdr",
+            "openai-sentinel-so-token": "so-hdr",
+        })
+        minted.assert_called_once()
+        self.assertEqual(minted.call_args[0][1], "chatgpt_checkout")
+        self.assertEqual(built.call_args.kwargs["page_url"], "https://chatgpt.com/?promo_campaign=campaign-1")
+
+    def test_payment_sentinel_failure_returns_no_headers(self):
+        with patch("core.openai_auth.request_sentinel_token", side_effect=RuntimeError("boom")):
+            self.assertEqual(self._real_sentinel_headers(object(), "campaign-1"), {})
 
     def test_non_plus_or_mismatched_offer_campaign_skips_checkout(self):
         for campaigns in (
@@ -546,7 +629,8 @@ class PaymentMethodFlowTests(unittest.TestCase):
         self.assertTrue(result["ok"])
         self.assertEqual(result["payment_method_check_status"], "error")
         self.assertEqual(result["payment_method_error"], "checkout: HTTP 503")
-        self.assertEqual(len(session.posts), 1)
+        # 5xx 属于可重试类别，最多尝试两次后仍按 best-effort 记录失败。
+        self.assertEqual(len(session.posts), 2)
 
 
 class PaymentMethodPersistenceAndTemplateTests(unittest.TestCase):

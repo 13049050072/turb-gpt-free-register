@@ -36,6 +36,30 @@ _PAYMENT_EURO_COUNTRIES = frozenset({
     "AT", "BE", "CY", "DE", "EE", "ES", "FI", "FR", "GR", "HR", "IE",
     "IT", "LT", "LU", "LV", "MT", "NL", "PT", "SI", "SK",
 })
+# 代理池常见出口；缺失国家会让结账因账单国/币种不匹配直接 400。
+_PAYMENT_CURRENCY_BY_COUNTRY.update({
+    "VN": "VND", "NG": "NGN", "PK": "PKR", "KE": "KES", "BD": "BDT",
+    "LK": "LKR", "NP": "NPR", "MM": "MMK", "KH": "KHR", "LA": "LAK",
+    "MN": "MNT", "KZ": "KZT", "UZ": "UZS", "RS": "RSD", "BA": "BAM",
+    "MK": "MKD", "AL": "ALL", "MD": "MDL", "GE": "GEL", "AM": "AMD",
+    "AZ": "AZN", "BY": "BYN", "QA": "QAR", "KW": "KWD", "BH": "BHD",
+    "OM": "OMR", "JO": "JOD", "LB": "LBP", "MA": "MAD", "TN": "TND",
+    "DZ": "DZD", "GH": "GHS", "TZ": "TZS", "UG": "UGX", "MU": "MUR",
+    "SN": "XOF", "CI": "XOF", "CM": "XAF", "RW": "RWF", "ZM": "ZMW",
+    "BW": "BWP", "NA": "NAD", "MZ": "MZN", "AO": "AOA", "DO": "DOP",
+    "GT": "GTQ", "CR": "CRC", "PA": "PAB", "UY": "UYU", "PY": "PYG",
+    "BO": "BOB", "EC": "USD", "VE": "VES", "JM": "JMD", "TT": "TTD",
+    "BS": "BSD", "BB": "BBD", "BZ": "BZD", "HN": "HNL", "SV": "USD",
+    "NI": "NIO", "FJ": "FJD", "PG": "PGK", "WS": "WST", "TO": "TOP",
+    "MO": "MOP", "BN": "BND", "BT": "BTN", "MV": "MVR", "IQ": "IQD",
+    "ET": "ETB", "MG": "MGA", "MW": "MWK", "LS": "LSL", "SZ": "SZL",
+    "GM": "GMD", "SL": "SLE", "LR": "LRD", "GN": "GNF", "BF": "XOF",
+    "ML": "XOF", "NE": "XOF", "TG": "XOF", "BJ": "XOF", "GA": "XAF",
+    "CG": "XAF", "TD": "XAF", "CF": "XAF", "GQ": "XAF", "CD": "CDF",
+})
+
+_PAYMENT_SENTINEL_FLOW = "chatgpt_checkout"
+_PAYMENT_CHECKOUT_ATTEMPTS = 2
 
 PAYMENT_METHOD_LABELS = {
     "card": "银行卡",
@@ -479,10 +503,21 @@ def _payment_check_offer(plan_result: dict) -> tuple[str | None, str | None]:
         if value
     }
     offer = next((item for item in bounded_offers if item.casefold() in wanted), None)
-    if offer is None and not any(candidate_names):
+    if offer is None:
+        # 没有可核对的 campaign 绑定信息时，只有唯一 offer 才可确定；
+        # 多个 offer 无法证明对应关系，不做猜测。
+        if any(candidate_names) or len(bounded_offers) != 1:
+            return None, None
         offer = bounded_offers[0]
     campaign_id = _bounded_payment_identifier(campaign.get("id"))
     return (offer, campaign_id) if offer and campaign_id else (None, None)
+
+
+def _payment_currency_for_country(country: str) -> str | None:
+    currency = _PAYMENT_CURRENCY_BY_COUNTRY.get(country)
+    if not currency and country in _PAYMENT_EURO_COUNTRIES:
+        currency = "EUR"
+    return currency
 
 
 def _payment_checkout_region(
@@ -504,16 +539,17 @@ def _payment_checkout_region(
         None,
     )
     if not country and isinstance(profile, dict):
-        language = str(profile.get("navigator_language") or "")
-        locale_country = language.rsplit("-", 1)[-1].strip().upper()
-        if re.fullmatch(r"[A-Z]{2}", locale_country):
-            country = locale_country
+        language = str(profile.get("navigator_language") or "").strip()
+        # 只接受带地区子标签的语言（en-US / zh-Hans-CN）；单独语言码（ja）不是国家。
+        parts = [part for part in language.split("-") if part]
+        if len(parts) >= 2:
+            locale_country = parts[-1].upper()
+            if re.fullmatch(r"[A-Z]{2}", locale_country) and _payment_currency_for_country(locale_country):
+                country = locale_country
     if not country:
         return None
 
-    currency = _PAYMENT_CURRENCY_BY_COUNTRY.get(country)
-    if not currency and country in _PAYMENT_EURO_COUNTRIES:
-        currency = "EUR"
+    currency = _payment_currency_for_country(country)
     if not currency:
         candidate = str(plan_result.get("billing_currency") or "").strip().upper()
         if _PAYMENT_METHOD_CURRENCY_RE.fullmatch(candidate):
@@ -549,6 +585,15 @@ def _is_provider_activity_restricted(response: object) -> bool:
         and len(detail) <= _PAYMENT_PROVIDER_DETAIL_LIMIT
         and "unusual activity" in detail.casefold()
     )
+
+
+def _payment_error_is_retryable(message: str) -> bool:
+    """支付检查只在明确的临时失败上重试一次，其余错误立即返回。"""
+    text = str(message or "")
+    if text.endswith("provider_activity_restricted") or text.endswith("interactive_challenge_required"):
+        return True
+    match = re.search(r": HTTP (\d{3})$", text)
+    return bool(match and int(match.group(1)) >= 500)
 
 
 def _payment_response_json(response: object, stage: str) -> dict:
@@ -606,6 +651,40 @@ def _stripe_payment_init_request(session: BrowserSession, publishable_key: str) 
     }
 
 
+def _payment_sentinel_headers(session: BrowserSession, campaign_id: str) -> dict[str, str]:
+    """为 checkout 建单请求生成风控令牌（缺失时上游会直接 400 unusual activity）。
+
+    失败只是少两个请求头，结账仍会照常尝试，错误仍按 best-effort 记录。
+    """
+    page_url = f"https://chatgpt.com/?promo_campaign={quote(campaign_id, safe='')}"
+    try:
+        from core.openai_auth import build_sentinel_header, request_sentinel_token
+
+        challenge = request_sentinel_token(session, _PAYMENT_SENTINEL_FLOW)
+        token_header, so_header = build_sentinel_header(
+            session,
+            challenge,
+            _PAYMENT_SENTINEL_FLOW,
+            page_url=page_url,
+        )
+    except Exception:
+        # 异常文本可能带 URL/请求体，只记录类型。
+        logger.debug("[Plan] 支付检查风控令牌生成失败：无令牌继续", exc_info=True)
+        return {}
+    finally:
+        # 风控令牌请求若被 CF 挑战，会打开本地熔断；不清掉会连累紧随其后的
+        # checkout 请求。这里只清本地冷却，保留会话与 Cookie。
+        reset = getattr(session, "reset_circuit_breaker", None)
+        if callable(reset):
+            reset()
+    headers: dict[str, str] = {}
+    if token_header:
+        headers["openai-sentinel-token"] = token_header
+    if so_header:
+        headers["openai-sentinel-so-token"] = so_header
+    return headers
+
+
 def check_payment_method_availability(
     session: BrowserSession | None,
     token: str,
@@ -626,6 +705,7 @@ def check_payment_method_availability(
         return _payment_error_result("payment region unavailable")
     country, currency = region
     stage = "checkout"
+    referer = f"https://chatgpt.com/?promo_campaign={quote(campaign_id, safe='')}"
     try:
         request_timeout = max(1.0, min(60.0, float(timeout or 15.0)))
         claims = token_claims(token)
@@ -641,16 +721,35 @@ def check_payment_method_availability(
                 "is_coupon_from_query_param": False,
             },
         }
-        response = session.post(
-            f"https://chatgpt.com{PAYMENT_CHECKOUT_PATH}",
-            headers=_common_headers(
-                session, token, claims, target_path=PAYMENT_CHECKOUT_PATH,
-            ),
-            json=body,
-            allow_redirects=False,
-            timeout=request_timeout,
-        )
-        data = _payment_response_json(response, stage)
+        checkout_url = f"https://chatgpt.com{PAYMENT_CHECKOUT_PATH}"
+        data: dict | None = None
+        for attempt in range(1, _PAYMENT_CHECKOUT_ATTEMPTS + 1):
+            headers = _common_headers(
+                session, token, claims,
+                target_path=PAYMENT_CHECKOUT_PATH, referer=referer,
+            )
+            # 上游建单接口要风控令牌；每次重试都重新签一份。
+            headers.update(_payment_sentinel_headers(session, campaign_id))
+            response = session.post(
+                checkout_url,
+                headers=headers,
+                json=body,
+                allow_redirects=False,
+                timeout=request_timeout,
+            )
+            try:
+                data = _payment_response_json(response, "checkout")
+            except _PaymentResponseError as exc:
+                if attempt < _PAYMENT_CHECKOUT_ATTEMPTS and _payment_error_is_retryable(str(exc)):
+                    logger.info(
+                        "[Plan] 支付检查首次失败，重试一次：%s", str(exc),
+                    )
+                    time.sleep(random.uniform(0.6, 1.4))
+                    continue
+                raise
+            break
+        if data is None:
+            raise _PaymentResponseError("checkout: payment response missing")
         # Some OAICS responses already contain a complete method snapshot.
         if _collect_payment_method_types(data):
             return parse_payment_method_response(data)
@@ -891,9 +990,10 @@ def _common_headers(
     claims: dict | None = None,
     *,
     target_path: str = ACCOUNTS_CHECK_PATH,
+    referer: str = "https://chatgpt.com/",
 ) -> dict[str, str]:
     """生成登录态 ChatGPT API 请求头，并标记对应的目标路由。"""
-    headers = env.get_chatgpt_headers(referer="https://chatgpt.com/")
+    headers = env.get_chatgpt_headers(referer=referer)
     # GET 导航后的前端 fetch 不主动设置 content-type。
     headers.pop("content-type", None)
     headers.update({
@@ -936,11 +1036,16 @@ def parse_accounts_check(data: dict, *, token: str = "") -> dict:
     account = item.get("account") or {}
     entitlement = item.get("entitlement") or {}
     last_sub = item.get("last_active_subscription") or {}
+    account = account if isinstance(account, dict) else {}
+    entitlement = entitlement if isinstance(entitlement, dict) else {}
+    last_sub = last_sub if isinstance(last_sub, dict) else {}
     eligible_promo_campaigns = item.get("eligible_promo_campaigns") or {}
     plus_campaign = eligible_promo_campaigns.get("plus") if isinstance(eligible_promo_campaigns, dict) else None
-    plus_meta = (plus_campaign or {}).get("metadata") or {}
-    discount = plus_meta.get("discount") or {}
-    duration = plus_meta.get("duration") or {}
+    plus_meta = (plus_campaign or {}).get("metadata") if isinstance(plus_campaign, dict) else None
+    plus_meta = plus_meta if isinstance(plus_meta, dict) else {}
+    discount = plus_meta.get("discount") if isinstance(plus_meta.get("discount"), dict) else {}
+    duration = plus_meta.get("duration") if isinstance(plus_meta.get("duration"), dict) else {}
+    entitlement_discount = entitlement.get("discount") if isinstance(entitlement.get("discount"), dict) else {}
 
     plan_type = account.get("plan_type") or claims.get("claim_plan_type") or ""
     subscription_plan = entitlement.get("subscription_plan") or ""
@@ -974,12 +1079,12 @@ def parse_accounts_check(data: dict, *, token: str = "") -> dict:
         "billing_period": entitlement.get("billing_period"),
         "billing_currency": entitlement.get("billing_currency"),
         "is_delinquent": bool(entitlement.get("is_delinquent")),
-        "discount_type": (entitlement.get("discount") or {}).get("discount_type"),
-        "discount_amount": (entitlement.get("discount") or {}).get("amount"),
-        "discount_duration_num_periods": (entitlement.get("discount") or {}).get("duration_num_periods"),
-        "discount_expires_at": (entitlement.get("discount") or {}).get("discount_expires_at"),
-        "discount_cancellation_policy": (entitlement.get("discount") or {}).get("cancellation_policy"),
-        "discount_promo_campaign_id": (entitlement.get("discount") or {}).get("promo_campaign_id"),
+        "discount_type": entitlement_discount.get("discount_type"),
+        "discount_amount": entitlement_discount.get("amount"),
+        "discount_duration_num_periods": entitlement_discount.get("duration_num_periods"),
+        "discount_expires_at": entitlement_discount.get("discount_expires_at"),
+        "discount_cancellation_policy": entitlement_discount.get("cancellation_policy"),
+        "discount_promo_campaign_id": entitlement_discount.get("promo_campaign_id"),
         "last_purchase_origin_platform": last_sub.get("purchase_origin_platform"),
         "last_will_renew": bool(last_sub.get("will_renew")),
         "plus_trial_eligible": plus_trial_eligible,

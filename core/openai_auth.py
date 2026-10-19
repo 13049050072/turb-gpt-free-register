@@ -549,7 +549,13 @@ def request_password_sentinel_bundle(session: BrowserSession) -> dict:
     return responses["username_password_create"]
 
 
-def build_sentinel_header(session: BrowserSession, sentinel_resp: dict, flow: str) -> tuple:
+def build_sentinel_header(
+    session: BrowserSession,
+    sentinel_resp: dict,
+    flow: str,
+    *,
+    page_url: str | None = None,
+) -> tuple:
     """
     根据 sentinel 响应构建 openai-sentinel-token 和 openai-sentinel-so-token 请求头值。
 
@@ -585,6 +591,7 @@ def build_sentinel_header(session: BrowserSession, sentinel_resp: dict, flow: st
         react_container_key=getattr(session, "react_container_key", None),
         react_resources_key=getattr(session, "react_resources_key", None),
         cookie=session.auth_cookie_header() if hasattr(session, "auth_cookie_header") else f"oai-did={session.device_id}",
+        page_url=page_url,
     )
 
     # 解析 runner 输出，单独抽出 so 字段填充 openai-sentinel-so-token

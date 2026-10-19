@@ -78,6 +78,33 @@ class BulkPlanCheckTests(unittest.TestCase):
         self.assertEqual(state["skipped"], 1)
         self.assertEqual(state["queued"], 0)
 
+    def test_enqueue_exception_does_not_abort_run(self):
+        rows = [
+            {"id": 21, "email": "x@example.test", "access_token": "t1"},
+            {"id": 22, "email": "y@example.test", "access_token": "t2"},
+        ]
+        calls = []
+
+        def flaky(**kwargs):
+            calls.append(kwargs["account_id"])
+            if kwargs["account_id"] == 21:
+                raise RuntimeError("boom")
+            return {"accepted": True}
+
+        with patch.object(plan_check_service.db, "list_accounts", return_value=rows), \
+             patch.object(plan_check_service.db, "get_account",
+                          side_effect=lambda acc_id: next(
+                              (row for row in rows if int(row["id"]) == int(acc_id)), None)), \
+             patch.object(plan_check_service, "enqueue_account_plan_check", side_effect=flaky):
+            plan_check_service.start_bulk_all_check()
+            self.assertTrue(_wait_idle())
+
+        state = plan_check_service.bulk_check_status()
+        self.assertEqual(calls, [21, 22])
+        self.assertEqual(state["failed"], 1)
+        self.assertEqual(state["queued"], 1)
+        self.assertEqual(state["processed"], 2)
+
     def test_second_start_reports_already_running(self):
         rows = [{"id": 11, "email": "slow@example.test", "access_token": "t"}]
         release = threading.Event()

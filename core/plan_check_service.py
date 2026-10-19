@@ -331,30 +331,35 @@ def _bulk_worker(ids: list[int], trigger: str) -> None:
                 continue
 
             wait_rounds = 0
-            while True:
-                if _BULK_STOP.is_set():
-                    break
-                queued = enqueue_account_plan_check(
-                    account_id=int(account_id),
-                    email=str(row.get("email") or ""),
-                    access_token=str(row.get("access_token") or ""),
-                    trigger=trigger,
-                )
-                if queued.get("accepted"):
-                    _bulk_bump("queued")
-                    break
-                if queued.get("busy"):
-                    _bulk_bump("skipped")
-                    break
-                if queued.get("queue_full"):
-                    wait_rounds += 1
-                    if wait_rounds >= _BULK_QUEUE_MAX_WAIT_ROUNDS:
-                        _bulk_bump("failed")
+            try:
+                while True:
+                    if _BULK_STOP.is_set():
                         break
-                    time.sleep(_BULK_QUEUE_WAIT_SECONDS)
-                    continue
+                    queued = enqueue_account_plan_check(
+                        account_id=int(account_id),
+                        email=str(row.get("email") or ""),
+                        access_token=str(row.get("access_token") or ""),
+                        trigger=trigger,
+                    )
+                    if queued.get("accepted"):
+                        _bulk_bump("queued")
+                        break
+                    if queued.get("busy"):
+                        _bulk_bump("skipped")
+                        break
+                    if queued.get("queue_full"):
+                        wait_rounds += 1
+                        if wait_rounds >= _BULK_QUEUE_MAX_WAIT_ROUNDS:
+                            _bulk_bump("failed")
+                            break
+                        time.sleep(_BULK_QUEUE_WAIT_SECONDS)
+                        continue
+                    _bulk_bump("failed")
+                    break
+            except Exception:
+                # 单个账号入队异常不能中断整轮全量查询。
+                logger.exception("[Plan] 全量查询入队异常: account_id=%s", account_id)
                 _bulk_bump("failed")
-                break
             _bulk_bump("processed")
     finally:
         with _BULK_LOCK:

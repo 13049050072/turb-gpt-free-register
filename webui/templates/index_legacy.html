@@ -279,6 +279,13 @@
     .accounts-table .plan-promo-head {
       display: flex; align-items: center; gap: 4px; flex-wrap: wrap;
     }
+    .payment-method-status {
+      margin-top: 4px; color: #52617b; font-size: 11px; line-height: 1.35;
+      white-space: normal; overflow-wrap: anywhere;
+    }
+    .payment-method-checked { color: #166534; }
+    .payment-method-error { color: #b42318; }
+    .payment-method-not-applicable, .payment-method-unchecked { color: #7a869a; }
     .accounts-table .plan-promo-stack .pill {
       display: inline-flex; max-width: 100%; height: auto; min-height: 22px;
       line-height: 1.3; text-align: left; white-space: normal; overflow-wrap: anywhere;
@@ -1509,6 +1516,30 @@ function _promoStackHtml(baseText, baseClass, summaries, title, detailBtn = '') 
   const lines = summaries.map(item => `<span class="pill status-success" title="${esc(item)}">${esc(item)}</span>`).join('');
   return `<div class="plan-promo-stack"><div class="plan-promo-head">${base}${detailBtn}</div>${lines}</div>`;
 }
+function _paymentMethodCell(r) {
+  const status = String(r.payment_method_check_status || '').toLowerCase();
+  const checkedAt = r.payment_method_checked_at || '';
+  const types = Array.isArray(r.payment_method_types) ? r.payment_method_types.map(String) : [];
+  const labels = Array.isArray(r.payment_method_labels) ? r.payment_method_labels.map(String) : [];
+  if (status === 'checked') {
+    const methods = labels.length ? labels.join('、') : (types.length ? types.join('、') : '未返回具体方式');
+    const detail = [
+      checkedAt ? `已检查: ${checkedAt}` : '已检查',
+      r.payment_session_type ? `会话: ${r.payment_session_type}` : '',
+      r.payment_amount !== undefined && r.payment_amount !== null ? `金额: ${r.payment_amount}` : '',
+      r.payment_currency || '',
+    ].filter(Boolean).join('；');
+    return `<div class="payment-method-status payment-method-checked" title="${esc([detail, types.join(', ')].filter(Boolean).join('；'))}">支付方式: ${esc(methods)}<div class="acc-v2-sub">${esc(detail)}</div></div>`;
+  }
+  if (status === 'error') {
+    const reason = String(r.payment_method_error || '支付方式检查失败');
+    return `<div class="payment-method-status payment-method-error" title="${esc(reason)}">支付方式: 检查失败<div class="acc-v2-sub">${esc(reason)}</div></div>`;
+  }
+  if (status === 'not_applicable') {
+    return `<div class="payment-method-status payment-method-not-applicable" title="无适用的促销或结账优惠">支付方式: 不适用<div class="acc-v2-sub">无适用优惠</div></div>`;
+  }
+  return `<div class="payment-method-status payment-method-unchecked" title="当前套餐结果未包含支付方式检查">支付方式: 未检查</div>`;
+}
 function _planCell(r) {
   const ok = r.plan_check_ok;
   const err = r.plan_check_error || '';
@@ -1548,7 +1579,7 @@ function _planCell(r) {
     const t = promoSummaries.length ? `${title}；可用套餐优惠：${promoSummaries.join('；')}` : title;
     const keys = Object.keys(campaigns);
     const detailBtn = keys.length ? `<button type="button" class="promo-detail-btn" data-promo-details="${esc(JSON.stringify(campaigns))}">详情(${keys.length})</button>` : '';
-    return _promoStackHtml('free', cls, promoSummaries, t, detailBtn);
+    return `${_promoStackHtml('free', cls, promoSummaries, t, detailBtn)}${_paymentMethodCell(r)}`;
   }
 
   const isPaid = lower.includes('plus') || lower.includes('pro') || lower.includes('team') || lower.includes('go');
@@ -1568,7 +1599,7 @@ function _planCell(r) {
   if (r.plan_renews_at) detail.push(`续费时间: ${r.plan_renews_at}`);
   if (r.discount_expires_at) detail.push(`折扣结束: ${r.discount_expires_at}`);
   if (r.discount_promo_campaign_id) detail.push(`优惠: ${r.discount_promo_campaign_id}`);
-  return _promoStackHtml(text, cls, promoSummaries, detail.join('；'));
+  return `${_promoStackHtml(text, cls, promoSummaries, detail.join('；'))}${_paymentMethodCell(r)}`;
 }
 function _planAction(r) {
   if (['queued','running'].includes(r.plan_check_status)) {

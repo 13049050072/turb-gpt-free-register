@@ -6,6 +6,8 @@ SQLite 持久化层（JSON/TXT 仅用于首次迁移）。
 """
 import hashlib
 import json
+import math
+import re
 import sqlite3
 import threading
 import time
@@ -23,6 +25,129 @@ _LEGACY_DATA_DIR = _PROJECT_ROOT / "data"
 _LOG_DIR = _PROJECT_ROOT / "注册日志"
 _PLAN_CHECK_STALE_SECONDS = 120
 _PLAN_CHECK_QUEUE_STALE_SECONDS = 1800
+_PAYMENT_METHOD_FIELDS = (
+    "payment_method_check_status", "payment_method_checked_at", "payment_method_error",
+    "payment_method_types", "payment_method_labels", "payment_session_type",
+    "payment_amount", "payment_currency",
+)
+_PAYMENT_METHOD_STATUSES = {"checked", "not_applicable", "error"}
+_PAYMENT_METHOD_CURRENCY_RE = re.compile(r"^[A-Z]{3}$")
+_PAYMENT_METHOD_TYPE_RE = re.compile(r"^[a-z0-9][a-z0-9_.-]{0,63}$")
+_PAYMENT_METHOD_LABELS = frozenset({
+    "银行卡", "Link", "PayPal", "Cash App", "Apple Pay", "Google Pay",
+    "Amazon Pay", "Klarna", "Afterpay / Clearpay", "美国银行账户", "SEPA 借记卡",
+    "iDEAL", "Bancontact", "Sofort", "支付宝", "微信支付", "UPI", "PIX", "MoMo",
+    "GoPay", "GrabPay", "GCash", "BLIK", "TWINT", "其他支付方式",
+})
+_PAYMENT_SESSION_TYPES = frozenset({
+    "checkout", "checkout_session", "payment", "subscription", "setup",
+    "payment_intent", "setup_intent", "payment_page", "oaics", "stripe",
+})
+_PAYMENT_SENSITIVE_PREFIXES = (
+    "sk_", "pk_", "rk_", "whsec_", "cs_", "pi_", "seti_", "tok_",
+)
+_PAYMENT_SENSITIVE_TEXT_RE = re.compile(
+    r"(?:^|[_\-.])(access_token|refresh_token|authorization|bearer|client_secret|secret|cookie|"
+    r"session(?:_id)?|payment_intent(?:_id)?|checkout(?:_session)?(?:_id)?)(?:$|[_\-.])",
+    re.IGNORECASE,
+)
+_PAYMENT_RESULT_UNSAFE_KEYS = {
+    "checkout_url", "payment_url", "payment_page_url", "url", "session_id", "checkout_session_id",
+    "client_secret", "payment_intent", "payment_intent_id", "payment_session", "session", "mode",
+    "response", "response_body", "response_preview", "request_body", "body", "headers", "cookies",
+    "authorization", "access_token", "refresh_token", "token", "proxy", "proxy_credentials",
+    "raw_response", "raw_body", "payment_response", "payment_data",
+}
+
+
+def _sanitize_payment_value(key: str, value: Any) -> Any:
+    """Second boundary check before payment data enters the account payload."""
+    if key == "payment_method_check_status":
+        status = str(value or "").strip().lower()
+        return status if status in _PAYMENT_METHOD_STATUSES else "error"
+    if key == "payment_method_types":
+        if not isinstance(value, (list, tuple)):
+            return []
+        out = []
+        for item in value[:16]:
+            if not isinstance(item, str):
+                continue
+            text = item.strip()
+            lowered = text.casefold()
+            if (
+                text and len(text) <= 64 and _PAYMENT_METHOD_TYPE_RE.fullmatch(lowered)
+                and not lowered.startswith(_PAYMENT_SENSITIVE_PREFIXES)
+                and _PAYMENT_SENSITIVE_TEXT_RE.search(lowered) is None
+                and text not in out
+            ):
+                out.append(lowered)
+        return out
+    if key == "payment_method_labels":
+        if not isinstance(value, (list, tuple)):
+            return []
+        return [
+            item for item in value[:16]
+            if isinstance(item, str) and item in _PAYMENT_METHOD_LABELS
+        ]
+    if key == "payment_method_error":
+        text = str(value or "").strip()
+        if not text:
+            return None
+        allowed = {
+            "malformed payment response", "payment method types missing", "payment transport error",
+            "payment method check error", "payment method check failed",
+        }
+        if text in allowed:
+            return text
+        match = re.fullmatch(r"HTTP (?:[1-5][0-9]{2}|status missing)", text)
+        return match.group(0) if match else "payment method check failed"
+    if key == "payment_method_checked_at":
+        text = str(value or "").strip()
+        if not text or len(text) > 64:
+            return None
+        try:
+            datetime.fromisoformat(text.replace("Z", "+00:00"))
+        except (TypeError, ValueError):
+            return None
+        return text
+    if key == "payment_session_type":
+        text = str(value or "").strip().lower().replace("-", "_").replace(" ", "_")
+        return text if text in _PAYMENT_SESSION_TYPES else None
+    if key == "payment_currency":
+        text = str(value or "").strip().upper()
+        return text if _PAYMENT_METHOD_CURRENCY_RE.fullmatch(text) else None
+    if key == "payment_amount":
+        if isinstance(value, bool) or value is None:
+            return None
+        try:
+            number = float(value)
+        except (TypeError, ValueError, OverflowError):
+            return None
+        if not math.isfinite(number) or number < 0 or number > 1_000_000_000:
+            return None
+        return int(number) if number.is_integer() else round(number, 4)
+    return None
+
+
+def _persist_payment_method_fields(row: dict, result: dict) -> None:
+    if not isinstance(result, dict) or not any(key in result for key in _PAYMENT_METHOD_FIELDS):
+        return
+    defaults = {
+        "payment_method_types": [],
+        "payment_method_labels": [],
+    }
+    for key in _PAYMENT_METHOD_FIELDS:
+        row[key] = _sanitize_payment_value(key, result.get(key, defaults.get(key)))
+
+
+def _plan_result_for_persistence(result: dict) -> dict:
+    """Keep the established plan summary while excluding raw transport data."""
+    if not isinstance(result, dict):
+        return {}
+    return {
+        key: value for key, value in result.items()
+        if key not in _PAYMENT_RESULT_UNSAFE_KEYS
+    }
 
 _OUTLOOK_JSON = _PROJECT_ROOT / "用于注册的邮箱.json"
 _OUTLOOK_TXT = _PROJECT_ROOT / "用于注册的邮箱.txt"
@@ -1673,6 +1798,8 @@ def update_account_plan_check(acc_id: int | None = None, email: str | None = Non
             return False
 
         ok = bool(result.get("ok"))
+        _persist_payment_method_fields(row, result)
+        persisted_result = _plan_result_for_persistence(result)
         row["plan_check_status"] = "success" if ok else "failed"
         row["plan_check_ok"] = ok
         row["plan_checked_at"] = result.get("checked_at") or _now()
@@ -1726,7 +1853,7 @@ def update_account_plan_check(acc_id: int | None = None, email: str | None = Non
             row["eligible_offer_ids"] = result.get("eligible_offer_ids") or []
             row["eligible_promo_campaigns"] = result.get("eligible_promo_campaigns") or {}
             row["plan_last_success_at"] = result.get("checked_at") or _now()
-            row["plan_last_success_result_json"] = json.dumps(result, ensure_ascii=False)
+            row["plan_last_success_result_json"] = json.dumps(persisted_result, ensure_ascii=False)
         row["plan_check_proxy_mode"] = result.get("proxy_mode")
         row["plan_check_network_route"] = result.get("network_route")
         row["plan_check_proxy_used"] = result.get("proxy_used")
@@ -1734,7 +1861,7 @@ def update_account_plan_check(acc_id: int | None = None, email: str | None = Non
         for key in ("token_expired", "token_expires_at"):
             if key in result:
                 row[key] = result[key]
-        row["plan_check_result_json"] = json.dumps(result, ensure_ascii=False)
+        row["plan_check_result_json"] = json.dumps(persisted_result, ensure_ascii=False)
         row["updated_at"] = _now()
         return True
 
@@ -1972,6 +2099,9 @@ def list_account_plan_check_statuses(
         "expires_at", "plan_expires_at", "plan_renews_at", "renews_at",
         "billing_period", "billing_currency", "discount_amount", "discount_type",
         "discount_expires_at", "discount_promo_campaign_id",
+        "payment_method_check_status", "payment_method_checked_at", "payment_method_error",
+        "payment_method_types", "payment_method_labels", "payment_session_type",
+        "payment_amount", "payment_currency",
         "extract_link_status", "extract_link_ok", "extract_link_type",
         "extract_link_message", "extract_link_error",
         "extract_link_long_url", "extract_link_copy_paste",
@@ -2015,6 +2145,8 @@ def list_account_plan_check_statuses(
             item = {"id": row.get("id"), "email": row.get("email")}
             for key in fields:
                 value = row.get(key)
+                if key in _PAYMENT_METHOD_FIELDS:
+                    value = _sanitize_payment_value(key, value)
                 if key in ("id", "email"):
                     continue
                 if value is not None and value != "":
@@ -2042,6 +2174,30 @@ def list_account_plan_check_statuses(
                     "plan_type": row.get("plan_type"),
                     "plus_trial_eligible": row.get("plus_trial_eligible"),
                     "eligible_promo_campaigns": row.get("eligible_promo_campaigns"),
+                    "payment_method_check_status": _sanitize_payment_value(
+                        "payment_method_check_status", row.get("payment_method_check_status")
+                    ),
+                    "payment_method_checked_at": _sanitize_payment_value(
+                        "payment_method_checked_at", row.get("payment_method_checked_at")
+                    ),
+                    "payment_method_error": _sanitize_payment_value(
+                        "payment_method_error", row.get("payment_method_error")
+                    ),
+                    "payment_method_types": _sanitize_payment_value(
+                        "payment_method_types", row.get("payment_method_types")
+                    ),
+                    "payment_method_labels": _sanitize_payment_value(
+                        "payment_method_labels", row.get("payment_method_labels")
+                    ),
+                    "payment_session_type": _sanitize_payment_value(
+                        "payment_session_type", row.get("payment_session_type")
+                    ),
+                    "payment_amount": _sanitize_payment_value(
+                        "payment_amount", row.get("payment_amount")
+                    ),
+                    "payment_currency": _sanitize_payment_value(
+                        "payment_currency", row.get("payment_currency")
+                    ),
                     "extract_link_status": row.get("extract_link_status"),
                     "codex_status": row.get("codex_status"),
                     "codex_agent_status": row.get("codex_agent_status"),

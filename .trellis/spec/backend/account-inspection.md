@@ -95,6 +95,25 @@ A liveness job creates one fresh, in-memory `run_nonce` and passes it to `livene
 
 Every route attempt passes the current validated `LIVENESS_IMPERSONATE` value to `check_account_liveness()`. That value reaches every `BrowserSession` created by both the initial reauth path and the clean full-web fallback path. The protocol registration session factory applies the same `normalize_liveness_impersonate()` helper and validated setting to every registration session, including initial creation, preflight/auth retries, reopen error recovery, and direct fallback. `BrowserSession()` without the optional override remains backward compatible and uses global `IMPERSONATE`. The transport choice is runtime-only: it is not added to `fingerprint_state`, account records, liveness result payloads, logs, or browser profile summaries, and it does not mutate the persisted Chrome/JS/device profile.
 
+### 3.1 Payment-method availability during plan checks
+
+A successful plan check may perform one best-effort checkout initialization only when the plan result unambiguously describes a one-month free trial: the account is `free`, `plus_trial_eligible` is true, the promotion is 100% discounted, `plus_trial_duration_num_periods` is the numeric value `1`, and `plus_trial_duration_period` is `month`. It must also have at least one well-formed `eligible_promo_campaigns` entry and a matching `eligible_offer_ids` entry. Generic eligible promotions, paid plans, other or zero-length trials, missing/unknown duration fields, and malformed offer data do not issue checkout traffic. The request reuses the authenticated plan-check `BrowserSession`, proxy route, retry/session state, and traffic observer. Non-applicable results receive `payment_method_check_status=not_applicable`.
+
+The response parser accepts the OAICS checkout shape and Stripe payment-page initialization shape. It normalizes identifiers through one backend mapping and preserves bounded unknown identifiers with the generic label `其他支付方式`. The result contract is:
+
+```text
+payment_method_check_status: checked | not_applicable | error
+payment_method_checked_at: bounded ISO timestamp when a check ran
+payment_method_error: bounded fixed-class error text
+payment_method_types: at most 16 normalized identifiers
+payment_method_labels: at most 16 mapped labels
+payment_session_type: bounded checkout/payment session type
+payment_amount: bounded non-negative numeric amount
+payment_currency: bounded uppercase currency code
+```
+
+Payment parsing is best effort. HTTP, transport, malformed, missing-field, and unknown-method outcomes never change a successful plan result into a failed plan result. Only the eight fields above are copied into the account payload, plan result JSON, list projection, and account views. Checkout URLs, session IDs, client secrets, card/payment data, cookies, authorization values/tokens, bodies, and proxy credentials are neither persisted nor logged nor returned by the account APIs.
+
 ### 4. Validation & Error Matrix
 
 | Condition | Required result |
@@ -139,6 +158,7 @@ Every route attempt passes the current validated `LIVENESS_IMPERSONATE` value to
 - Template tests cover modern and Legacy controls, accessible history/failure dialogs, one in-flight list request, pending poll coalescing, and invalidation for success and uncertain outcomes of delete/archive/restore.
 - Liveness proxy tests assert provider-host boundary matching, byte-preserving encoded userinfo, cross-run freshness, per-attempt rotation, single-gateway retry, configured attempt limits, existing-sticky fallback, direct/non-provider preservation, definitive-failure stop, queue-slot ownership, and redaction in logs/results/session summaries.
 - Liveness transport tests assert the default `BrowserSession` still uses global `chrome146`, explicit `chrome124` reaches `curl_cffi.Session`, allowed environment overrides are bounded, invalid values fall back before curl construction, every service route attempt passes the configured profile, and clean full-web fallback preserves it without persisting transport state or exposing credentials/session IDs.
+- Payment-gate tests cover exactly one-month free trial (run), no promotion, paid/non-free plan, zero or other trial duration, and unknown/malformed duration or offer data (skip).
 - Protocol registration transport tests assert initial, preflight retry, authorize retry/reopen-error, and direct-fallback sessions all receive normalized `transport_impersonate="chrome124"`; config/session tests assert liveness normalization remains bounded, the global `BrowserSession` default remains `chrome146`, and Roxy/Cloak/Browser Use/Skyvern do not use the protocol helper.
 - Quality gates include focused Python tests, both Node UI tests, inline JavaScript syntax checks, `py_compile`, `git diff --check`, and full discovery with any unrelated clean-HEAD failures reproduced explicitly.
 

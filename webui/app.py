@@ -143,6 +143,10 @@ def _compact_account_for_list(row: dict) -> dict:
         "plan_check_error", "plan_expires_at", "plan_renews_at", "renews_at",
         "billing_period", "billing_currency", "discount_amount", "discount_type",
         "discount_expires_at", "discount_promo_campaign_id",
+        # Payment method availability is a bounded checkout summary only.
+        "payment_method_check_status", "payment_method_checked_at", "payment_method_error",
+        "payment_method_types", "payment_method_labels", "payment_session_type",
+        "payment_amount", "payment_currency",
         "token_expired", "token_expires_at",
         # 查活状态。
         "live_check_status", "live_check_error", "live_checked_at",
@@ -161,6 +165,8 @@ def _compact_account_for_list(row: dict) -> dict:
     )
     for key in optional_keys:
         value = row.get(key)
+        if key in db._PAYMENT_METHOD_FIELDS:
+            value = db._sanitize_payment_value(key, value)
         if value is not None and value != "":
             out[key] = value
     plan = str(row.get("current_plan_type") or row.get("plan_type") or "").lower()

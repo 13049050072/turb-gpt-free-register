@@ -65,3 +65,24 @@
 
 - 本轮只新增探测脚本与日志，未再改业务代码；线上镜像仍是 `turb-gpt-free-register:fb8b85c`。
 - 结论：支付方式检测在真实环境可用；结果取决于账号是否被上游支付风控标记。#737 为成功样本，#918 为风控样本，#849 为闸门样本。
+
+## 2026-10-19 - Task: 推送 b673346 并更新 Oracle 线上镜像
+
+### What was done
+
+- 提交并推送 `b673346`（支付检测实现文档、任务记录与进度日志），连同 `903b148`、`fb8b85c` 一起推到 `origin/main`（`a731abd..b673346`）。
+- 用 `b673346` 重新构建镜像并替换 Oracle 容器；线上 revision 与提交一致。
+- 构建前遇到根分区写满（45G 用满，仅剩 34M），清理构建缓存与 16 个历史镜像标签后释放到 8.2G 可用，保留 `a731abd`（回滚）、`cd5517b`、`fb8b85c`。
+
+### Testing
+
+- 推送：`git push origin main` 输出 `a731abd..b673346  main -> main`。
+- 构建：`docker compose build web` 成功；`docker image inspect` 显示 `revision=b673346`。
+- 部署：备份 `compose.env.before-b673346-20261019T150128Z`；容器 `state=running health=healthy restarts=0`，登录页 302。
+- 部署后校验：容器内 `core/chatgpt_plan.py` 含 3 处 `_PAYMENT_SENTINEL_FLOW`；对 #737 跑套餐刷新返回 `200 / free / trial=true / 100% / 1 期 month`。
+
+### Notes
+
+- Oracle 线上镜像由 `fb8b85c` 更新为 `turb-gpt-free-register:b673346`；回滚把 `compose.env` 的 `TURB_IMAGE` 改回 `turb-gpt-free-register:a731abd` 或 `fb8b85c` 再 `docker compose up -d --no-deps web`。
+- 磁盘清理删除了 16 个旧镜像标签（`787b8a4`、`09a8c76`、`e9165f8`、`58d953e`、`e6c823b`、`571ccf7`、`d6369ae`、`d008bf0`、`dfea160`、`6a59fa6`、`2ec3413`、`47c83ee`、`305983b`、`aeaa25c`、`a47ec76`、`s2adead-…`），如需这些版本回滚点需重新构建。
+- 新建目录 `/home/ubuntu/turb-gpt-free-register-build-b673346` 为本次构建上下文。

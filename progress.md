@@ -109,3 +109,24 @@
 - `webui/templates/index.html`：新增“全部查套餐”按钮与轮询进度逻辑。
 - `tests/test_plan_check_bulk.py`、`tests/test_plan_check_bulk_api.py`：新增测试。
 - 回滚：`git revert` 本次提交，或还原上述 5 个文件。
+
+## 2026-10-20 - Task: 全量套餐查询上线并跑完首轮
+
+### What was done
+
+- 提交 `3b39e05`（全量查询功能）与 `6ac66cf`（单账号入队异常不中断整轮），构建镜像 `turb-gpt-free-register:6ac66cf` 并替换 Oracle 容器。
+- 通过新接口启动首轮全量查询：657 个账号全部入队完成，`failed=0`，耗时 7 分 38 秒（00:36:14 → 00:43:52）。
+- 结果分布：全部为 free；173 个账号写入了支付方式状态，其中 168 个 `not_applicable`。
+
+### Testing
+
+- 单元测试：`tests.test_plan_check_bulk`（5 项）、`tests.test_plan_check_bulk_api`（2 项）通过；相关回归 49 项通过。
+- 线上接口验证：`POST /api/accounts/check-plan-all` 返回 202 且 `total=657`；轮询 `GET /api/accounts/check-plan-all-status` 观察到 544 → 613 → 657 的推进并正常结束。
+- 落库抽查：737/782/842 `checked`（card/link/upi，0 INR）；918/864 `error: payment method check failed`（同一轮内的瞬时失败，可单独重查）。
+
+### Notes
+
+- `core/plan_check_service.py`：新增全量查询后台线程与进度快照，单账号异常只计失败不中断。
+- `webui/app.py`：新增 `check-plan-all` 与 `check-plan-all-status` 两个接口。
+- `webui/templates/index.html`：工具栏新增“全部查套餐”按钮，按钮实时显示 `已处理/总数`。
+- 线上镜像 `turb-gpt-free-register:6ac66cf`，回滚改 `TURB_IMAGE` 到 `turb-gpt-free-register:3b39e05` 或 `turb-gpt-free-register:fb8b85c` 后 `up -d --no-deps web`；备份 `compose.env.before-6ac66cf-20261019T163340Z`。

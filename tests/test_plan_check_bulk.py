@@ -3,6 +3,7 @@
 import threading
 import time
 import unittest
+from concurrent.futures import Future
 from unittest.mock import patch
 
 from core import plan_check_service
@@ -17,27 +18,34 @@ def _wait_idle(timeout=5.0):
     return False
 
 
+def _done_future():
+    future = Future()
+    future.set_result(None)
+    return future
+
+
 class BulkPlanCheckTests(unittest.TestCase):
     def tearDown(self):
         _wait_idle()
 
-    def _run_with(self, rows, queue_results):
+    def _run_with(self, rows, queue_results, **start_kwargs):
         """rows: 账号行；queue_results: 每次 enqueue 依次返回的结果。"""
         calls = []
         results = list(queue_results)
 
         def fake_enqueue(**kwargs):
             calls.append(kwargs)
-            if results:
-                return results.pop(0)
-            return {"accepted": True}
+            base = results.pop(0) if results else {"accepted": True}
+            if base.get("accepted"):
+                base = {**base, "future": _done_future()}
+            return base
 
         with patch.object(plan_check_service.db, "list_accounts", return_value=rows), \
              patch.object(plan_check_service.db, "get_account",
                           side_effect=lambda acc_id: next(
                               (row for row in rows if int(row["id"]) == int(acc_id)), None)), \
              patch.object(plan_check_service, "enqueue_account_plan_check", side_effect=fake_enqueue):
-            started = plan_check_service.start_bulk_all_check()
+            started = plan_check_service.start_bulk_all_check(**start_kwargs)
             self.assertTrue(started["started"])
             self.assertTrue(_wait_idle())
         return calls, plan_check_service.bulk_check_status()
@@ -52,6 +60,8 @@ class BulkPlanCheckTests(unittest.TestCase):
 
         self.assertEqual([call["account_id"] for call in calls], [1, 2])
         self.assertEqual(state["total"], 2)
+        self.assertEqual(state["fed"], 2)
+        self.assertEqual(state["completed"], 2)
         self.assertEqual(state["queued"], 2)
         self.assertEqual(state["failed"], 0)
         self.assertEqual(state["processed"], 2)
@@ -68,7 +78,7 @@ class BulkPlanCheckTests(unittest.TestCase):
 
         self.assertEqual(len(calls), 3)
         self.assertEqual(state["queued"], 1)
-        self.assertEqual(state["failed"], 0)
+        self.assertEqual(state["processed"], 1)
 
     def test_busy_account_is_counted_as_skipped(self):
         rows = [{"id": 9, "email": "busy@example.test", "access_token": "t"}]
@@ -77,6 +87,7 @@ class BulkPlanCheckTests(unittest.TestCase):
         self.assertEqual(len(calls), 1)
         self.assertEqual(state["skipped"], 1)
         self.assertEqual(state["queued"], 0)
+        self.assertEqual(state["processed"], 1)
 
     def test_enqueue_exception_does_not_abort_run(self):
         rows = [
@@ -89,7 +100,7 @@ class BulkPlanCheckTests(unittest.TestCase):
             calls.append(kwargs["account_id"])
             if kwargs["account_id"] == 21:
                 raise RuntimeError("boom")
-            return {"accepted": True}
+            return {"accepted": True, "future": _done_future()}
 
         with patch.object(plan_check_service.db, "list_accounts", return_value=rows), \
              patch.object(plan_check_service.db, "get_account",
@@ -102,8 +113,24 @@ class BulkPlanCheckTests(unittest.TestCase):
         state = plan_check_service.bulk_check_status()
         self.assertEqual(calls, [21, 22])
         self.assertEqual(state["failed"], 1)
-        self.assertEqual(state["queued"], 1)
+        self.assertEqual(state["completed"], 1)
         self.assertEqual(state["processed"], 2)
+
+    def test_workers_are_passed_to_dedicated_executor(self):
+        rows = [{"id": 31, "email": "w@example.test", "access_token": "t"}]
+        calls, state = self._run_with(rows, [], workers=6)
+
+        self.assertEqual(state["workers"], 6)
+        executor = calls[0]["executor"]
+        self.assertIsNotNone(executor)
+        self.assertEqual(executor._max_workers, 6)
+        self.assertTrue(calls[0]["return_future"])
+
+    def test_invalid_workers_are_rejected(self):
+        for value in (0, 17, "abc", True, 3.5):
+            with self.subTest(value=value):
+                with self.assertRaises(ValueError):
+                    plan_check_service.start_bulk_all_check(workers=value)
 
     def test_second_start_reports_already_running(self):
         rows = [{"id": 11, "email": "slow@example.test", "access_token": "t"}]
@@ -111,7 +138,7 @@ class BulkPlanCheckTests(unittest.TestCase):
 
         def slow_enqueue(**_kwargs):
             release.wait(3.0)
-            return {"accepted": True}
+            return {"accepted": True, "future": _done_future()}
 
         with patch.object(plan_check_service.db, "list_accounts", return_value=rows), \
              patch.object(plan_check_service.db, "get_account", return_value=rows[0]), \

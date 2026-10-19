@@ -130,3 +130,26 @@
 - `webui/app.py`：新增 `check-plan-all` 与 `check-plan-all-status` 两个接口。
 - `webui/templates/index.html`：工具栏新增“全部查套餐”按钮，按钮实时显示 `已处理/总数`。
 - 线上镜像 `turb-gpt-free-register:6ac66cf`，回滚改 `TURB_IMAGE` 到 `turb-gpt-free-register:3b39e05` 或 `turb-gpt-free-register:fb8b85c` 后 `up -d --no-deps web`；备份 `compose.env.before-6ac66cf-20261019T163340Z`。
+
+## 2026-10-20 - Task: 全量查套餐支持自定义并发
+
+### What was done
+
+- 全量套餐查询改为每轮独立线程池：调用方传入 1–16 的并发数，不再固定复用 3 线程的单账号队列池。
+- 进度口径修正：`processed` = 已完成 + 跳过 + 失败；`running` 只有在全部任务真正跑完后才结束，避免“刚入队就显示 100%”。
+- 账号页“全部查套餐”改为弹窗设置并发（1–16，默认 3，记住上次选择），按钮显示 `已处理/总数`。
+- 接口 `POST /api/accounts/check-plan-all` 接受 `workers`，非法值返回 400。
+
+### Testing
+
+- `tests.test_plan_check_bulk`（8 项）覆盖并发透传、非法并发、队列满重试、异常隔离、重复启动。
+- `tests.test_plan_check_bulk_api`（3 项）覆盖 workers 透传与非法值 400。
+- 相关回归 53 项通过；模板 JS 语法检查通过；本地渲染 `/` 页面确认弹窗与并发输入存在。
+- `py_compile`、`git diff --check` 通过。
+
+### Notes
+
+- `core/plan_check_service.py`：新增 `_bulk_workers()` 校验与独立执行器；状态新增 `fed`/`completed`/`workers`。
+- `webui/app.py`：启动接口校验 `workers`。
+- `webui/templates/index.html`：新增启动弹窗与并发输入，轮询改为按完成数推进。
+- `tests/test_plan_check_bulk.py`、`tests/test_plan_check_bulk_api.py`：同步更新。

@@ -277,31 +277,59 @@ def queue_settings() -> dict:
 
 
 # ---------------------------------------------------------------------------
-# 全量套餐查询：把库里所有带 access_token 的账号依次塞进同一条套餐队列。
-# 队列有并发上限，所以用一个后台线程按剩余名额补位，避免一次性提交被拒。
+# 全量套餐查询：把库里所有带 access_token 的账号依次塞进套餐队列。
+# 队列有容量上限，这里用后台线程按剩余名额补位；每轮用独立线程池承载调用方
+# 指定的并发数，不挤占手动单账号查询共用的线程池。
 # ---------------------------------------------------------------------------
 
 _BULK_LOCK = threading.Lock()
 _BULK_STOP = threading.Event()
 _BULK_THREAD: threading.Thread | None = None
+_BULK_FEED_DONE = False
+_BULK_MAX_WORKERS = 16
 _BULK_STATE: dict = {
     "running": False,
     "total": 0,
-    "processed": 0,
+    "fed": 0,
+    "completed": 0,
     "queued": 0,
     "skipped": 0,
     "failed": 0,
     "started_at": None,
     "finished_at": None,
     "trigger": None,
+    "workers": 0,
 }
 _BULK_QUEUE_WAIT_SECONDS = 0.5
 _BULK_QUEUE_MAX_WAIT_ROUNDS = 600  # 单个账号最多等 5 分钟空位
 
 
+def _bulk_workers(value: object) -> int:
+    if value is None or value == "":
+        return _WORKERS
+    if isinstance(value, bool):
+        raise ValueError(f"并发线程数必须为 1–{_BULK_MAX_WORKERS} 的整数")
+    if isinstance(value, float) and not value.is_integer():
+        raise ValueError(f"并发线程数必须为 1–{_BULK_MAX_WORKERS} 的整数")
+    try:
+        workers = int(value)
+    except (TypeError, ValueError):
+        raise ValueError(f"并发线程数必须为 1–{_BULK_MAX_WORKERS} 的整数") from None
+    if not 1 <= workers <= _BULK_MAX_WORKERS:
+        raise ValueError(f"并发线程数必须为 1–{_BULK_MAX_WORKERS} 的整数")
+    return workers
+
+
 def _bulk_snapshot() -> dict:
     with _BULK_LOCK:
-        return dict(_BULK_STATE)
+        snapshot = dict(_BULK_STATE)
+    # 对外口径：已处理 = 已执行完 + 跳过 + 失败（未提交的账号也算处理过）
+    snapshot["processed"] = (
+        int(snapshot.get("completed") or 0)
+        + int(snapshot.get("skipped") or 0)
+        + int(snapshot.get("failed") or 0)
+    )
+    return snapshot
 
 
 def _bulk_bump(field: str) -> None:
@@ -309,13 +337,31 @@ def _bulk_bump(field: str) -> None:
         _BULK_STATE[field] = int(_BULK_STATE.get(field) or 0) + 1
 
 
+def _bulk_mark_done_locked() -> None:
+    """喂完且所有已提交任务都结束时，才把整轮标记为完成。"""
+    if not _BULK_FEED_DONE:
+        return
+    if int(_BULK_STATE.get("completed") or 0) < int(_BULK_STATE.get("fed") or 0):
+        return
+    if _BULK_STATE["running"]:
+        _BULK_STATE["running"] = False
+    if not _BULK_STATE["finished_at"]:
+        _BULK_STATE["finished_at"] = datetime.now().isoformat(timespec="seconds")
+
+
+def _bulk_task_done(_future=None) -> None:
+    with _BULK_LOCK:
+        _BULK_STATE["completed"] = int(_BULK_STATE.get("completed") or 0) + 1
+        _bulk_mark_done_locked()
+
+
 def bulk_check_status() -> dict:
-    """返回全量套餐查询的进度快照。"""
+    """返回全量套餐查询的进度快照（processed 为已完成数）。"""
     return _bulk_snapshot()
 
 
-def _bulk_worker(ids: list[int], trigger: str) -> None:
-    global _BULK_THREAD
+def _bulk_worker(ids: list[int], trigger: str, pool: ThreadPoolExecutor) -> None:
+    global _BULK_THREAD, _BULK_FEED_DONE
     try:
         for account_id in ids:
             if _BULK_STOP.is_set():
@@ -327,7 +373,6 @@ def _bulk_worker(ids: list[int], trigger: str) -> None:
                 logger.exception("[Plan] 全量查询读取账号失败: account_id=%s", account_id)
             if not row or not str(row.get("access_token") or "").strip():
                 _bulk_bump("failed")
-                _bulk_bump("processed")
                 continue
 
             wait_rounds = 0
@@ -340,9 +385,17 @@ def _bulk_worker(ids: list[int], trigger: str) -> None:
                         email=str(row.get("email") or ""),
                         access_token=str(row.get("access_token") or ""),
                         trigger=trigger,
+                        executor=pool,
+                        return_future=True,
                     )
                     if queued.get("accepted"):
                         _bulk_bump("queued")
+                        _bulk_bump("fed")
+                        future = queued.get("future")
+                        if future is None:
+                            _bulk_task_done()
+                        else:
+                            future.add_done_callback(_bulk_task_done)
                         break
                     if queued.get("busy"):
                         _bulk_bump("skipped")
@@ -360,25 +413,34 @@ def _bulk_worker(ids: list[int], trigger: str) -> None:
                 # 单个账号入队异常不能中断整轮全量查询。
                 logger.exception("[Plan] 全量查询入队异常: account_id=%s", account_id)
                 _bulk_bump("failed")
-            _bulk_bump("processed")
     finally:
         with _BULK_LOCK:
-            _BULK_STATE["running"] = False
-            _BULK_STATE["finished_at"] = datetime.now().isoformat(timespec="seconds")
+            _BULK_FEED_DONE = True
+            _bulk_mark_done_locked()
             snapshot = dict(_BULK_STATE)
+        try:
+            pool.shutdown(wait=False)
+        except Exception:
+            pass
         _BULK_THREAD = None
         logger.info(
-            "[Plan] 全量查询结束: total=%s queued=%s skipped=%s failed=%s",
-            snapshot.get("total"), snapshot.get("queued"),
-            snapshot.get("skipped"), snapshot.get("failed"),
+            "[Plan] 全量查询已全部入队: total=%s fed=%s skipped=%s failed=%s workers=%s",
+            snapshot.get("total"), snapshot.get("fed"),
+            snapshot.get("skipped"), snapshot.get("failed"), snapshot.get("workers"),
         )
 
 
-def start_bulk_all_check(*, archived: bool = False, trigger: str = "manual_all") -> dict:
+def start_bulk_all_check(
+    *,
+    archived: bool = False,
+    trigger: str = "manual_all",
+    workers: object = None,
+) -> dict:
     """对库里全部账号启动一次套餐查询；已在运行时直接返回当前进度。"""
-    global _BULK_THREAD
+    global _BULK_THREAD, _BULK_FEED_DONE
+    worker_count = _bulk_workers(workers)
     with _BULK_LOCK:
-        if _BULK_THREAD is not None and _BULK_THREAD.is_alive():
+        if _BULK_STATE.get("running"):
             return {"started": False, "already_running": True, **_BULK_STATE}
 
     rows = db.list_accounts(limit=100000, archived=archived)
@@ -386,21 +448,25 @@ def start_bulk_all_check(*, archived: bool = False, trigger: str = "manual_all")
         int(row["id"]) for row in rows
         if row.get("id") is not None and str(row.get("access_token") or "").strip()
     ]
+    pool = ThreadPoolExecutor(max_workers=max(1, worker_count), thread_name_prefix="plan-check-all")
     _BULK_STOP.clear()
     with _BULK_LOCK:
+        _BULK_FEED_DONE = False
         _BULK_STATE.update({
             "running": True,
             "total": len(ids),
-            "processed": 0,
+            "fed": 0,
+            "completed": 0,
             "queued": 0,
             "skipped": 0,
             "failed": 0,
             "started_at": datetime.now().isoformat(timespec="seconds"),
             "finished_at": None,
             "trigger": trigger,
+            "workers": worker_count,
         })
         thread = threading.Thread(
-            target=_bulk_worker, args=(ids, trigger), name="plan-check-bulk", daemon=True,
+            target=_bulk_worker, args=(ids, trigger, pool), name="plan-check-bulk", daemon=True,
         )
         _BULK_THREAD = thread
         thread.start()

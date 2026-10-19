@@ -1143,7 +1143,10 @@ def create_app(auth_code: str | None = None) -> Flask:
         try:
             result = plan_check_service.start_bulk_all_check(
                 archived=archived if isinstance(archived, bool) else False,
+                workers=data.get("workers"),
             )
+        except ValueError as exc:
+            return jsonify({"ok": False, "error": str(exc)}), 400
         except Exception as exc:
             return jsonify({"ok": False, "error": f"{type(exc).__name__}: {exc}"}), 500
         return jsonify({"ok": True, **result}), 202

@@ -5073,19 +5073,41 @@ function downloadSelectedCodexAgents() {
 
 let PLAN_ALL_POLL = null;
 
-async function checkAllPlans() {
-  const btn = $('#btnCheckAllPlansV2');
-  if (!btn) return;
+function checkAllPlans() {
   if (PLAN_ALL_POLL) { showToast('全量查套餐正在进行中'); return; }
-  if (!confirm('确定查询全部账号的套餐吗？\n\n按后台队列并发执行；普通 free 只查套餐，一个月免费试用会顺带检测支付方式。')) return;
+  const input = $('#planAllWorkers');
+  if (input) {
+    const saved = Number(localStorage.getItem('planAllWorkers'));
+    input.value = Number.isInteger(saved) && saved >= 1 && saved <= 16 ? saved : 3;
+  }
+  const dialog = $('#planAllStartDialog');
+  if (dialog) { dialog.showModal(); return; }
+}
+
+async function submitPlanAll(event) {
+  if (event) event.preventDefault();
+  const btn = $('#btnCheckAllPlansV2');
+  const input = $('#planAllWorkers');
+  const workers = Number(input ? input.value : 3);
+  if (!Number.isInteger(workers) || workers < 1 || workers > 16) {
+    showToast('并发线程数必须为 1–16 的整数');
+    return;
+  }
+  const dialog = $('#planAllStartDialog');
+  if (dialog) dialog.close();
+  localStorage.setItem('planAllWorkers', String(workers));
+  if (!btn) return;
   const old = btn.textContent;
   btn.disabled = true;
   btn.textContent = '启动中…';
   try {
     const r = await api('/api/accounts/check-plan-all', {
-      method:'POST', headers:{'Content-Type':'application/json'}, body:'{}',
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({workers}),
     });
-    showToast(r.already_running ? '全量查套餐已在运行' : `已开始：共 ${r.total || 0} 个账号`);
+    showToast(r.already_running
+      ? '全量查套餐已在运行'
+      : `已开始：共 ${r.total || 0} 个账号，并发 ${r.workers || workers}`);
     startPlanAllPolling(old);
   } catch (err) {
     showToast('全量查套餐失败: ' + err.message);
@@ -5108,7 +5130,7 @@ function startPlanAllPolling(oldLabel) {
       PLAN_ALL_POLL = null;
       btn.textContent = restore;
       btn.disabled = false;
-      showToast(`全量查套餐完成：入队 ${st.queued || 0}，跳过 ${st.skipped || 0}，失败 ${st.failed || 0}`);
+      showToast(`全量查套餐完成：完成 ${st.processed || 0}，跳过 ${st.skipped || 0}，失败 ${st.failed || 0}`);
       await loadAccounts();
     } catch (err) {
       clearInterval(PLAN_ALL_POLL);
@@ -7494,6 +7516,25 @@ setInterval(loadSummary, 30000);
 setInterval(() => { if (!$('#tab-accounts').classList.contains('hidden')) pollAccountPlanStatuses(); }, 10000);
 </script>
 {% include 'promo_details.html' %}
+<dialog id="planAllStartDialog" class="inspection-dialog inspection-dialog--start" aria-labelledby="planAllStartTitle">
+  <form onsubmit="submitPlanAll(event)">
+    <div class="inspection-header">
+      <div class="inspection-heading"><h3 id="planAllStartTitle">全部查套餐</h3><p>查询库里全部账号当前套餐</p></div>
+      <button class="inspection-btn inspection-close" type="button" aria-label="关闭全部查套餐弹窗" onclick="document.getElementById('planAllStartDialog').close()">×</button>
+    </div>
+    <div class="inspection-body">
+      <div class="inspection-notice"><span>查询范围：<strong>全部账号</strong></span><span>仅包含带 access_token 的账号，不受当前筛选条件影响。</span></div>
+      <label class="inspection-field" for="planAllWorkers">并发线程数</label>
+      <input id="planAllWorkers" name="workers" type="number" min="1" max="16" step="1" value="3" required aria-describedby="planAllWorkersHint">
+      <p id="planAllWorkersHint" class="inspection-hint">支持 1–16 个并发，默认 3。只作用于本轮全量查询，不改变单账号查套餐的队列配置。</p>
+      <p class="inspection-hint">普通 free 只查套餐；一个月 100% 免费试用才会顺带检测支付方式。</p>
+    </div>
+    <div class="inspection-footer"><span>同一时间只允许一轮全量查询</span><div class="inspection-footer-actions">
+      <button class="inspection-btn" type="button" onclick="document.getElementById('planAllStartDialog').close()">取消</button>
+      <button class="inspection-btn inspection-btn--primary" id="btnConfirmPlanAll" type="submit">开始查询</button>
+    </div></div>
+  </form>
+</dialog>
 {% include 'account_inspections.html' %}
 </body>
 </html>

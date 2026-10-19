@@ -70,6 +70,8 @@ _PAYMENT_METHOD_ERROR = "error"
 _PAYMENT_METHOD_TYPE_RE = re.compile(r"^[a-z0-9][a-z0-9_.-]{0,63}$")
 _PAYMENT_METHOD_CURRENCY_RE = re.compile(r"^[A-Z]{3}$")
 _PAYMENT_SAFE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,95}$")
+_PAYMENT_CHECKOUT_SESSION_RE = re.compile(r"^(?:cs_|oaics_)[A-Za-z0-9_]{1,240}$")
+_PAYMENT_PUBLISHABLE_KEY_RE = re.compile(r"^pk_(?:live|test)_[A-Za-z0-9]{1,240}$")
 _PAYMENT_METHOD_TYPE_ALIASES = {
     "credit_card": "card",
     "debit_card": "card",
@@ -460,32 +462,27 @@ def _payment_check_offer(plan_result: dict) -> tuple[str | None, str | None]:
     if not bounded_offers:
         return None, None
 
-    # Prefer an explicitly matching campaign. If campaign metadata does not
-    # carry an offer name, the existing eligible-offer list is the only
-    # checkout eligibility signal available from the plan response.
-    for campaign in campaigns.values():
-        if not isinstance(campaign, dict):
-            continue
-        metadata = campaign.get("metadata") if isinstance(campaign.get("metadata"), dict) else {}
-        candidate_names = (
-            metadata.get("plan_name"),
-            campaign.get("offer_id"),
-            campaign.get("plan"),
-        )
-        wanted = {
-            value.casefold()
-            for value in (_bounded_payment_identifier(item) for item in candidate_names)
-            if value
-        }
-        offer = next((item for item in bounded_offers if item.casefold() in wanted), None)
-        if offer is None and not any(candidate_names):
-            offer = bounded_offers[0]
-        if offer is None:
-            continue
-        campaign_id = _bounded_payment_identifier(campaign.get("id"))
-        if campaign_id:
-            return offer, campaign_id
-    return None, None
+    # The trial fields above are derived specifically from the Plus campaign.
+    # Other campaign entries (for example team promotions) cannot select it.
+    campaign = campaigns.get("plus")
+    if not isinstance(campaign, dict):
+        return None, None
+    metadata = campaign.get("metadata") if isinstance(campaign.get("metadata"), dict) else {}
+    candidate_names = (
+        metadata.get("plan_name"),
+        campaign.get("offer_id"),
+        campaign.get("plan"),
+    )
+    wanted = {
+        value.casefold()
+        for value in (_bounded_payment_identifier(item) for item in candidate_names)
+        if value
+    }
+    offer = next((item for item in bounded_offers if item.casefold() in wanted), None)
+    if offer is None and not any(candidate_names):
+        offer = bounded_offers[0]
+    campaign_id = _bounded_payment_identifier(campaign.get("id"))
+    return (offer, campaign_id) if offer and campaign_id else (None, None)
 
 
 def _payment_checkout_region(
@@ -524,6 +521,61 @@ def _payment_checkout_region(
     return (country, currency) if currency else None
 
 
+class _PaymentResponseError(ValueError):
+    """Only fixed local diagnostics may be placed in the public payment result."""
+
+
+def _payment_response_json(response: object, stage: str) -> dict:
+    status = int(getattr(response, "status_code", 0) or 0)
+    if not 200 <= status < 300:
+        detail = f"HTTP {status}" if status else "HTTP status missing"
+        raise _PaymentResponseError(f"{stage}: {detail}")
+    try:
+        data = response.json()
+    except Exception:
+        raise _PaymentResponseError(f"{stage}: malformed payment response") from None
+    if not isinstance(data, dict):
+        raise _PaymentResponseError(f"{stage}: malformed payment response")
+    return data
+
+
+def _stripe_payment_init_request(session: BrowserSession, publishable_key: str) -> dict:
+    """Reuse the current transport, but send no ChatGPT authentication to Stripe."""
+    profile = getattr(session, "browser_profile", {}) or {}
+    locale = str(profile.get("navigator_language") or "en-US")
+    browser_headers = session.get_chatgpt_headers(referer="https://chatgpt.com/")
+    headers = {
+        key.lower(): value for key, value in browser_headers.items()
+        if key.lower() in {"user-agent", "accept-language"}
+    }
+    headers.update({
+        "accept": "application/json",
+        "content-type": "application/x-www-form-urlencoded",
+        "origin": "https://js.stripe.com",
+        "referer": "https://js.stripe.com/",
+    })
+    return {
+        "headers": headers,
+        "data": {
+            "browser_locale": locale,
+            "browser_timezone": str(profile.get("timezone_iana") or "UTC"),
+            "elements_session_client[client_betas][0]": "custom_checkout_server_updates_1",
+            "elements_session_client[client_betas][1]": "custom_checkout_manual_approval_1",
+            "elements_session_client[elements_init_source]": "custom_checkout",
+            "elements_session_client[referrer_host]": "chatgpt.com",
+            "elements_session_client[stripe_js_id]": str(uuid.uuid4()),
+            "elements_session_client[locale]": locale.split("-")[0],
+            "elements_options_client[saved_payment_method][enable_save]": "auto",
+            "elements_options_client[saved_payment_method][enable_redisplay]": "auto",
+            "key": publishable_key,
+            "_stripe_version": (
+                "2025-03-31.basil; checkout_server_update_beta=v1; "
+                "checkout_manual_approval_preview=v1"
+            ),
+        },
+    }
+
+
 def check_payment_method_availability(
     session: BrowserSession | None,
     token: str,
@@ -543,11 +595,15 @@ def check_payment_method_availability(
     if not region:
         return _payment_error_result("payment region unavailable")
     country, currency = region
+    stage = "checkout"
     try:
+        request_timeout = max(1.0, min(60.0, float(timeout or 15.0)))
         claims = token_claims(token)
         body = {
             "entry_point": "all_plans_pricing_modal",
-            "plan_name": offer_id,
+            # eligible_offer_ids are opaque offer identifiers, not checkout
+            # product names. The endpoint accepts the Plus product enum here.
+            "plan_name": "chatgptplusplan",
             "billing_details": {"country": country, "currency": currency},
             "checkout_ui_mode": "custom",
             "promo_campaign": {
@@ -562,23 +618,51 @@ def check_payment_method_availability(
             ),
             json=body,
             allow_redirects=False,
-            timeout=max(1.0, min(60.0, float(timeout or 15.0))),
+            timeout=request_timeout,
         )
-        status = int(getattr(response, "status_code", 0) or 0)
-        if not 200 <= status < 300:
-            return _payment_error_result(f"HTTP {status}" if status else "HTTP status missing")
-        try:
-            data = response.json()
-        except Exception:
-            return _payment_error_result("malformed payment response")
-        try:
+        data = _payment_response_json(response, stage)
+        # Some OAICS responses already contain a complete method snapshot.
+        if _collect_payment_method_types(data):
             return parse_payment_method_response(data)
+        session_id = data.get("checkout_session_id") or data.get("id")
+        if not isinstance(session_id, str) or not _PAYMENT_CHECKOUT_SESSION_RE.fullmatch(session_id):
+            raise _PaymentResponseError("checkout: valid session metadata missing")
+        if session_id.startswith("oaics_"):
+            stage = "oaics_state"
+            entity = data.get("processor_entity") or ("openai_llc" if country == "US" else "openai_ie")
+            if entity not in {"openai_llc", "openai_ie"}:
+                raise _PaymentResponseError("oaics_state: invalid processor entity")
+            path = f"{PAYMENT_CHECKOUT_PATH}/{entity}/{session_id}"
+            response = session.get(
+                f"https://chatgpt.com{path}",
+                headers=_common_headers(session, token, claims, target_path=path),
+                allow_redirects=False,
+                timeout=request_timeout,
+            )
+            source = "oaics"
+        else:
+            stage = "stripe_init"
+            publishable_key = data.get("publishable_key")
+            if not isinstance(publishable_key, str) or not _PAYMENT_PUBLISHABLE_KEY_RE.fullmatch(publishable_key):
+                raise _PaymentResponseError("stripe_init: valid publishable key missing")
+            response = session.post(
+                f"https://api.stripe.com/v1/payment_pages/{session_id}/init",
+                **_stripe_payment_init_request(session, publishable_key),
+                allow_redirects=False,
+                timeout=request_timeout,
+            )
+            source = "stripe"
+        data = _payment_response_json(response, stage)
+        try:
+            return parse_payment_method_response(data, source=source)
         except (TypeError, ValueError):
-            return _payment_error_result("payment method types missing")
+            raise _PaymentResponseError(f"{stage}: payment method types missing") from None
+    except _PaymentResponseError as exc:
+        return _payment_error_result(str(exc))
     except Exception:
         # Exception text can contain URLs, request bodies, or provider secrets;
-        # only expose the bounded failure class.
-        return _payment_error_result("payment transport error")
+        # only expose the bounded failure stage.
+        return _payment_error_result(f"{stage}: payment transport error")
 
 
 # Short compatibility name for callers/tests that use the operation wording.

@@ -2,7 +2,11 @@ import json
 import unittest
 from contextlib import contextmanager
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
+from types import SimpleNamespace
+
+from core.protocol_traffic import ProtocolTrafficTracker, safe_protocol_url
+from core.session import BrowserSession, _safe_url_for_log
 
 from core import db
 from core.chatgpt_plan import (
@@ -90,6 +94,39 @@ class _CheckoutContractSession(_Session):
         if not self.contract_valid:
             return _Response(400, data={"error": "invalid checkout request"})
         return _Response(200, data={"payment_method_types": ["card"]})
+
+
+class _SequenceSession(_Session):
+    """Responses cross the checkout/provider boundary in request order."""
+
+    def __init__(self, *responses):
+        super().__init__()
+        self.responses = list(responses)
+        self.calls = []
+        self.browser_profile.update(timezone_iana="America/Los_Angeles")
+
+    def _send(self, method, url, kwargs):
+        self.calls.append((method, url, kwargs))
+        response = self.responses.pop(0)
+        if isinstance(response, Exception):
+            raise response
+        return response
+
+    def get(self, url, **kwargs):
+        return self._send("GET", url, kwargs)
+
+    def post(self, url, **kwargs):
+        return self._send("POST", url, kwargs)
+
+    def get_chatgpt_headers(self, **kwargs):
+        return {
+            **super().get_chatgpt_headers(**kwargs),
+            "User-Agent": "fixture-browser",
+            "Accept-Language": "en-US,en;q=0.9",
+            "cookie": "fixture-chatgpt-cookie",
+            "authorization": "fixture-auth",
+            "chatgpt-account-id": "fixture-account",
+        }
 
 
 class PaymentMethodParserTests(unittest.TestCase):
@@ -247,6 +284,35 @@ class PaymentMethodFlowTests(unittest.TestCase):
                 self.assertNotIn("provider.invalid", json.dumps(result))
                 self.assertNotIn("client_secret", json.dumps(result))
 
+    def test_opaque_offer_ids_are_not_sent_as_product_name(self):
+        # Production accounts/check returns opaque offer IDs, not product enums.
+        # Include an unrelated campaign first to exercise Plus-specific selection.
+        plan = self.eligible_plan(
+            eligible_offer_ids=["opaque-offer-a", "opaque-offer-b"],
+            eligible_promo_campaigns={
+                "team": {"id": "team-campaign", "offer_id": "opaque-offer-a"},
+                "plus": {"id": "campaign-1", "metadata": {}},
+            },
+        )
+        session = _CheckoutContractSession()
+        result = check_payment_method_availability(session, "token", plan)
+        self.assertTrue(session.contract_valid)
+        self.assertEqual(result["payment_method_check_status"], "checked")
+        self.assertNotIn("opaque-offer", json.dumps(session.posts[0][1]["json"]))
+
+    def test_non_plus_or_mismatched_offer_campaign_skips_checkout(self):
+        for campaigns in (
+            {"team": {"id": "campaign-1"}},
+            {"plus": {"id": "campaign-1", "offer_id": "missing-offer"}},
+        ):
+            with self.subTest(campaigns=campaigns):
+                session = _Session()
+                result = check_payment_method_availability(
+                    session, "token", self.eligible_plan(eligible_promo_campaigns=campaigns),
+                )
+                self.assertEqual(result["payment_method_check_status"], "not_applicable")
+                self.assertEqual(session.posts, [])
+
     def test_known_checkout_contract_avoids_http_400(self):
         session = _CheckoutContractSession()
         result = check_payment_method_availability(session, "token", self.eligible_plan())
@@ -277,6 +343,143 @@ class PaymentMethodFlowTests(unittest.TestCase):
         self.assertNotIn("provider.invalid", json.dumps(result))
         self.assertNotIn("secret-id", json.dumps(result))
 
+    def test_stripe_metadata_requires_init_on_same_session_without_chatgpt_auth(self):
+        session = _SequenceSession(
+            _Response(data={"checkout_session_id": "cs_test_fixture", "publishable_key": "pk_test_fixture"}),
+            _Response(data={"payment_method_types": ["card", "link"], "invoice": {"amount_due": 0, "currency": "usd"}}),
+        )
+        result = check_payment_method_availability(session, "fixture-token", self.eligible_plan(), timeout=7)
+        self.assertEqual(result["payment_method_types"], ["card", "link"])
+        self.assertEqual(result["payment_session_type"], "stripe")
+        self.assertEqual(result["payment_amount"], 0)
+        self.assertEqual(result["payment_currency"], "USD")
+        self.assertEqual([item[:2] for item in session.calls], [
+            ("POST", "https://chatgpt.com" + PAYMENT_CHECKOUT_PATH),
+            ("POST", "https://api.stripe.com/v1/payment_pages/cs_test_fixture/init"),
+        ])
+        init = session.calls[1][2]
+        self.assertNotIn("json", init)
+        self.assertEqual(init["data"]["key"], "pk_test_fixture")
+        self.assertEqual(init["data"]["browser_locale"], "en-US")
+        self.assertEqual(init["data"]["browser_timezone"], "America/Los_Angeles")
+        self.assertEqual(init["data"]["elements_session_client[elements_init_source]"], "custom_checkout")
+        self.assertIn("checkout_server_update_beta=v1", init["data"]["_stripe_version"])
+        self.assertEqual(set(init["headers"]), {
+            "user-agent", "accept-language", "accept", "content-type", "origin", "referer",
+        })
+        self.assertEqual(init["headers"]["origin"], "https://js.stripe.com")
+        for _method, _url, kwargs in session.calls:
+            self.assertFalse(kwargs["allow_redirects"])
+            self.assertEqual(kwargs["timeout"], 7)
+        for secret in ("cs_test_fixture", "pk_test_fixture", "fixture-token", "fixture-chatgpt-cookie"):
+            self.assertNotIn(secret, json.dumps(result))
+
+    def test_oaics_metadata_requires_authenticated_state_get(self):
+        for country, entity in (("US", "openai_llc"), ("DE", "openai_ie")):
+            with self.subTest(country=country):
+                session = _SequenceSession(
+                    _Response(data={"checkout_session_id": "oaics_fixture"}),
+                    _Response(data={"paymentMethodTypes": ["card", "paypal"], "total": {"total": 0, "currency": "eur"}}),
+                )
+                session.exit_geo = {"country": country}
+                result = check_payment_method_availability(session, "fixture-token", self.eligible_plan())
+                self.assertEqual(result["payment_method_types"], ["card", "paypal"])
+                self.assertEqual(result["payment_session_type"], "oaics")
+                path = f"{PAYMENT_CHECKOUT_PATH}/{entity}/oaics_fixture"
+                method, url, kwargs = session.calls[1]
+                self.assertEqual((method, url), ("GET", "https://chatgpt.com" + path))
+                self.assertEqual(kwargs["headers"]["authorization"], "Bearer fixture-token")
+                self.assertEqual(kwargs["headers"]["x-openai-target-path"], path)
+                self.assertNotIn("oaics_fixture", json.dumps(result))
+
+    def test_direct_oaics_methods_need_no_followup(self):
+        session = _SequenceSession(_Response(data={
+            "checkout_session_id": "oaics_fixture", "paymentMethodTypes": ["card"],
+        }))
+        result = check_payment_method_availability(session, "token", self.eligible_plan())
+        self.assertEqual(result["payment_method_check_status"], "checked")
+        self.assertEqual(len(session.calls), 1)
+
+    def test_invalid_metadata_cannot_choose_an_arbitrary_followup_url(self):
+        for metadata in (
+            {}, {"checkout_session_id": "https://untrusted.invalid/"},
+            {"checkout_session_id": "cs_test_foo/../bar", "publishable_key": "pk_test_fixture"},
+            {"checkout_session_id": "cs_test_fixture"},
+            {"checkout_session_id": "cs_test_fixture", "publishable_key": "sk_test_fixture"},
+            {"checkout_session_id": "oaics_fixture", "processor_entity": "../../untrusted"},
+        ):
+            with self.subTest(metadata=metadata):
+                session = _SequenceSession(_Response(data=metadata))
+                result = check_payment_method_availability(session, "token", self.eligible_plan())
+                self.assertEqual(result["payment_method_check_status"], "error")
+                self.assertEqual(len(session.calls), 1)
+                self.assertNotIn("untrusted", json.dumps(result))
+                self.assertNotIn("fixture", json.dumps(result))
+
+    def test_provider_failure_has_fixed_stage_and_does_not_leak_response(self):
+        for provider in ("stripe", "oaics"):
+            metadata = {"checkout_session_id": "oaics_fixture"} if provider == "oaics" else {
+                "id": "cs_test_fixture", "publishable_key": "pk_test_fixture",
+            }
+            stage = "oaics_state" if provider == "oaics" else "stripe_init"
+            for failure, diagnostic in (
+                (_Response(400, data={"client_secret": "fixture-secret"}), "HTTP 400"),
+                (_Response(429), "HTTP 429"), (_Response(503), "HTTP 503"),
+                (_Response(302), "HTTP 302"),
+                (_Response(data=ValueError("fixture-secret")), "malformed payment response"),
+                (_Response(data=[]), "malformed payment response"),
+                (_Response(data={"client_secret": "fixture-secret"}), "payment method types missing"),
+                (RuntimeError("fixture-secret"), "payment transport error"),
+            ):
+                with self.subTest(provider=provider, diagnostic=diagnostic):
+                    session = _SequenceSession(_Response(data=metadata), failure)
+                    result = check_payment_method_availability(session, "token", self.eligible_plan())
+                    self.assertEqual(result["payment_method_check_status"], "error")
+                    self.assertEqual(result["payment_method_error"], f"{stage}: {diagnostic}")
+                    self.assertEqual(len(session.calls), 2)
+                    self.assertNotIn("fixture", json.dumps(result))
+
+    def test_provider_followup_uses_public_traffic_wrappers(self):
+        for provider in ("stripe", "oaics"):
+            metadata = {"checkout_session_id": "oaics_fixture"} if provider == "oaics" else {
+                "checkout_session_id": "cs_test_fixture", "publishable_key": "pk_test_fixture",
+            }
+            initial = _Response(data=metadata)
+            snapshot = _Response(data={"payment_method_types": ["card"]})
+            raw = SimpleNamespace(
+                post=Mock(side_effect=[initial, snapshot]), get=Mock(return_value=snapshot),
+            )
+            session = object.__new__(BrowserSession)
+            session.session = raw
+            session.traffic_tracker = ProtocolTrafficTracker()
+            session.blocked_until = 0
+            session.blocked_reason = ""
+            session.exit_geo = {"country": "US"}
+            session.browser_profile = {"navigator_language": "en-US"}
+            session.get_chatgpt_headers = Mock(return_value={})
+            result = check_payment_method_availability(session, "token", self.eligible_plan())
+            self.assertEqual(result["payment_method_check_status"], "checked")
+            self.assertEqual(session.traffic_tracker.freeze()["request_count"], 2)
+            self.assertEqual(raw.post.call_count, 2 if provider == "stripe" else 1)
+            self.assertEqual(raw.get.call_count, 1 if provider == "oaics" else 0)
+
+    def test_checkout_identifiers_are_redacted_in_traffic_and_circuit_logs(self):
+        for url in (
+            "https://api.stripe.com/v1/payment_pages/cs_test_onlyletters/init?key=pk_test_fixture",
+            "https://chatgpt.com/backend-api/payments/checkout/openai_llc/oaics_onlyletters",
+        ):
+            for sanitize in (safe_protocol_url, _safe_url_for_log):
+                safe = sanitize(url)
+                self.assertIn("<redacted>", safe)
+                self.assertNotIn("onlyletters", safe)
+                self.assertNotIn("pk_test_fixture", safe)
+        session = object.__new__(BrowserSession)
+        session.blocked_until = 0
+        session.blocked_reason = ""
+        with self.assertLogs("core.session", level="WARNING") as logs:
+            session._observe_response_for_circuit_breaker(_Response(429), url)
+        self.assertNotIn("onlyletters", " ".join(logs.output) + session.blocked_reason)
+
     def test_payment_failure_does_not_fail_successful_plan_check(self):
         session = _Session(
             response=_Response(503, data={"secret": "not-returned"}),
@@ -299,7 +502,7 @@ class PaymentMethodFlowTests(unittest.TestCase):
             result = check_account_plan("token", session=session, max_attempts=1, timezone_offset_min="-540")
         self.assertTrue(result["ok"])
         self.assertEqual(result["payment_method_check_status"], "error")
-        self.assertEqual(result["payment_method_error"], "HTTP 503")
+        self.assertEqual(result["payment_method_error"], "checkout: HTTP 503")
         self.assertEqual(len(session.posts), 1)
 
 

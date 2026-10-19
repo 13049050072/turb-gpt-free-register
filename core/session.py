@@ -22,6 +22,7 @@ from config import (
     BROWSER_PROFILE_POOL, build_browser_environment, normalize_liveness_impersonate,
 )
 from core.proxy_utils import mask_proxy_url
+from core.protocol_traffic import safe_protocol_url
 
 
 logger = logging.getLogger(__name__)
@@ -29,14 +30,8 @@ _GEO_CACHE: dict[str, dict] = {}
 
 
 def _safe_url_for_log(value: object) -> str:
-    """Keep query values such as OAuth code/state out of request logs."""
-    try:
-        parsed = urlparse(str(value or ""))
-        if parsed.scheme and parsed.netloc:
-            return f"{parsed.scheme}://{parsed.netloc}{parsed.path or '/'}"
-        return parsed.path or "<empty>"
-    except Exception:
-        return "<invalid-url>"
+    """Share traffic redaction, including checkout session IDs and OAuth queries."""
+    return safe_protocol_url(value)
 
 
 _GEO_CACHE_LOCK = threading.Lock()

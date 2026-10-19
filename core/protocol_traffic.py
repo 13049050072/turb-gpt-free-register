@@ -50,6 +50,10 @@ def _looks_secret_path_segment(value: str) -> bool:
     lower = value.lower()
     if lower in _SAFE_ROUTE_WORDS:
         return False
+    # Checkout identifiers can contain only letters; entropy/digit heuristics
+    # alone do not reliably hide provider session paths.
+    if lower.startswith(("cs_", "oaics_")):
+        return True
     if any(word in lower for word in _SECRET_WORDS):
         return True
     if "@" in value or "=" in value or "%" in value:

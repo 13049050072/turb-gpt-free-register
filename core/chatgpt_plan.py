@@ -22,6 +22,20 @@ logger = logging.getLogger(__name__)
 
 ACCOUNTS_CHECK_PATH = "/backend-api/accounts/check/v4-2023-04-27"
 PAYMENT_CHECKOUT_PATH = "/backend-api/payments/checkout"
+_PAYMENT_CURRENCY_BY_COUNTRY = {
+    "US": "USD", "CA": "CAD", "GB": "GBP", "JP": "JPY", "CN": "CNY",
+    "HK": "HKD", "TW": "TWD", "KR": "KRW", "SG": "SGD", "AU": "AUD",
+    "NZ": "NZD", "IN": "INR", "ID": "IDR", "MY": "MYR", "PH": "PHP",
+    "TH": "THB", "VN": "VND", "BR": "BRL", "MX": "MXN", "AR": "ARS",
+    "CL": "CLP", "CO": "COP", "PE": "PEN", "ZA": "ZAR", "TR": "TRY",
+    "IL": "ILS", "AE": "AED", "SA": "SAR", "EG": "EGP", "CH": "CHF",
+    "PL": "PLN", "SE": "SEK", "NO": "NOK", "DK": "DKK", "CZ": "CZK",
+    "HU": "HUF", "RO": "RON", "BG": "BGN", "UA": "UAH", "IS": "ISK",
+}
+_PAYMENT_EURO_COUNTRIES = frozenset({
+    "AT", "BE", "CY", "DE", "EE", "ES", "FI", "FR", "GR", "HR", "IE",
+    "IT", "LT", "LU", "LV", "MT", "NL", "PT", "SI", "SK",
+})
 
 PAYMENT_METHOD_LABELS = {
     "card": "银行卡",
@@ -469,8 +483,45 @@ def _payment_check_offer(plan_result: dict) -> tuple[str | None, str | None]:
         if offer is None:
             continue
         campaign_id = _bounded_payment_identifier(campaign.get("id"))
-        return offer, campaign_id
+        if campaign_id:
+            return offer, campaign_id
     return None, None
+
+
+def _payment_checkout_region(
+    session: BrowserSession, plan_result: dict,
+) -> tuple[str, str] | None:
+    profile = getattr(session, "browser_profile", {}) or {}
+    geo = getattr(session, "exit_geo", {}) or {}
+    profile_geo = profile.get("geo") if isinstance(profile, dict) else {}
+    country_candidates = (
+        geo.get("country") if isinstance(geo, dict) else None,
+        profile_geo.get("country") if isinstance(profile_geo, dict) else None,
+    )
+    country = next(
+        (
+            str(value).strip().upper()
+            for value in country_candidates
+            if isinstance(value, str) and re.fullmatch(r"[A-Za-z]{2}", value.strip())
+        ),
+        None,
+    )
+    if not country and isinstance(profile, dict):
+        language = str(profile.get("navigator_language") or "")
+        locale_country = language.rsplit("-", 1)[-1].strip().upper()
+        if re.fullmatch(r"[A-Z]{2}", locale_country):
+            country = locale_country
+    if not country:
+        return None
+
+    currency = _PAYMENT_CURRENCY_BY_COUNTRY.get(country)
+    if not currency and country in _PAYMENT_EURO_COUNTRIES:
+        currency = "EUR"
+    if not currency:
+        candidate = str(plan_result.get("billing_currency") or "").strip().upper()
+        if _PAYMENT_METHOD_CURRENCY_RE.fullmatch(candidate):
+            currency = candidate
+    return (country, currency) if currency else None
 
 
 def check_payment_method_availability(
@@ -488,17 +539,27 @@ def check_payment_method_availability(
         ).as_dict()
     if session is None:
         return _payment_error_result("payment transport error")
+    region = _payment_checkout_region(session, plan_result)
+    if not region:
+        return _payment_error_result("payment region unavailable")
+    country, currency = region
     try:
         claims = token_claims(token)
         body = {
-            "plan": offer_id,
-            "purchase_origin_platform": "chatgpt_web",
+            "entry_point": "all_plans_pricing_modal",
+            "plan_name": offer_id,
+            "billing_details": {"country": country, "currency": currency},
+            "checkout_ui_mode": "custom",
+            "promo_campaign": {
+                "promo_campaign_id": campaign_id,
+                "is_coupon_from_query_param": False,
+            },
         }
-        if campaign_id:
-            body["promo_campaign_id"] = campaign_id
         response = session.post(
             f"https://chatgpt.com{PAYMENT_CHECKOUT_PATH}",
-            headers=_common_headers(session, token, claims),
+            headers=_common_headers(
+                session, token, claims, target_path=PAYMENT_CHECKOUT_PATH,
+            ),
             json=body,
             allow_redirects=False,
             timeout=max(1.0, min(60.0, float(timeout or 15.0))),
@@ -710,15 +771,21 @@ def token_claims(token: str) -> dict:
     }
 
 
-def _common_headers(env: BrowserSession, token: str, claims: dict | None = None) -> dict[str, str]:
-    """生成与 ChatGPT 登录态前端一致的套餐查询头。"""
+def _common_headers(
+    env: BrowserSession,
+    token: str,
+    claims: dict | None = None,
+    *,
+    target_path: str = ACCOUNTS_CHECK_PATH,
+) -> dict[str, str]:
+    """生成登录态 ChatGPT API 请求头，并标记对应的目标路由。"""
     headers = env.get_chatgpt_headers(referer="https://chatgpt.com/")
     # GET 导航后的前端 fetch 不主动设置 content-type。
     headers.pop("content-type", None)
     headers.update({
         "authorization": f"Bearer {normalize_token(token)}",
-        "x-openai-target-path": ACCOUNTS_CHECK_PATH,
-        "x-openai-target-route": ACCOUNTS_CHECK_PATH,
+        "x-openai-target-path": target_path,
+        "x-openai-target-route": target_path,
     })
     account_id = str((claims or {}).get("account_id") or "").strip()
     if account_id:

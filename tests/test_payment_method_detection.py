@@ -39,6 +39,8 @@ class _Session:
         self.proxy = ""
         self.device_id = "device-test"
         self.oai_session_id = "session-test"
+        self.exit_geo = {"country": "US"}
+        self.browser_profile = {"geo": {"country": "US"}, "navigator_language": "en-US"}
         self.blocked_until = 0
         self.blocked_reason = ""
 
@@ -60,6 +62,35 @@ class _Session:
 
     def fingerprint_summary_text(self):
         return "test-fingerprint"
+
+
+class _CheckoutContractSession(_Session):
+    def __init__(self):
+        super().__init__()
+        self.contract_valid = False
+
+    def post(self, url, **kwargs):
+        self.posts.append((url, kwargs))
+        headers = kwargs.get("headers", {})
+        self.contract_valid = (
+            url == "https://chatgpt.com" + PAYMENT_CHECKOUT_PATH
+            and headers.get("x-openai-target-path") == PAYMENT_CHECKOUT_PATH
+            and headers.get("x-openai-target-route") == PAYMENT_CHECKOUT_PATH
+            and kwargs.get("json") == {
+                "entry_point": "all_plans_pricing_modal",
+                "plan_name": "chatgptplusplan",
+                "billing_details": {"country": "US", "currency": "USD"},
+                "checkout_ui_mode": "custom",
+                "promo_campaign": {
+                    "promo_campaign_id": "campaign-1",
+                    "is_coupon_from_query_param": False,
+                },
+            }
+        )
+        if not self.contract_valid:
+            return _Response(400, data={"error": "invalid checkout request"})
+        return _Response(200, data={"payment_method_types": ["card"]})
+
 
 class PaymentMethodParserTests(unittest.TestCase):
     def test_oaics_shape_is_normalized_and_bounded(self):
@@ -132,6 +163,24 @@ class PaymentMethodFlowTests(unittest.TestCase):
         self.assertEqual(result["payment_method_check_status"], "checked")
         self.assertEqual(len(session.posts), 1)
 
+    def test_malformed_promotion_identifier_skips_checkout(self):
+        plan = self.eligible_plan(
+            eligible_promo_campaigns={"plus": {"metadata": {"plan_name": "chatgptplusplan"}}},
+        )
+        session = _Session(response=_Response(200, data={"payment_method_types": ["card"]}))
+        result = check_payment_method_availability(session, "token", plan)
+        self.assertEqual(result["payment_method_check_status"], "not_applicable")
+        self.assertEqual(session.posts, [])
+
+    def test_checkout_region_missing_is_best_effort_error_without_request(self):
+        session = _Session(response=_Response(200, data={"payment_method_types": ["card"]}))
+        session.exit_geo = {}
+        session.browser_profile = {}
+        result = check_payment_method_availability(session, "token", self.eligible_plan())
+        self.assertEqual(result["payment_method_check_status"], "error")
+        self.assertEqual(result["payment_method_error"], "payment region unavailable")
+        self.assertEqual(session.posts, [])
+
     def test_no_promotion_skips_checkout(self):
         session = _Session(response=_Response(200, data={"payment_method_types": ["card"]}))
         result = check_payment_method_availability(
@@ -198,6 +247,13 @@ class PaymentMethodFlowTests(unittest.TestCase):
                 self.assertNotIn("provider.invalid", json.dumps(result))
                 self.assertNotIn("client_secret", json.dumps(result))
 
+    def test_known_checkout_contract_avoids_http_400(self):
+        session = _CheckoutContractSession()
+        result = check_payment_method_availability(session, "token", self.eligible_plan())
+        self.assertEqual(result["payment_method_check_status"], "checked")
+        self.assertTrue(session.contract_valid)
+        self.assertEqual(len(session.posts), 1)
+
     def test_success_uses_current_session_and_only_bounded_checkout_body(self):
         session = _Session(response=_Response(200, data={
             "payment_method_types": ["card"], "session_type": "checkout", "amount": 0, "currency": "usd",
@@ -208,9 +264,14 @@ class PaymentMethodFlowTests(unittest.TestCase):
         self.assertEqual(session.posts[0][0], "https://chatgpt.com" + PAYMENT_CHECKOUT_PATH)
         body = session.posts[0][1]["json"]
         self.assertEqual(body, {
-            "plan": "chatgptplusplan",
-            "promo_campaign_id": "campaign-1",
-            "purchase_origin_platform": "chatgpt_web",
+            "entry_point": "all_plans_pricing_modal",
+            "plan_name": "chatgptplusplan",
+            "billing_details": {"country": "US", "currency": "USD"},
+            "checkout_ui_mode": "custom",
+            "promo_campaign": {
+                "promo_campaign_id": "campaign-1",
+                "is_coupon_from_query_param": False,
+            },
         })
         self.assertNotIn("token", json.dumps(body))
         self.assertNotIn("provider.invalid", json.dumps(result))

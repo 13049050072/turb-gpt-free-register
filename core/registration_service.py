@@ -468,6 +468,60 @@ def _run_codex_retry_job(job_id: int, log_file: str, email: str, account_id: int
 # 公共接口
 # ============================================================
 
+def recover_interrupted_jobs(*, limit: int = 5000) -> dict:
+    """服务重启后修复注册任务状态。
+
+    - running / stopping：线程已随进程消失，标记失败并提示重试；
+    - pending：从未开始，重新提交到线程池继续执行。
+    """
+    now = datetime.now().isoformat(timespec="seconds")
+    jobs = db.list_jobs(limit=limit)
+    interrupted = 0
+    pending: list[dict] = []
+    for job in jobs:
+        try:
+            job_id = int(job.get("id") or 0)
+        except (TypeError, ValueError):
+            continue
+        if not job_id:
+            continue
+        status = str(job.get("status") or "")
+        if status in ("running", "stopping"):
+            db.update_job(
+                job_id,
+                status="failed",
+                error="服务重启导致任务中断，请重试",
+                completed_at=now,
+            )
+            interrupted += 1
+        elif status == "pending":
+            pending.append(job)
+
+    resumed = 0
+    if pending:
+        with _executor_lock:
+            executor = get_executor()
+            for job in pending:
+                job_id = int(job["id"])
+                try:
+                    executor.submit(_run_one_job, job_id, str(job.get("log_file") or ""))
+                    resumed += 1
+                except Exception as exc:
+                    db.update_job(
+                        job_id,
+                        status="failed",
+                        error=f"队列提交失败：{type(exc).__name__}: {exc}"[:500],
+                        completed_at=now,
+                    )
+                    logger.exception("[Service] 重启恢复时提交任务 #%s 失败", job_id)
+    if interrupted or resumed:
+        logger.warning(
+            "[Service] 注册任务重启恢复：中断 %s 个已标记失败，排队 %s 个已重新入队",
+            interrupted, resumed,
+        )
+    return {"interrupted": interrupted, "resumed": resumed}
+
+
 def submit_registration(count: int = 1, email_source: str | None = None, workers: int | None = None) -> list[dict]:
     """
     创建 N 个注册任务并提交到线程池。

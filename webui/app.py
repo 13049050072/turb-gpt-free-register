@@ -369,6 +369,15 @@ def create_app(auth_code: str | None = None) -> Flask:
             recovered_chatgpt_passwords = db.recover_interrupted_chatgpt_passwords()
             if recovered_chatgpt_passwords:
                 logger.warning("已恢复 %s 个因 WebUI 重启中断的 ChatGPT 密码设置状态", recovered_chatgpt_passwords)
+            try:
+                job_recovery = svc.recover_interrupted_jobs()
+                if job_recovery.get("interrupted") or job_recovery.get("resumed"):
+                    logger.warning(
+                        "注册任务重启恢复：中断 %s 个已标记失败，排队 %s 个已重新入队",
+                        job_recovery.get("interrupted"), job_recovery.get("resumed"),
+                    )
+            except Exception:
+                logger.exception("注册任务重启恢复失败")
     try:
         from core.chatgpt2api_import_service import start_import_worker
         start_import_worker()

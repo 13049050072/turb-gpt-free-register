@@ -171,3 +171,23 @@
 
 - 线上镜像 `turb-gpt-free-register:0235f94`；回滚到 `turb-gpt-free-register:6ac66cf` 再 `up -d --no-deps web`，备份 `compose.env.before-0235f94-20261019T165214Z`。
 - 实际吞吐仍受 `PLAN_CHECK_MIN_INTERVAL=1.0` + `PLAN_CHECK_JITTER=0.8` 限制（约 0.55 个/秒），并发只决定同时在飞的请求数。
+
+## 2026-10-20 - Task: 修复重启后注册任务永久卡在“运行中”
+
+### What was done
+
+- 定位到 #1523–#1542 等 16 个任务从 00:31 起停在“运行中”，日志在重启时刻截断；57 个 pending 任务不再被提交。
+- 原因：注册任务没有任何重启恢复逻辑（套餐查询、提链、查活等都有），容器重建后线程消失，DB 状态仍是 running。
+- 新增 `registration_service.recover_interrupted_jobs()`：running/stopping 标记失败并提示重试，pending 重新提交线程池；在 WebUI 启动恢复块里调用。
+
+### Testing
+
+- 新增 `tests/test_registration_recovery.py`（2 项）：中断任务标记失败、pending 重新入队、提交失败降级为 failed。
+- 相关回归 50 项通过；`py_compile`、`git diff --check` 通过。
+
+### Notes
+
+- `core/registration_service.py`：新增重启恢复函数。
+- `webui/app.py`：启动时调用并记录日志。
+- `tests/test_registration_recovery.py`：新增测试。
+- 部署后预期：16 个 running 变 failed（可一键重试），57 个 pending 自动继续执行。

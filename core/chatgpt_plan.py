@@ -1004,17 +1004,11 @@ def _clear_plan_circuit(env: BrowserSession) -> None:
 
 
 def _warm_plan_session(env: BrowserSession) -> None:
-    """先访问 ChatGPT document 建立同一会话的边缘 Cookie；失败不阻断正式查询。"""
+    """Reuse registration's top-level ChatGPT navigation and document initialization."""
     try:
-        resp = env.get(
-            "https://chatgpt.com/",
-            headers=env.get_chatgpt_navigate_headers(
-                referer="https://chatgpt.com/", user_initiated=False,
-            ),
-            allow_redirects=True,
-        )
-        if int(getattr(resp, "status_code", 0) or 0) >= 400:
-            logger.info("[Plan] document 预热返回 HTTP %s，保留响应 Cookie 后继续", resp.status_code)
+        from core.openai_auth import network_preflight
+
+        network_preflight(env)
     except Exception as exc:
         logger.debug("[Plan] document 预热失败，继续正式查询：%s: %s", type(exc).__name__, str(exc)[:160])
     finally:

@@ -4,6 +4,16 @@
 
 `core/chatgpt_plan.py:check_account_plan` runs best-effort payment detection after a successful accounts/check response. `check_payment_method_availability` requires a free plan, `plus_trial_eligible is True`, numeric discount 100, numeric duration 1, period `month`, and a valid matching promotion and checkout offer. Missing, malformed, generic, paid, and other-duration offers return `not_applicable` with no checkout request.
 
+## Plan session initialization
+
+- **Scope:** An internally owned `check_account_plan(...)` session warms up through `_warm_plan_session(env: BrowserSession) -> None` before building accounts/check headers. A borrowed `session=` is neither warmed nor closed by the plan checker.
+- **Shared contract:** `_warm_plan_session` lazily calls `core.openai_auth.network_preflight(session: BrowserSession) -> None`. This reuses the registration flow's `/auth/login` top-level navigation, existing proxy-retry settings, preflight timeout, and successful document observation on the same tracked session. Document observation must precede accounts/check header generation so current page build metadata can be used.
+- **Failure behavior:** Successful navigation observes the document. Recoverable navigation failures use the existing finite registration retry policy. Exhausted retries or other preflight errors remain best-effort: clear only the local plan circuit and proceed with accounts/check. The existing plan-loop retry/Retry-After rules and non-retryable 401 behavior remain unchanged.
+- **Cases:** Good: login navigation succeeds and plan headers use the observed build. Base: login navigation fails but accounts/check still succeeds. Bad: a borrowed session is navigated or closed, or a separate transport is created during warmup.
+- **Tests:** `tests/test_chatgpt_plan_retry.py` asserts navigation order, same-session 403 retry, document observation before plan headers, best-effort failure, borrowed-session boundaries, and owned-session cleanup.
+- **Wrong vs correct:** Do not replace initialization with a bare homepage GET that never observes the returned document; call `network_preflight(env)` and preserve its shared request lifecycle.
+- **Evidence limit:** A live accounts/check HTTP 200 after this change does not establish that initialization caused the recovery, especially when login navigation still returns 403. Report the independent checkout result separately; checkout HTTP 400 is not a successful payment-method check.
+
 ## Provider lifecycle
 
 1. POST `https://chatgpt.com/backend-api/payments/checkout` using `_common_headers`, `plan_name: "chatgptplusplan"`, the eligible Plus promotion, and validated country/currency. `eligible_offer_ids` are opaque identifiers used for gating; they must never become the product name. Only the `plus` campaign may select the trial promotion.

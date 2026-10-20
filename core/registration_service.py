@@ -331,10 +331,17 @@ def _edge_retry_proxy(job_id: int) -> str:
     return rotate_sticky_session(random.choice(pool), salt=f"job-{job_id}-edge-retry")
 
 
+def _result_is_edge_block(result: Any) -> bool:
+    """注册流程把失败包进返回值（不抛异常），这里识别 403 结果。"""
+    if not isinstance(result, dict) or result.get("success"):
+        return False
+    return _is_edge_block_error(str(result.get("error") or ""))
+
+
 def _run_registration_with_edge_retry(call, *, job_id: int, log) -> Any:
-    """执行注册；遇到边缘 403 时换出口 IP 重试一次。"""
+    """执行注册；遇到边缘 403（抛异常或返回失败）时换出口 IP 重试一次。"""
     try:
-        return call(None)
+        result = call(None)
     except Exception as exc:  # noqa: BLE001
         if _EDGE_RETRY_LIMIT <= 0 or not _is_edge_block_error(exc):
             raise
@@ -346,6 +353,16 @@ def _run_registration_with_edge_retry(call, *, job_id: int, log) -> Any:
             job_id, type(exc).__name__,
         )
         return call(proxy)
+    if _EDGE_RETRY_LIMIT <= 0 or not _result_is_edge_block(result):
+        return result
+    proxy = _edge_retry_proxy(job_id)
+    if not proxy:
+        return result
+    log.warning(
+        "[Job %s] 命中 Cloudflare 边缘 403，换出口 IP 重试一次：%s",
+        job_id, str(result.get("error") or "")[:80],
+    )
+    return call(proxy)
 
 
 def _run_one_job(job_id: int, log_file: str) -> None:

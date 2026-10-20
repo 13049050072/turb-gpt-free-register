@@ -42,6 +42,32 @@ class EdgeRetryTests(unittest.TestCase):
         self.assertEqual(calls[1], POOL_URL)
         picker.assert_called_once_with(42)
 
+    def test_failed_result_with_403_is_retried(self):
+        calls = []
+
+        def call(proxy):
+            calls.append(proxy)
+            if proxy is None:
+                return {"success": False, "error": "HTTP Error 403: "}
+            return {"success": True, "email": "x@example.test"}
+
+        with patch.object(svc, "_edge_retry_proxy", return_value=POOL_URL):
+            result = svc._run_registration_with_edge_retry(call, job_id=43, log=_SilentLog())
+        self.assertTrue(result["success"])
+        self.assertEqual(calls, [None, POOL_URL])
+
+    def test_failed_result_without_403_is_not_retried(self):
+        calls = []
+
+        def call(proxy):
+            calls.append(proxy)
+            return {"success": False, "error": "HTTP Error 400: bad request"}
+
+        with patch.object(svc, "_edge_retry_proxy", return_value=POOL_URL):
+            result = svc._run_registration_with_edge_retry(call, job_id=44, log=_SilentLog())
+        self.assertFalse(result["success"])
+        self.assertEqual(calls, [None])
+
     def test_non_403_is_not_retried(self):
         calls = []
 

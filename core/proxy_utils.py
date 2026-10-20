@@ -181,3 +181,28 @@ def diagnose_proxy_endpoint(value: str, *, timeout: float = 2.0) -> str:
     if response[:1] == b"\x05":
         return "SOCKS5 握手响应正常，可能是账号密码或目标地址被拒绝"
     return "代理端口返回了非 SOCKS5 响应，请确认协议和端口"
+
+
+def rotate_sticky_session(value: str, *, salt: str = "") -> str:
+    """把 1024Proxy 粘性会话 id 换成新的，拿到另一个出口 IP。
+
+    只改用户名里的 ``-sid-<id>-t-<ttl>`` 段；没有该段或不是 URL 形式时原样返回。
+    用于 Cloudflare 边缘 403 时换出口重试，避免整条任务直接失败。
+    """
+    text = str(value or "").strip()
+    if not text:
+        return text
+    parsed = urlsplit(text)
+    raw_at = parsed.netloc.rfind("@")
+    if raw_at < 0:
+        return text
+    raw_userinfo = parsed.netloc[:raw_at]
+    raw_colon = raw_userinfo.find(":")
+    raw_username = raw_userinfo if raw_colon < 0 else raw_userinfo[:raw_colon]
+    raw_password = "" if raw_colon < 0 else raw_userinfo[raw_colon:]
+    base = _STICKY_SESSION_MARKER.sub("", unquote(raw_username))
+    session_id = hashlib.sha256(
+        f"{salt}:{secrets.token_hex(16)}".encode("utf-8")
+    ).hexdigest()[:12]
+    netloc = f"{base}-sid-{session_id}-t-10{raw_password}{parsed.netloc[raw_at:]}"
+    return urlunsplit((parsed.scheme, netloc, parsed.path, parsed.query, parsed.fragment))

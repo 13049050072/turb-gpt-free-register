@@ -10,6 +10,7 @@
     → 创建 5 个任务，丢入线程池，立即返回 [job_dict, ...]
 """
 import logging
+import random
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
@@ -300,6 +301,53 @@ class _JobLogContext:
         self.handler.close()
 
 
+_EDGE_BLOCK_MARKERS = (
+    "http error 403", "http 403", "status=403", "403 forbidden",
+)
+
+# 每个任务因 Cloudflare 边缘 403 换出口重试的次数（不含首次）。
+_EDGE_RETRY_LIMIT = 1
+
+
+def _is_edge_block_error(exc: BaseException | str) -> bool:
+    """判断是否为 Cloudflare 边缘 403（换出口 IP 后有机会通过）。"""
+    text = exc if isinstance(exc, str) else f"{type(exc).__name__}: {exc}"
+    low = text.lower()
+    if any(marker in low for marker in _EDGE_BLOCK_MARKERS):
+        return True
+    return "熔断冷却" in text
+
+
+def _edge_retry_proxy(job_id: int) -> str:
+    """从代理池挑一个入口，并把粘性会话 id 换成新的（换出口 IP）。"""
+    try:
+        from config import PROXY_POOL
+        from core.proxy_utils import rotate_sticky_session
+    except Exception:  # noqa: BLE001
+        return ""
+    pool = [str(item).strip() for item in (PROXY_POOL or []) if str(item).strip()]
+    if not pool:
+        return ""
+    return rotate_sticky_session(random.choice(pool), salt=f"job-{job_id}-edge-retry")
+
+
+def _run_registration_with_edge_retry(call, *, job_id: int, log) -> Any:
+    """执行注册；遇到边缘 403 时换出口 IP 重试一次。"""
+    try:
+        return call(None)
+    except Exception as exc:  # noqa: BLE001
+        if _EDGE_RETRY_LIMIT <= 0 or not _is_edge_block_error(exc):
+            raise
+        proxy = _edge_retry_proxy(job_id)
+        if not proxy:
+            raise
+        log.warning(
+            "[Job %s] 命中 Cloudflare 边缘 403，换出口 IP 重试一次：%s",
+            job_id, type(exc).__name__,
+        )
+        return call(proxy)
+
+
 def _run_one_job(job_id: int, log_file: str) -> None:
     """单任务入口（线程池里跑这个）。"""
     log_logger = logging.getLogger(__name__)
@@ -334,11 +382,17 @@ def _run_one_job(job_id: int, log_file: str) -> None:
                     db.update_job(job_id, email=email)
                     log_logger.info(f"[Job {job_id}] 页面已找到邮箱输入框，已分配邮箱: {email}")
 
-            result = run_registration(
-                email=email,
-                name=name,
-                birthday=birthday,
-                on_email_acquired=_on_email_acquired,
+            def _call_registration(proxy: str | None):
+                return run_registration(
+                    email=None if proxy else email,
+                    name=name,
+                    birthday=birthday,
+                    proxy=proxy,
+                    on_email_acquired=_on_email_acquired,
+                )
+
+            result = _run_registration_with_edge_retry(
+                _call_registration, job_id=job_id, log=log_logger,
             )
             if is_stop_requested(job_id):
                 _release_unconsumed_job_email(email, "用户手动停止")

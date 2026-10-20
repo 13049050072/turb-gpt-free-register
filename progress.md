@@ -212,3 +212,22 @@
 - `core/openai_auth.py`：新增 `_extract_register_error_hint()`，`register_user` 失败日志增加 `hint=`。
 - `tests/test_register_error_hint.py`、`tests/test_openai_auth_registration_flow.py`：新增/调整测试。
 - 结论：当前主要失败源是西瓜邮箱并发上限（order_limit），其次是 `user/register` 400；后者下一次出现会带 `hint=`，可直接定位。
+
+## 2026-10-20 - Task: 清理线上无法开启 2FA 的账号
+
+### What was done
+
+- 统计线上账号 2FA 状态：741 个账号里 736 个已有 TOTP 密钥，5 个处于“设置失败且无密钥”。
+- 备份这 5 个账号的完整记录到 `/home/ubuntu/backups/accounts-2fa-unfinished-20261020T061020Z.json`（600 权限）。
+- 删除这 5 个账号（id 1083、1077、1075、1052、1025），连带清理 `codex_agent_accounts` 关联行。
+
+### Testing
+
+- 删除前后核对：`total_all` 741 → 736；被删 id 残留 0；`无 totp_secret 且 2FA 设置未完成` 的账号 0。
+- 剩余 736 个账号全部带 `totp_secret`，账号页“2FA：未开启 / 设置失败”筛选结果均为空。
+
+### Notes
+
+- 数据侧变更，无代码改动。
+- 回滚：用备份 JSON 重新导入账号记录（含 password/access_token/totp_secret），命令见 `docs/` 同目录说明或按 `db.import_*` 走。
+- 备份文件保留期按服务器磁盘情况清理。

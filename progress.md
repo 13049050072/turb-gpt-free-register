@@ -191,3 +191,24 @@
 - `webui/app.py`：启动时调用并记录日志。
 - `tests/test_registration_recovery.py`：新增测试。
 - 部署后预期：16 个 running 变 failed（可一键重试），57 个 pending 自动继续执行。
+
+## 2026-10-20 - Task: 排查线上注册失败并补 400 诊断
+
+### What was done
+
+- 统计近 200 个注册任务：成功 73、失败 127；失败原因以邮箱来源限流为主。
+- 上线 `302fbb1`：`user/register` 非白名单错误码时，把严格 snake_case 的短标识符以 `hint=` 写入日志（不含 message/邮箱/令牌），便于定位 OpenAI 的拒绝原因。
+- 用 `workers=2` 提交 3 个注册任务做冒烟：2 个成功、1 个仍在运行，链路正常。
+
+### Testing
+
+- 失败分布（近 200 个任务）：邮箱来源 429（order_limit / rate_limited）85 个、`user/register 400` 28 个、超时 10 个、curl 28 3 个、OAuth 超时 1 个。
+- 全部失败任务（1000 条内 221 个）按错误聚合：400 共 62（其中 daum.net 26、icloud.com 36）、西瓜 429/401 共 89、重启中断 16、超时类 16、Remail 验证码超时 10、403 共 7。
+- 新增 `tests/test_register_error_hint.py`（5 项）；`test_openai_auth_registration_flow` 调整为“有界标识符可落日志、密钥与邮箱仍不得出现”，23 项通过。
+- 线上镜像 `turb-gpt-free-register:302fbb1` healthy；回滚 `329741b`，备份 `compose.env.before-302fbb1-20261020T031856Z`。
+
+### Notes
+
+- `core/openai_auth.py`：新增 `_extract_register_error_hint()`，`register_user` 失败日志增加 `hint=`。
+- `tests/test_register_error_hint.py`、`tests/test_openai_auth_registration_flow.py`：新增/调整测试。
+- 结论：当前主要失败源是西瓜邮箱并发上限（order_limit），其次是 `user/register` 400；后者下一次出现会带 `hint=`，可直接定位。

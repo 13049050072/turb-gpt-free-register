@@ -283,7 +283,9 @@ class OpenAIRegistrationFlowTests(unittest.TestCase):
                 )
         output = "\n".join(cm.output)
         self.assertIn("status=400", output)
-        self.assertNotIn("unexpected_internal_error", output)  # 非白名单 code 不落日志
+        # 有界 snake_case 标识符允许落日志（排查需要），其余内容一律不得出现
+        self.assertIn("hint=unexpected_internal_error", output)
+        self.assertNotIn("password=SuperSecret123", output)
         self.assertNotIn("SuperSecret123", output)
         self.assertNotIn("tok-123456", output)
         self.assertNotIn("user@example.com", output)

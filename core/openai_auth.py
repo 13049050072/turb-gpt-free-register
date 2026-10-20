@@ -7,6 +7,7 @@ OpenAI Auth 模块
 import json
 import logging
 import random
+import re
 import secrets
 import time
 from urllib.parse import urlparse
@@ -64,8 +65,9 @@ _ACCOUNT_DEAD_CODES = frozenset({
     "account_banned",
 })
 
-# user/register 非 2xx 响应里允许进入日志的 error.code 白名单。
-# 只放已知、无敏感信息的规范化 code；其余任意服务端 message 一律不落日志。
+# user/register 非 2xx 响应里优先按白名单落 error.code；
+# 白名单外的响应只允许把严格 snake_case 的短标识符（如 email_domain_not_allowed）
+# 作为 hint 落日志，其余任意服务端 message / 字段值一律不落日志。
 _REGISTER_ERROR_CODE_ALLOWLIST = _ACCOUNT_DEAD_CODES | frozenset({
     # 邮箱/密码注册常见拒绝原因
     "email_already_used",
@@ -189,6 +191,46 @@ def _extract_allowlisted_error_code(resp) -> str:
     if not code or len(code) > _MAX_ERROR_CODE_LENGTH:
         return ""
     return code if code in _REGISTER_ERROR_CODE_ALLOWLIST else ""
+
+
+def _extract_register_error_hint(resp) -> str:
+    """从非 2xx 响应里取一个可安全落日志的短标识（严格 snake_case）。
+
+    白名单之外的 error code 不进日志，但实际排查需要知道 OpenAI 到底返回了什么；
+    这里只接受形如 ``email_domain_not_allowed`` 的纯标识符，长度有界，
+    不含邮箱、令牌或任意自然语言 message。
+    """
+    try:
+        raw = getattr(resp, "content", None)
+        if raw is None:
+            raw = getattr(resp, "text", "")
+        if isinstance(raw, str):
+            raw = raw.encode("utf-8", "replace")
+        payload = json.loads(bytes(raw)[:_MAX_ERROR_BODY_READ_BYTES])
+    except Exception:
+        return ""
+    candidates: list[str] = []
+
+    def walk(node, depth: int = 0) -> None:
+        if depth > 3 or len(candidates) >= 8:
+            return
+        if isinstance(node, dict):
+            for key in ("code", "type", "error_code"):
+                value = node.get(key)
+                if isinstance(value, str):
+                    candidates.append(value)
+            for value in node.values():
+                walk(value, depth + 1)
+        elif isinstance(node, list):
+            for value in node[:4]:
+                walk(value, depth + 1)
+
+    walk(payload)
+    for candidate in candidates:
+        text = candidate.strip().lower()
+        if re.fullmatch(r"[a-z0-9_]{1,64}", text):
+            return text
+    return ""
 
 
 def _proxy_retry_config() -> tuple[int, float]:
@@ -701,7 +743,11 @@ def register_user(
         if code:
             logger.error("[步骤7] user/register 失败 status=%s code=%s", resp.status_code, code)
         else:
-            logger.error("[步骤7] user/register 失败 status=%s", resp.status_code)
+            hint = _extract_register_error_hint(resp)
+            if hint:
+                logger.error("[步骤7] user/register 失败 status=%s hint=%s", resp.status_code, hint)
+            else:
+                logger.error("[步骤7] user/register 失败 status=%s", resp.status_code)
         resp.raise_for_status()
     data = resp.json()
     return data

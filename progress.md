@@ -251,3 +251,24 @@
 - `core/registration_service.py`：新增 403 重试包装与代理轮换。
 - `tests/test_registration_edge_retry.py`：新增测试。
 - 回滚：还原上述三个文件；重试次数由 `_EDGE_RETRY_LIMIT` 控制。
+
+## 2026-10-20 - Task: 验证 403 换出口重试（余额恢复后）
+
+### What was done
+
+- 发现注册失败是包在返回值里的 `{"success": false, "error": "HTTP Error 403"}`，异常包装抓不到；补 `_result_is_edge_block()`，让返回失败也触发换出口重试。
+- 部署 `a0b5d89` 到 Oracle，连跑两批真实注册做验证。
+
+### Testing
+
+- 单测 11 项通过（新增失败结果触发重试、非 403 结果不重试）。
+- 线上第一批 4 个（workers=2）：2011–2014 全部成功。
+- 线上第二批 8 个（workers=4）：2015–2018 成功，2019–2022 失败，错误均为 `422 Insufficient inventory`（remail 该域名库存为空），不是 403。
+- 两批共 12 个任务，0 次 403；重试日志未触发。
+- 代理轮换实测：同一入口换 3 个 sid 拿到 3 个不同出口 IP（49.42.35.102 / 103.240.76.43 / 103.216.54.62）。
+
+### Notes
+
+- `core/registration_service.py`：新增 `_result_is_edge_block()`，重试判断覆盖返回值失败。
+- `tests/test_registration_edge_retry.py`：新增 2 项，共 11 项。
+- 回滚：`TURB_IMAGE=turb-gpt-free-register:765ab80`，备份 `compose.env.before-a0b5d89-20261020T112704Z`。

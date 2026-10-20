@@ -231,3 +231,23 @@
 - 数据侧变更，无代码改动。
 - 回滚：用备份 JSON 重新导入账号记录（含 password/access_token/totp_secret），命令见 `docs/` 同目录说明或按 `db.import_*` 走。
 - 备份文件保留期按服务器磁盘情况清理。
+
+## 2026-10-20 - Task: 注册流程 Cloudflare 边缘 403 换出口重试
+
+### What was done
+
+- 统计最近 200 个注册任务：失败 9 个，其中 8 个是 `HTTP Error 403`（auth.openai.com 的 authorize 导航被 CF 拦），1 个交互式挑战；403 已成当前主要失败源。
+- 新增 `proxy_utils.rotate_sticky_session()`：只替换 1024Proxy 用户名里的 `-sid-<id>-t-<ttl>`，保持 base 用户名与密码不变，拿到另一个出口 IP。
+- `registration_service`：注册调用包一层 `_run_registration_with_edge_retry()`，命中 403/熔断冷却时换新 sid 重试一次（重试用新邮箱，避免复用已释放的取件上下文）。
+
+### Testing
+
+- 新增 `tests/test_registration_edge_retry.py`（9 项）：403 识别、非 403 不重试、换代理重试一次、无代理时原样抛出、sid 替换不重复。
+- 与注册恢复、400 hint 相关回归 16 项通过；`py_compile` 通过。
+
+### Notes
+
+- `core/proxy_utils.py`：新增 `rotate_sticky_session()`。
+- `core/registration_service.py`：新增 403 重试包装与代理轮换。
+- `tests/test_registration_edge_retry.py`：新增测试。
+- 回滚：还原上述三个文件；重试次数由 `_EDGE_RETRY_LIMIT` 控制。
